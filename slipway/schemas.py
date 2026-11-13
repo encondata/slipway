@@ -520,6 +520,10 @@ class ClaimOut(InstanceOut):
     deployment_id: uuid.UUID | None = None
     env_imported: list[str] = Field(default_factory=list)  # names only, never values
     env_skipped: list[str] = Field(default_factory=list)  # containers disagree on the value, or it is unusable
+    env_files_read: list[str] = Field(default_factory=list)  # the project's env files that were imported
+    env_files_missing: list[str] = Field(default_factory=list)
+    env_files_unreadable: list[str] = Field(default_factory=list)
+    warning: str | None = None
 
 
 class ActionOut(BaseModel):

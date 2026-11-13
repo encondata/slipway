@@ -489,3 +489,94 @@ async def test_claimed_paths_can_change_until_the_first_deploy(admin_client, hos
         await db.commit()
     r = await admin_client.patch(f"/api/v1/instances/{inst_id}", json={"compose_file": "compose.yml"})
     assert r.status_code == 400
+
+
+# ------------------------------------------------------------------ env files
+
+
+def _dotenv_block(index: int, text: str) -> str:
+    data = text.encode()
+    rows = [" ".join(f"{b:02x}" for b in data[i:i + 16]) for i in range(0, len(data), 16)]
+    return "\n".join([f"dotenv-begin {index}", *(" " + r for r in rows), f"dotenv-end {index}"])
+
+
+def test_env_files_default_to_the_project_dotenv_and_follow_env_file():
+    (shop, _) = discovery.parse(DISCOVER_OUTPUT)
+    assert shop.env_files == ["/home/me/shop/.env"]
+    out = _container(WEB, "x-web-1", project="x", service="web", working_dir="/srv/x", config_files="/srv/x/compose.yml")
+    out = out.replace('"config_files": "/srv/x/compose.yml"',
+                      '"config_files": "/srv/x/compose.yml", "env_files": "/srv/x/prod.env,/etc/x/extra.env"')
+    (g,) = discovery.parse(out)
+    assert g.env_files == ["/srv/x/prod.env", "/etc/x/extra.env"]
+
+
+def test_parse_dotenv_like_compose():
+    text = "\n".join([
+        "# comment", "export A=1", "B = two words # note", 'C="x\\ty ${A} $$lit"', "D='raw ${A}'",
+        "E=${MISSING:-def}/${A}", 'F="multi', 'line"', "G=after#nohash", "H=${A:+set}${MISSING+no}", "",
+    ])
+    values, skipped = discovery.parse_dotenv(text)
+    assert values == {"A": "1", "B": "two words", "C": "x\ty 1 $lit", "D": "raw ${A}", "E": "def/1",
+                      "F": "multi\nline", "G": "after#nohash", "H": "set"}
+    assert skipped == []
+    assert discovery.parse_dotenv("A='unterminated\n")[1] == ["A"]
+
+
+def test_parse_env_files_reads_hex_blocks_in_order():
+    out = "\n".join([
+        _dotenv_block(0, "PORT=8080\nSECRET=one\nMULTI=\"a\nb\"\n"),
+        "WARNING: something on stderr",
+        _dotenv_block(1, "SECRET=two\nURL=http://h:${PORT}\n"),
+        "dotenv-missing 2",
+        "dotenv-unreadable 3",
+    ])
+    files = discovery.parse_env_files(out, ["/a/.env", "/b/.env", "/c/.env", "/d/.env", "/e/.env"])
+    assert files.values == {"PORT": "8080", "SECRET": "two", "URL": "http://h:8080"}
+    assert files.read == ["/a/.env", "/b/.env"] and files.missing == ["/c/.env"]
+    assert files.unreadable == ["/d/.env", "/e/.env"]  # /e/.env: no answer at all
+    assert files.skipped == ["MULTI"]  # Slipway stores single-line values only
+
+
+def test_env_command_reads_the_env_files_safely():
+    command = discovery.env_command([WEB], ["/home/me/my app/.env"])
+    assert "head -c 262144 -- '/home/me/my app/.env' | od -An -v -tx1" in command
+    assert "docker run --rm --network none -v '/home/me/my app':/r:ro alpine:3.20 test -f /r/.env" in command
+    for bad in ("relative/.env", "/a:b/.env", "/"):
+        with pytest.raises(ValueError):
+            discovery.env_command([WEB], [bad])
+
+
+async def test_claim_imports_the_project_env_file(admin_client, host_remote):
+    host, repo = await _host_and_repo()
+    env_out = "\n".join([
+        f"env {WEB} " + json.dumps(["SECRET=from-container", "ONLY_IN_CONTAINER=1"]) + " []",
+        f"env {DB_} " + json.dumps(["POSTGRES_PASSWORD=pw"]) + " []",
+        _dotenv_block(0, "WEB_PORT=8080\nSECRET=from-dotenv\nDATA_DIR=/mnt/user/shop\n"),
+    ])
+    host_remote.responses["printf 'env "] = env_out
+    body = {"group": {"kind": "compose", "project": "shop"}, "repository_id": str(repo.id), "branch": "main",
+            "name": "shop", "deploy": False, "import_env": True}
+    r = await admin_client.post(f"/api/v1/hosts/{host.id}/claim", json=body)
+    assert r.status_code == 201, r.text
+    data = r.json()
+    assert data["env_files_read"] == ["/home/me/shop/.env"] and data["warning"] is None
+    assert data["env_imported"] == ["DATA_DIR", "ONLY_IN_CONTAINER", "POSTGRES_PASSWORD", "SECRET", "WEB_PORT"]
+    command = next(c for c in host_remote.commands if "printf 'env " in c)
+    assert "/home/me/shop/.env" in command
+    async with get_sessionmaker()() as db:
+        inst = await db.get(Instance, uuid.UUID(data["id"]))
+        assert inst.env["SECRET"] == "from-dotenv"  # what Compose substituted and passed with env_file
+        assert inst.env["WEB_PORT"] == "8080" and inst.env["DATA_DIR"] == "/mnt/user/shop"
+        event = await db.scalar(select(AuditEvent).where(AuditEvent.action == "instance.claim"))
+        assert "from-dotenv" not in json.dumps(event.details) and event.details["env_files_read"] == ["/home/me/shop/.env"]
+
+
+async def test_claim_warns_when_the_env_file_cannot_be_read(admin_client, host_remote):
+    host, repo = await _host_and_repo()
+    host_remote.responses["printf 'env "] = "dotenv-unreadable 0"
+    body = {"group": {"kind": "compose", "project": "shop"}, "repository_id": str(repo.id), "branch": "main",
+            "name": "shop", "deploy": False, "import_env": True}
+    r = await admin_client.post(f"/api/v1/hosts/{host.id}/claim", json=body)
+    assert r.status_code == 201, r.text
+    assert r.json()["env_files_unreadable"] == ["/home/me/shop/.env"]
+    assert "Could not read /home/me/shop/.env" in r.json()["warning"]

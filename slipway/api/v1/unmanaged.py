@@ -118,7 +118,8 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
 
     With ``deploy`` (the default) the branch is deployed straight away and replaces what runs;
     without it the instance only registers what runs now. ``import_env`` copies the containers'
-    environment variables, which usually hold secrets.
+    environment variables and, for a compose project, the variables in its env files (the ``.env``
+    Compose read), which usually hold secrets.
     """
     if body.deploy and not ctx.can(Perm.DEPLOYMENTS_CREATE):
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing permission: {Perm.DEPLOYMENTS_CREATE}")
@@ -150,7 +151,8 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
                 None,
             )
             if group is not None and body.import_env:
-                _, env_output = await remote.run(discovery.env_command([c.id for c in group.containers]), timeout=120)
+                command = discovery.env_command([c.id for c in group.containers], group.env_files)
+                _, env_output = await remote.run(command, timeout=300)
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     if group is None:
@@ -171,7 +173,16 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
                 f"{what} overlaps {base}, the directory Slipway would use for '{slug}'. Choose another name.",
             )
 
-    env, skipped = discovery.parse_env(env_output, [c.id for c in group.containers]) if body.import_env else ({}, [])
+    env: dict[str, str] = {}
+    skipped: list[str] = []
+    files = discovery.EnvFiles()
+    if body.import_env:
+        env, skipped = discovery.parse_env(env_output, [c.id for c in group.containers])
+        # The project's env files win: Compose substituted their values into the compose file and passed
+        # them to services with ``env_file: .env``. Slipway gives them back to Compose the same way.
+        files = discovery.parse_env_files(env_output, group.env_files)
+        env.update(files.values)
+        skipped = sorted({k for k in skipped if k not in env} | set(files.skipped))
     try:
         env = deployer.clean_env(env)
     except ValueError as exc:  # parse_env already drops what clean_env refuses
@@ -250,6 +261,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
             "kind": group.kind, "name": group.name, "container_id": group.container_id,
             "working_dir": group.working_dir, "register_only": not body.deploy,
             "env_imported": sorted(env), "env_skipped": skipped,
+            "env_files_read": files.read, "env_files_unreadable": files.unreadable,
         },
     )
     dep = await queue_deployment(db, instance, ctx.user) if body.deploy else None
@@ -262,4 +274,9 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
     return ClaimOut(
         **InstanceOut.of(instance).model_dump(),
         deployment_id=dep.id if dep else None, env_imported=sorted(env), env_skipped=skipped,
+        env_files_read=files.read, env_files_missing=files.missing, env_files_unreadable=files.unreadable,
+        warning=(
+            f"Could not read {', '.join(files.unreadable)}: add the variables it holds on the instance before deploying"
+            if files.unreadable else None
+        ),
     )

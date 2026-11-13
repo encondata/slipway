@@ -209,8 +209,14 @@ audited as `instance.claim`):
   as running (or stopped) with the claimed containers' status, logs and start/stop/restart, its ports are
   reserved like any deployed instance's, and its host and build settings are fixed. Deploy when ready.
 - **Import environment variables** is off by default: it reads the containers' variables with `docker
-  inspect` (leaving out the ones the image sets), which usually include passwords and API keys. They are
-  stored encrypted like any instance's variables; the audit log records their names, never their values.
+  inspect` (leaving out the ones the image sets) and, for a compose project, the env file Compose read: the
+  project's `.env`, or the files given with `--env-file`. That file is usually not in git, so after the claim
+  Compose would no longer see it; importing it brings along values that only the compose file uses
+  (`"${WEB_PORT}:80"`, `${DATA_DIR}/db`), parsed the way Compose does (quotes, `export`, comments,
+  `${VAR:-default}`), and its values win over the containers'. A `.env` the SSH user can't read is read
+  through a throwaway `alpine:3.20` container; if that fails too, the claim says so. Multi-line values are
+  skipped and listed. These variables usually include passwords and API keys. They are stored encrypted
+  like any instance's variables; the audit log records their names, never their values.
 
 A claimed instance never removes volumes: not on deploy, not when it is destroyed (destroying it removes its
 containers, images and Slipway's own `<deploy_root>/<slug>`, and keeps anonymous volumes too). Slipway refuses a

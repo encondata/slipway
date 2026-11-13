@@ -206,10 +206,9 @@
         }
         if (submit) submit.hidden = true;
       }
-      if (form.dataset.success) {
-        (form.dataset.then || "").startsWith("redirect") || form.dataset.then === "reload"
-          ? flashAfterReload(form.dataset.success) : toast(form.dataset.success);
-      }
+      const leaving = (form.dataset.then || "").startsWith("redirect") || form.dataset.then === "reload";
+      if (form.dataset.success) leaving ? flashAfterReload(form.dataset.success) : toast(form.dataset.success);
+      if (data && data.warning) leaving ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
       then(form.dataset.then, data);
     } catch (err) {
       toast(err.message, "error");
@@ -432,6 +431,8 @@
     text("project", group.project);
     text("working_dir", group.working_dir || "(unknown)");
     text("config_files", (group.config_files || []).join(", ") || "(unknown)");
+    text("env_files", (group.env_files || []).join(", "));
+    $("[data-claim-env-files]", form).hidden = !(group.env_files || []).length;
     text("summary", compose
       ? `Compose project with ${group.containers.length} container(s): ${group.containers.map((c) => c.name).join(", ")}.`
       : `Standalone container running ${group.images.join(", ")}.`);
