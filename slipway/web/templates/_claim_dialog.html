@@ -67,7 +67,7 @@
 
       <label class="check">
         <input type="checkbox" name="import_env">
-        <span><strong>Import environment variables</strong><br><span class="subtle">Reads the containers' variables with <code>docker inspect</code> (leaving out the image's own). These usually include passwords and API keys: they are stored encrypted, and anyone who can edit the instance can read them.</span></span>
+        <span><strong>Import environment variables</strong><br><span class="subtle">Reads the containers' variables with <code>docker inspect</code> (leaving out the image's own)<span data-claim-env-files hidden> and the project's <code data-claim-text="env_files"></code>, including values only the compose file uses, such as ports and paths</span>. Slipway passes them to every deploy, so nothing has to be copied by hand. They usually include passwords and API keys: they are stored encrypted, and anyone who can edit the instance can read them.</span></span>
       </label>
       <label class="check">
         <input type="checkbox" name="auto_ports" checked>
