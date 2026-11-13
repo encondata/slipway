@@ -1,0 +1,46 @@
+{% extends "settings/_layout.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Integrations{% endblock %}
+{% block settings %}
+<section class="card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("globe", "i-lg") }}</span>
+    <div><h2>Switchyard</h2><p>The reverse proxy that publishes instances' hostnames. Slipway creates and updates a proxy host for each hostname after every successful deploy.</p></div>
+    <span class="spacer"></span>
+    {% if sy.url and sy_has_key %}<span class="badge success">Connected</span>{% else %}<span class="badge">Not set up</span>{% endif %}
+  </div>
+  <form class="card-body stack" style="gap: 16px" method="post" action="/js-required"
+        data-form="PUT /api/v1/settings/switchyard" data-success="Switchyard settings saved" data-then="reload">
+    <div class="form-grid">
+      <div class="field span-2">
+        <label for="sy-url">Switchyard URL</label>
+        <input class="input mono" id="sy-url" name="url" value="{{ sy.url or '' }}" placeholder="https://switchyard.example.com" required>
+        <span class="help">The address Slipway uses to reach Switchyard's web UI and API (Slipway adds <code>/api</code>).</span>
+      </div>
+      <div class="field">
+        <label for="sy-key">API key</label>
+        <input class="input mono" id="sy-key" name="api_key" type="password" autocomplete="off" placeholder="{{ 'Saved; leave empty to keep it' if sy_has_key else 'sy_…' }}" {{ '' if sy_has_key else 'required' }}>
+        <span class="help">Encrypted at rest and never shown again.</span>
+      </div>
+      <div class="field">
+        <label for="sy-tls">Default certificate for new hostnames</label>
+        <select class="input" id="sy-tls" name="default_tls_mode">
+          {% for value, label in [("auto", "Let's Encrypt (public names)"), ("dns", "DNS challenge (provider set in Switchyard)"), ("internal", "Internal CA (LAN-only names)"), ("off", "No TLS (plain HTTP)")] %}
+          <option value="{{ value }}" {{ 'selected' if (sy.default_tls_mode or 'auto') == value }}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="callout">{{ icon("info") }}<div>In Switchyard, make a key under <strong>Administration → API keys</strong> named <code>slipway</code> with these operations:
+      {% for op in required_operations %}<code>{{ op }}</code>{{ ", " if not loop.last }}{% endfor %}.
+      Slipway applies its changes only when nothing else is waiting in Switchyard's <em>Review &amp; apply</em>; otherwise they stay staged and the deploy log says so.</div></div>
+    <div class="row" style="gap: 8px; flex-wrap: wrap">
+      <button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button>
+      {% if sy.url and sy_has_key %}
+      <button class="btn" type="button" data-api="POST /api/v1/settings/switchyard/test" data-success-field="message">{{ icon("sync", "i-sm") }} Test connection</button>
+      <button class="btn btn-danger" type="button" data-api="PUT /api/v1/settings/switchyard" data-body='{"clear": true}'
+        data-confirm="Disconnect Switchyard? Hostnames already in Switchyard stay there; Slipway stops updating them." data-success="Switchyard disconnected" data-then="reload">Disconnect</button>
+      {% endif %}
+    </div>
+  </form>
+</section>
+{% endblock %}

@@ -158,6 +158,30 @@ file holds the interpolated environment values and is readable only by the SSH u
 with `docker compose config` that the ports came out as planned before it stops or starts anything. Only host
 ports move: container ports stay the same, so services still reach each other on the compose network.
 
+### Hostnames through Switchyard
+
+An instance can list **hostnames** (`app.example.com`), each pointing at one of its published ports: a compose
+service and container port, or a container port in Dockerfile mode, plus the certificate mode. At the end of
+every successful deploy, and with **Sync proxy** on the instance page (`POST /api/v1/instances/{id}/proxy/sync`),
+Slipway makes [Switchyard](https://github.com/encondata/switchyard) match: one proxy host per hostname, sending
+traffic to the Docker host's address on the host port the container port ended up on. A port Slipway moved
+because it was taken is followed. Hostnames removed from the instance, and all of them when the instance is
+deleted, are removed from Switchyard. A hostname is unique across instances.
+
+- **Connect it** under *Settings → Integrations* (needs `settings:write`): the Switchyard URL and an API key
+  made under *Administration → API keys* with `hosts.list`, `hosts.get`, `hosts.create`, `hosts.update`,
+  `hosts.delete`, `config.preview` and `config.apply`. The key is encrypted at rest; *Test connection* checks it.
+- **Where traffic goes:** the host's address, or the host's *Address for the reverse proxy* when Switchyard
+  must reach it by another address than Slipway uses for SSH.
+- **Applying:** Switchyard stages changes until an apply, and an apply sends every pending change to Caddy. So
+  Slipway applies only when nothing else was waiting and Caddy was not changed outside Switchyard; otherwise
+  its changes stay staged and the deploy log (and the instance page) say to apply them in Switchyard.
+- **What Slipway changes:** only the hosts it created, which it marks in their notes, and only their domains,
+  upstream address and port, and certificate mode. Access policies, headers and other settings made in
+  Switchyard stay. A hostname another Switchyard host already uses is left alone and reported.
+- A Switchyard problem never fails a deploy: the containers are running, and the problem is in the deploy log
+  and on the instance page.
+
 ### Claiming containers Slipway did not deploy
 
 The host page lists **unmanaged containers**: compose projects (grouped by `com.docker.compose.project`) and

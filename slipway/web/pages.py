@@ -23,6 +23,7 @@ from slipway.core.permissions import PERMISSION_DESCRIPTIONS, Perm, has_permissi
 from slipway.db.base import utcnow
 from slipway.models import (
     ApiToken,
+    AppSetting,
     AuditEvent,
     Deployment,
     DeploymentStatus,
@@ -34,6 +35,7 @@ from slipway.models import (
     Role,
     User,
 )
+from slipway.services import switchyard
 from slipway.services.auth import AuthContext
 from slipway.services.users import user_count
 from slipway.web.oauth import safe_next
@@ -377,7 +379,11 @@ async def instances_page(request: Request, db: DB, ctx: PageAuth) -> HTMLRespons
 async def _form_context(db: DB) -> dict[str, Any]:
     repos = (await db.scalars(select(Repository).where(Repository.archived.is_(False)).order_by(Repository.full_name))).all()
     hosts = (await db.scalars(select(Host).order_by(Host.name))).all()
-    return {"repos": repos, "hosts": hosts}
+    return {
+        "repos": repos, "hosts": hosts,
+        "switchyard_configured": await switchyard.load_config(db) is not None,
+        "default_tls": await switchyard.default_tls_mode(db),
+    }
 
 
 @router.get("/instances/new")
@@ -504,6 +510,17 @@ async def settings_roles(request: Request, db: DB, ctx: PageAuth) -> HTMLRespons
     return await render(
         request, db, "settings/roles.html", ctx, tab="roles", roles=roles, catalog=PERMISSION_DESCRIPTIONS,
         choices=choices, grantable={p for p in choices if has_permission(ctx.user.permissions, p)},
+    )
+
+
+@router.get("/settings/integrations")
+async def settings_integrations(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
+    need(ctx, Perm.SETTINGS_WRITE)
+    row = await db.scalar(select(AppSetting).where(AppSetting.key == switchyard.SETTING_KEY))
+    return await render(
+        request, db, "settings/integrations.html", ctx, tab="integrations",
+        sy=(row.value if row else None) or {}, sy_has_key=bool(row and row.secret),
+        required_operations=switchyard.REQUIRED_OPERATIONS,
     )
 
 

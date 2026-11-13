@@ -62,6 +62,28 @@
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.published_ports %}<span class="chip mono">{{ p.service }} {{ p.host }} → {{ p.container }}/{{ p.protocol }}</span>{% if p.declared %} <span class="subtle">(compose file: {{ p.declared }})</span>{% endif %} {% else %}<span class="muted">{{ "None published" if instance.last_deployed_at else "From the compose file, on the first deploy" }}</span>{% endfor %}</dd>
         {% endif %}
         <dt>{{ icon("alert", "i-sm") }} Taken ports</dt><dd>{{ "Move to the next free port" if instance.auto_ports else "Stop the deploy" }}</dd>
+        <dt>{{ icon("globe", "i-sm") }} Hostnames</dt><dd>
+          {%- set entries = {} -%}
+          {%- for e in instance.proxy_entries or [] %}{% set _ = entries.update({e.hostname: e}) %}{% endfor -%}
+          {%- set route_names = (instance.routes or [])|map(attribute="hostname")|list -%}
+          {%- for r in instance.routes or [] %}
+          {%- set e = entries.get(r.hostname) -%}
+          <div class="row" style="gap: 6px; flex-wrap: wrap; margin-bottom: 4px">
+            <a class="chip mono" href="{{ 'http' if r.tls_mode == 'off' else 'https' }}://{{ r.hostname }}" target="_blank" rel="noopener">{{ r.hostname }}</a>
+            <span class="subtle mono">→ {{ e.upstream if e and e.upstream else ((r.service ~ ":") if r.service else "") ~ r.container }}</span>
+            {% if not e %}<span class="badge">Not published yet</span>
+            {% elif e.state == "live" %}<span class="badge success">Live</span>
+            {% elif e.state == "staged" %}<span class="badge warning" title="{{ e.message }}">Staged in Switchyard</span>
+            {% else %}<span class="badge danger" title="{{ e.message }}">Error</span> <span class="subtle">{{ e.message }}</span>{% endif %}
+          </div>
+          {%- else %}<span class="muted">None</span>{% endfor %}
+          {%- for e in instance.proxy_entries or [] if e.hostname not in route_names %}
+          <div class="row" style="gap: 6px"><span class="chip mono">{{ e.hostname }}</span><span class="badge danger" title="{{ e.message }}">Not removed</span> <span class="subtle">{{ e.message }}</span></div>
+          {%- endfor %}
+          {% if auth.can(Perm.INSTANCES_WRITE) and (instance.routes or instance.proxy_entries) and instance.status != "created" %}
+          <div style="margin-top: 6px"><button class="btn btn-sm" data-api="POST /api/v1/instances/{{ instance.id }}/proxy/sync" data-then="reload">{{ icon("sync", "i-sm") }} Sync proxy</button></div>
+          {% endif %}
+        </dd>
         <dt>{{ icon("key", "i-sm") }} Environment</dt><dd>
           {%- if env_unreadable -%}
           <span class="badge warning">Unreadable</span> Stored variables could not be decrypted (wrong <code>SLIPWAY_ENCRYPTION_KEY</code>?). Deploys fail until they are entered again or the key is restored.

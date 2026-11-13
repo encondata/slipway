@@ -56,7 +56,7 @@ from sqlalchemy import func, select, update
 from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
 from slipway.models import BuildSource, Deployment, DeploymentStatus, Instance, InstanceStatus, Repository, User
-from slipway.services import ports, ssh
+from slipway.services import ports, ssh, switchyard
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 
@@ -1176,6 +1176,12 @@ async def run_deployment(
         await sink.close()
         await _finish(deployment_id, DeploymentStatus.FAILED, error=str(exc), status=InstanceStatus.FAILED)
         return
+    if job.instance.routes or job.instance.proxy_entries:
+        try:
+            await switchyard.sync_and_store(job.instance, say=sink.line)
+        except Exception as exc:  # the containers are running: a proxy problem never fails the deploy
+            log.warning("Proxy sync after deployment %s failed: %s", deployment_id, exc)
+            await sink.line(f"Proxy: could not update Switchyard: {exc}")
     await sink.line("Deployment succeeded")
     await sink.close()
     await _finish(

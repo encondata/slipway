@@ -30,6 +30,11 @@
     <span class="help">Where Slipway keeps releases on the host. The SSH user must own it and be in the <code>docker</code> group.</span>
   </div>
   <div class="field span-2">
+    <label for="hf-proxy">Address for the reverse proxy <span class="subtle">(optional)</span></label>
+    <input class="input mono" id="hf-proxy" name="proxy_address" value="{{ (h.proxy_address or '') if h else '' }}" placeholder="Same as the hostname above" data-keep-empty>
+    <span class="help">Where Switchyard sends traffic for this host's instances, when it differs from the address Slipway uses for SSH (for example the LAN IP when Slipway connects over a VPN).</span>
+  </div>
+  <div class="field span-2">
     <span class="label-text">Authentication</span>
     <div class="choice-grid">
       {% set method = "keep" if h else "generate" %}

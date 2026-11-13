@@ -37,6 +37,9 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     environment: Mapped[str] = mapped_column(String(32), default="")  # prod / staging / dev ...
     description: Mapped[str] = mapped_column(String(255), default="")
     deploy_root: Mapped[str] = mapped_column(String(255), default="/opt/slipway")
+    # Address the reverse proxy uses to reach this host's published ports, when it is not ``hostname``
+    # (Slipway reaching the host by another name or over a VPN, say).
+    proxy_address: Mapped[str | None] = mapped_column(String(255))
 
     auth_method: Mapped[str] = mapped_column(String(16), default=HostAuthMethod.KEY)
     private_key: Mapped[str | None] = mapped_column(EncryptedText)
@@ -62,6 +65,11 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     @property
     def address(self) -> str:
         return self.hostname if self.port == 22 else f"{self.hostname}:{self.port}"
+
+    @property
+    def upstream_address(self) -> str:
+        """Where the reverse proxy sends traffic for this host's published ports."""
+        return self.proxy_address or self.hostname
 
     @property
     def is_pinned(self) -> bool:
