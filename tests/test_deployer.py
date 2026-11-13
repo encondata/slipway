@@ -137,10 +137,16 @@ class FakeGitHub:
 
 
 class FakeRemote:
-    def __init__(self, fail_on: str | None = None):
+    """``responses`` maps a command substring to its output (a callable gets the remote and the command).
+
+    ``docker compose config`` prints a compose file with no services unless a response says otherwise.
+    """
+
+    def __init__(self, fail_on: str | None = None, responses: dict | None = None):
         self.commands: list[str] = []
         self.files: dict[str, str | bytes] = {}
         self.fail_on = fail_on
+        self.responses = responses or {}
 
     async def run(self, command, *, check=True, on_line=None, timeout=None):
         self.commands.append(command)
@@ -148,6 +154,11 @@ class FakeRemote:
             await on_line("Step 1/3 : FROM node:22")
         if self.fail_on and self.fail_on in command:
             raise ssh.CommandFailed(command, 1, "build exploded")
+        for needle, out in self.responses.items():
+            if needle in command:
+                return 0, out(self, command) if callable(out) else out
+        if " config --format json" in command:
+            return 0, '{"services": {}}'
         return 0, ""
 
     async def put(self, local, remote):

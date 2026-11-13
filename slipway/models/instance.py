@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import ForeignKey, String, Text, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from slipway.core.crypto import EncryptedJSON
@@ -59,6 +59,13 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     env: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
     ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list)  # [{host, container, protocol}]
     volumes: Mapped[list[dict[str, Any]]] = mapped_column(default=list)  # [{source, target}]
+    # When a host port is taken at deploy time, use the next free one (else the deploy fails before it starts).
+    auto_ports: Mapped[bool] = mapped_column(default=True, server_default=true())
+    # Compose mode: host ports to use instead of the compose file's, [{service, container, protocol, host, auto?}].
+    # Ports Slipway moved are stored here too (auto: true), so they stay the same on later deploys.
+    port_overrides: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+    # Host ports the last deployment published, [{service, container, protocol, host, host_ip?, declared?}].
+    published_ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
 
     status: Mapped[str] = mapped_column(String(16), default=InstanceStatus.CREATED)
     current_commit_sha: Mapped[str | None] = mapped_column(String(40))

@@ -19,6 +19,7 @@ dependencies = [
     "asyncssh[bcrypt]>=2.18",  # bcrypt: passphrase-protected OpenSSH keys
     "jinja2>=3.1",
     "python-multipart>=0.0.18",
+    "pyyaml>=6.0",  # reads compose files for port variables where Compose cannot
 ]
 
 [project.optional-dependencies]
