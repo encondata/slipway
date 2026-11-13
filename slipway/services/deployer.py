@@ -11,8 +11,12 @@ Pipeline for one deployment:
    from the repository's ``.env`` followed by Slipway's values, so Slipway's values win. (A repository
    value that interpolates one Slipway overrides keeps the repository's value in ``${...}`` of the
    compose file; ``env_file: .env`` sees Slipway's.)
-5. ``docker build`` + ``docker run`` (Dockerfile mode) or ``docker compose up -d --build``.
-6. Point ``current`` at the new release and prune old releases/images.
+5. Check the host ports the deployment publishes against the ports in use on the host, and
+   move taken ones to the next free port when the instance allows it (see ``services.ports``).
+   Compose mode reads them from ``docker compose config`` and passes moved ports back through
+   the compose file's own variables or ``shared/compose.ports.yml``.
+6. ``docker build`` + ``docker run`` (Dockerfile mode) or ``docker compose up -d --build``.
+7. Point ``current`` at the new release and prune old releases/images.
 
 Every deployment gets its own release directory, so the one ``current`` points to is never
 touched by a redeploy. A failed deployment removes its release again unless containers were
@@ -44,7 +48,7 @@ from sqlalchemy import func, select, update
 from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
 from slipway.models import BuildSource, Deployment, DeploymentStatus, Instance, InstanceStatus, Repository, User
-from slipway.services import ssh
+from slipway.services import ports, ssh
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 
@@ -187,6 +191,11 @@ class InstancePaths:
         return f"{self.shared}/slipway.env"
 
     @property
+    def ports_override_file(self) -> str:
+        """Compose mode: replaces the ``ports`` of services whose host ports Slipway moved."""
+        return f"{self.shared}/compose.ports.yml"
+
+    @property
     def current(self) -> str:
         return f"{self.base}/current"
 
@@ -200,9 +209,27 @@ def paths_for(instance: Instance) -> InstancePaths:
     return InstancePaths(clean_deploy_root(instance.host.deploy_root), instance.slug)
 
 
-def _compose(instance: Instance) -> str:
+def _compose(instance: Instance, override: str | None = None) -> str:
+    """The compose command line. ``override`` (the ports override file) is only passed where
+    containers are created; start, stop, restart and logs do not depend on the host ports."""
     env_file = paths_for(instance).env_file
-    return f"docker compose -p {q(instance.compose_project)} --env-file {q(env_file)} -f {q(instance.compose_file)}"
+    extra = f" -f {q(override)}" if override else ""
+    return f"docker compose -p {q(instance.compose_project)} --env-file {q(env_file)} -f {q(instance.compose_file)}{extra}"
+
+
+def compose_config_command(instance: Instance, release_dir: str, *, override: str | None = None, interpolate: bool = True) -> str:
+    """Print the resolved compose file as JSON, folded into short lines (join them with no separator).
+
+    Run after the merged ``.env`` is in place. On failure prints Compose's error instead. The
+    output holds environment values: it is parsed, never logged.
+    """
+    compose = _compose(instance, override)
+    flag = "" if interpolate else " --no-interpolate"
+    return (
+        f"cd {q(release_dir)} && "
+        f"{{ out=$({compose} config --format json{flag} 2>/dev/null) || {{ {compose} config --quiet{flag}; exit 1; }}; }} && "
+        "if command -v fold >/dev/null 2>&1; then printf '%s\\n' \"$out\" | fold -w 4000; else printf '%s\\n' \"$out\"; fi"
+    )
 
 
 def _label(instance: Instance) -> str:
@@ -235,20 +262,31 @@ def _root_rm(parent: str, name: str) -> str:
     return f"docker run --rm --network none -v {parent}:/r {CLEANUP_IMAGE} rm -rf -- /r/{name}"
 
 
-def build_commands(instance: Instance, release_dir: str, sha: str) -> list[str]:
-    """Commands (run in order) that build and start a release."""
+def compose_env_command(instance: Instance, release_dir: str) -> str:
+    """Build ``shared/.env``: the repository's .env defaults, with Slipway's values after them so they win."""
+    paths = paths_for(instance)
+    project_dir = posixpath.normpath(posixpath.join(release_dir, posixpath.dirname(instance.compose_file) or "."))
+    env, merged = q(paths.env_file), q(paths.env_file + ".new")
+    return (
+        f"cd {q(project_dir)} && umask 077 && "
+        f"{{ if [ -f .env ] && [ ! -L .env ]; then cat .env; echo; fi; cat {q(paths.slipway_env_file)}; }} > {merged} && "
+        f"mv -f {merged} {env} && ln -sfn {env} .env"
+    )
+
+
+def build_commands(instance: Instance, release_dir: str, sha: str, *, override: str | None = None) -> list[str]:
+    """Commands (run in order) that build and start a release.
+
+    ``override`` is the compose ports override file, when Slipway moved ports that the compose
+    file fixes.
+    """
     paths = paths_for(instance)
     label = _label(instance)
     if instance.build_source == BuildSource.COMPOSE:
-        project_dir = posixpath.normpath(posixpath.join(release_dir, posixpath.dirname(instance.compose_file) or "."))
-        env, merged = q(paths.env_file), q(paths.env_file + ".new")
         return [
-            # Keep the repository's .env defaults, with Slipway's values after them so they win.
-            f"cd {q(project_dir)} && umask 077 && "
-            f"{{ if [ -f .env ] && [ ! -L .env ]; then cat .env; echo; fi; cat {q(paths.slipway_env_file)}; }} > {merged} && "
-            f"mv -f {merged} {env} && ln -sfn {env} .env",
+            compose_env_command(instance, release_dir),
             _remove_containers(instance),
-            f"cd {q(release_dir)} && {_compose(instance)} up -d --build --remove-orphans",
+            f"cd {q(release_dir)} && {_compose(instance, override)} up -d --build --remove-orphans",
         ]
 
     image = f"slipway/{instance.slug}:{sha[:12]}"
@@ -702,6 +740,134 @@ async def _discard_release(
         await sink.line(f"Warning: could not remove unused release {release}")
 
 
+# One port check at a time per host, so two deployments can't both pick the same free port.
+# A check stores its result on the instance before the lock is released, and the next check
+# counts it as taken.
+_host_port_locks: defaultdict[uuid.UUID, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def _reserved_ports(instance: Instance) -> list[tuple[int, str, str]]:
+    """(port, protocol, instance name) for the host ports other deployed instances on the host use."""
+    async with session_scope() as db:
+        rows = (await db.execute(
+            select(Instance.name, Instance.build_source, Instance.ports, Instance.published_ports).where(
+                Instance.host_id == instance.host_id,
+                Instance.id != instance.id,
+                Instance.status != InstanceStatus.CREATED,
+            )
+        )).all()
+    out = []
+    for name, source, configured, published in rows:
+        for p in (configured if source == BuildSource.DOCKERFILE else published) or []:
+            try:
+                out.append((int(p["host"]), "udp" if p.get("protocol") == "udp" else "tcp", name))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+async def _plan_ports(
+    remote: ssh.RemoteSession, instance: Instance, declared: list[ports.Binding], sink: LogSink,
+) -> ports.PortPlan:
+    """Check ``declared`` against the host, move clashes if allowed, and store the result.
+
+    Raises DeployError on a clash the instance does not allow Slipway to move.
+    """
+    overrides: dict[tuple[str | None, int, str], int] = {}
+    if instance.build_source == BuildSource.COMPOSE:
+        for o in instance.port_overrides or []:
+            overrides[(o["service"], int(o["container"]), o.get("protocol") or "tcp")] = int(o["host"])
+    async with _host_port_locks[instance.host_id]:
+        _, output = await remote.run(ports.SCAN_COMMAND, check=False, timeout=60)
+        host_ports = ports.parse_scan(output, instance_id=str(instance.id), compose_project=instance.compose_project)
+        for port, protocol, name in await _reserved_ports(instance):
+            host_ports.reserve(port, protocol, f"Slipway instance {name}")
+        try:
+            plan = ports.plan(declared, host_ports, overrides=overrides, auto=instance.auto_ports, host_name=instance.host.name)
+        except ports.PortError as exc:
+            raise DeployError(str(exc)) from exc
+        for wanted, given, why in plan.moved:
+            await sink.line(f"Host port {wanted.describe()} is {why}; using {given.host} instead")
+        fields: dict[str, Any] = {"published_ports": ports.binding_rows(plan)}
+        if instance.build_source == BuildSource.COMPOSE:
+            fields["port_overrides"] = _merge_overrides(instance.port_overrides or [], plan)
+        else:
+            fields["ports"] = [
+                {**p, "host": b.host} for p, b in zip(instance.ports, plan.bindings, strict=True)
+            ]
+        async with session_scope() as db:
+            await db.execute(update(Instance).where(Instance.id == instance.id).values(**fields))
+    for key, value in fields.items():
+        setattr(instance, key, value)
+    return plan
+
+
+def _merge_overrides(current: list[dict[str, Any]], plan: ports.PortPlan) -> list[dict[str, Any]]:
+    """The instance's port overrides with each port Slipway moved added (marked ``auto``)."""
+    merged = [dict(o) for o in current]
+    for wanted, given, _ in plan.moved:
+        row = next(
+            (o for o in merged if (o["service"], int(o["container"]), o.get("protocol") or "tcp") == wanted.key), None
+        )
+        if row is None:
+            merged.append({"service": wanted.service, "container": wanted.container, "protocol": wanted.protocol,
+                           "host": given.host, "auto": True})
+        else:
+            row.update(host=given.host, auto=True)
+    return merged
+
+
+async def _compose_config(remote: ssh.RemoteSession, instance: Instance, release: str, **kw: Any) -> dict[str, Any]:
+    _, output = await remote.run(compose_config_command(instance, release, **kw), timeout=300)
+    try:
+        return ports.parse_compose_json("".join(output.splitlines()))
+    except ports.PortError as exc:
+        raise DeployError(str(exc)) from exc
+
+
+async def _prepare_compose_ports(
+    remote: ssh.RemoteSession, instance: Instance, release: str, env: dict[str, str], sink: LogSink,
+) -> str | None:
+    """Check the compose file's host ports and pass any that move back to Compose.
+
+    Runs after ``shared/.env`` is merged. Returns the override file to pass to ``up``, if any.
+    """
+    paths = paths_for(instance)
+    await sink.line("Checking the host ports the compose file publishes")
+    config = await _compose_config(remote, instance, release)
+    try:
+        raw = await _compose_config(remote, instance, release, interpolate=False)
+    except (DeployError, ssh.SSHError):
+        raw = None  # only needed to find port variables; without it moved ports use the override file
+    declared = ports.compose_bindings(config, raw)
+    plan = await _plan_ports(remote, instance, declared, sink)
+    variables, override = ports.compose_changes(plan, config)
+    for old, new in plan.changed:
+        if not any(old.key == w.key for w, _, _ in plan.moved):
+            await sink.line(f"Using host port {new.host} for {old.service} container port {old.container} (port override)")
+    await remote.run(f"rm -f -- {q(paths.ports_override_file)}")
+    if variables:
+        await remote.write_text(paths.slipway_env_file, render_compose_env({**env, **variables}))
+        await remote.run(compose_env_command(instance, release))
+        await sink.line("Set " + ", ".join(f"{k}={v}" for k, v in sorted(variables.items())) + " for the compose file")
+    if override is None and not variables:
+        return None
+    if override is not None:
+        await remote.write_text(paths.ports_override_file, override)
+        await sink.line(f"Wrote host port changes to {paths.ports_override_file}")
+    # Check that Compose applied them: an older Compose ignores !override.
+    applied = ports.compose_bindings(await _compose_config(remote, instance, release, override=override and paths.ports_override_file))
+    want = sorted((b.service or "", b.container, b.protocol, b.host_ip, b.host) for b in plan.bindings)
+    got = sorted((b.service or "", b.container, b.protocol, b.host_ip, b.host) for b in applied)
+    if want != got:
+        raise DeployError(
+            f"Docker Compose on {instance.host.name} did not apply the new host ports. Moving a port the compose "
+            "file sets as a number needs Docker Compose 2.24.4 or later; or take the port from a variable, "
+            "such as \"${WEB_PORT:-8080}:80\""
+        )
+    return paths.ports_override_file if override is not None else None
+
+
 async def _install(
     remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, tarball: Path,
     env: dict[str, str], sink: LogSink,
@@ -709,19 +875,30 @@ async def _install(
     paths = paths_for(instance)
     release = paths.release(sha, deployment_id)
     upload = f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz"
+    compose = instance.build_source == BuildSource.COMPOSE
     await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
     try:
         await remote.put(tarball, upload)
         await remote.run(unpack_command(release, upload))
         await sink.line(f"Unpacked release into {release}")
-        if instance.build_source == BuildSource.COMPOSE:
+        if compose:
             env_path, content = paths.slipway_env_file, render_compose_env(env)
         else:
             env_path, content = paths.env_file, render_env(env)
         await remote.write_text(env_path, content)
         await sink.line(f"Wrote {len(env)} environment variable(s) to {env_path}")
 
-        for command in build_commands(instance, release, sha):
+        override = None
+        commands = build_commands(instance, release, sha)
+        if compose:
+            await sink.line(f"$ {commands[0]}")
+            await remote.run(commands[0], on_line=sink.line, timeout=3600)
+            override = await _prepare_compose_ports(remote, instance, release, env, sink)
+            commands = build_commands(instance, release, sha, override=override)[1:]
+        elif instance.ports:
+            await _plan_ports(remote, instance, ports.dockerfile_bindings(instance.ports), sink)
+            commands = build_commands(instance, release, sha)
+        for command in commands:
             await sink.line(f"$ {command}")
             await remote.run(command, on_line=sink.line, timeout=3600)
     except Exception:

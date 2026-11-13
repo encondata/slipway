@@ -41,7 +41,10 @@
         {% if instance.build_source == "dockerfile" %}
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.ports %}<span class="chip mono">{{ p.host }} → {{ p.container }}/{{ p.protocol }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         <dt>{{ icon("database", "i-sm") }} Volumes</dt><dd>{% for v in instance.volumes %}<span class="chip mono">{{ v.source }} → {{ v.target }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
+        {% else %}
+        <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.published_ports %}<span class="chip mono">{{ p.service }} {{ p.host }} → {{ p.container }}/{{ p.protocol }}</span>{% if p.declared %} <span class="subtle">(compose file: {{ p.declared }})</span>{% endif %} {% else %}<span class="muted">{{ "None published" if instance.last_deployed_at else "From the compose file, on the first deploy" }}</span>{% endfor %}</dd>
         {% endif %}
+        <dt>{{ icon("alert", "i-sm") }} Taken ports</dt><dd>{{ "Move to the next free port" if instance.auto_ports else "Stop the deploy" }}</dd>
         <dt>{{ icon("key", "i-sm") }} Environment</dt><dd>
           {%- if env_unreadable -%}
           <span class="badge warning">Unreadable</span> Stored variables could not be decrypted (wrong <code>SLIPWAY_ENCRYPTION_KEY</code>?). Deploys fail until they are entered again or the key is restored.

@@ -11,7 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, fie
 
 from slipway.core.permissions import validate_permissions
 from slipway.models import Deployment, Host, Instance, Repository, User
-from slipway.services import deployer
+from slipway.services import deployer, ports
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -287,6 +287,16 @@ class PortMapping(BaseModel):
     protocol: Literal["tcp", "udp"] = "tcp"
 
 
+class PortOverride(BaseModel):
+    """Compose mode: publish ``service``'s ``container`` port on host port ``host`` instead."""
+
+    service: Str = Field(min_length=1, max_length=128, pattern=ports.SERVICE_RE.pattern)
+    container: int = Field(ge=1, le=65535)
+    host: int = Field(ge=1, le=65535)
+    protocol: Literal["tcp", "udp"] = "tcp"
+    auto: bool = False  # chosen by Slipway because the port was taken
+
+
 class VolumeMapping(BaseModel):
     source: Str = Field(min_length=1, max_length=255)
     target: Str = Field(min_length=1, max_length=255)
@@ -317,6 +327,19 @@ class _InstanceFields(BaseModel):
     env: dict[EnvKey, EnvValue] | None = Field(None, max_length=500)
     ports: list[PortMapping] | None = Field(None, max_length=100)
     volumes: list[VolumeMapping] | None = Field(None, max_length=100)
+    auto_ports: bool | None = None
+    port_overrides: list[PortOverride] | None = Field(None, max_length=100)
+
+    @field_validator("port_overrides")
+    @classmethod
+    def _one_override_per_port(cls, v: list[PortOverride] | None) -> list[PortOverride] | None:
+        seen = set()
+        for o in v or []:
+            key = (o.service, o.container, o.protocol)
+            if key in seen:
+                raise ValueError(f"Two port overrides for {o.service} container port {o.container}/{o.protocol}")
+            seen.add(key)
+        return v
 
     @field_validator("dockerfile_path", "compose_file")
     @classmethod
@@ -368,6 +391,10 @@ class InstanceOut(Out):
     env_unreadable: bool = False
     ports: list[dict[str, Any]]
     volumes: list[dict[str, Any]]
+    auto_ports: bool
+    port_overrides: list[dict[str, Any]]
+    # Host ports the last deployment published; ``declared`` is the port the compose file asked for.
+    published_ports: list[dict[str, Any]]
     status: str
     current_commit_sha: str | None
     last_deployed_at: datetime | None
@@ -393,6 +420,9 @@ class InstanceOut(Out):
             env_unreadable=env_unreadable,
             ports=i.ports,
             volumes=i.volumes,
+            auto_ports=i.auto_ports,
+            port_overrides=i.port_overrides or [],
+            published_ports=i.published_ports or [],
             status=i.status,
             current_commit_sha=i.current_commit_sha,
             last_deployed_at=i.last_deployed_at,

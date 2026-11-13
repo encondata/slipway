@@ -142,6 +142,19 @@ ends in a backslash and also needs quoting requires a recent Docker Compose rele
 interpolates them with `${...}` (a service's `env_file: .env` does see Slipway's values), so set the derived
 variable in Slipway too.
 
+**Host ports:** before it builds or stops anything, a deployment checks the host ports it will publish
+against the ports in use on the host: listening sockets (`/proc/net`), ports Docker publishes for other
+containers, and ports other Slipway instances on the host were given (even while they are stopped). Its own
+containers' ports count as free. A taken port moves to the next free port above it, and the instance keeps
+that port on later deploys; turn off *Use the next free port* on the instance to make the deploy stop
+instead. Compose instances read their ports from `docker compose config` and can also set **host port
+overrides** (service, container port, host port) without changing the compose file. A moved port is passed
+back to Compose through the compose file's own variable when the port is written as one
+(`"${WEB_PORT:-8080}:80"`), so every other value that uses `${WEB_PORT}` follows; otherwise through
+`shared/compose.ports.yml`, which replaces the service's `ports` with `!override` (Docker Compose 2.24.4 or
+later; the deploy fails with a clear error on an older Compose). Only host ports move: container ports stay
+the same, so services still reach each other on the compose network.
+
 An instance's host and build settings (host, Dockerfile or compose, Dockerfile path, build context, compose
 file) can only change before its first deployment; after that, destroy it and create a new one. Deleting an
 instance, or changing these settings, is refused while a deployment is queued or running.
@@ -196,7 +209,7 @@ are only readable with `instances:write`.
 
 **Compose instances run repository-defined containers as root.** Slipway runs the compose file from the
 deployed branch as is (bind mounts, `privileged`, host namespaces and so on), ignoring the instance's port
-and volume settings. So anyone who can push to that branch, together with anyone holding
+mapping and volume settings (only host ports can be overridden). So anyone who can push to that branch, together with anyone holding
 `deployments:create`, effectively has root on that host and can read every other instance's `shared/.env`
 there. Use one host per trust level and protect deployed branches; on hosts that run compose instances from
 less-trusted branches, consider rootless Docker or userns-remap. The instance form shows this warning.

@@ -24,6 +24,18 @@
   <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
 </div>
 {%- endmacro %}
+{% macro override_row(o=None) -%}
+<div class="repeater-row port-override">
+  <input class="input mono" data-f="service" value="{{ o.service if o else '' }}" placeholder="service" aria-label="Compose service">
+  <input class="input" data-f="host" type="number" min="1" max="65535" value="{{ o.host if o else '' }}" placeholder="Host port" aria-label="Host port">
+  <span class="arrow">⟷</span>
+  <input class="input" data-f="container" type="number" min="1" max="65535" value="{{ o.container if o else '' }}" placeholder="Container port" aria-label="Container port">
+  <select class="input" data-f="protocol" aria-label="Protocol">
+    <option value="tcp">TCP</option><option value="udp" {{ 'selected' if o and o.protocol == 'udp' }}>UDP</option>
+  </select>
+  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+</div>
+{%- endmacro %}
 {% macro volume_row(vol=None) -%}
 <div class="repeater-row volume">
   <input class="input mono" data-f="source" value="{{ vol.source if vol else '' }}" placeholder="/var/lib/app-data or volume-name" aria-label="Host path or volume">
@@ -104,7 +116,7 @@
         <div class="field" data-show-when="build_source=compose">
           <label for="cf">Compose file</label>
           <input class="input mono" id="cf" name="compose_file" {{ 'disabled' if locked }} value="{{ instance.compose_file if editing else (selected_repo.compose_file if selected_repo and selected_repo.compose_file else 'docker-compose.yml') }}">
-          <span class="help">Ports and volumes come from the compose file. The variables below override the repository's <code>.env</code> (next to the compose file) and are passed literally.</span>
+          <span class="help">Ports and volumes come from the compose file; host ports can be changed under Runtime Configuration. The variables below override the repository's <code>.env</code> (next to the compose file) and are passed literally.</span>
         </div>
         <div class="callout warning" data-show-when="build_source=compose">{{ icon("alert") }}<span>Compose files run as trusted code with host-level access: anyone who can push to this branch and deploy it can take control of the host.</span></div>
         {% if locked %}<p class="help">Host and build settings are fixed after the first deployment. To change them, destroy this instance and create a new one.</p>{% endif %}
@@ -173,6 +185,24 @@
             <span class="help">Use absolute host paths or named volumes. Each deploy gets a fresh release directory.</span>
           </div>
         </div>
+        <div class="field" data-show-when="build_source=compose">
+          <span class="label-text">Host port overrides <span class="subtle">(optional)</span></span>
+          {% set published = instance.published_ports if editing else [] %}
+          {% if published %}
+          <span class="help">Published on the last deploy:
+            {% for p in published %}<span class="chip mono">{{ p.service }} {{ p.host }} → {{ p.container }}/{{ p.protocol }}{% if p.declared %} <span class="subtle">(file: {{ p.declared }})</span>{% endif %}</span> {% endfor %}</span>
+          {% endif %}
+          <div class="repeater" id="override-rep" data-repeater="port_overrides" data-min-keys="2">
+            {% for o in (instance.port_overrides if editing else []) %}{{ override_row(o) }}{% endfor %}
+            <template>{{ override_row() }}</template>
+          </div>
+          <div><button class="btn btn-sm" type="button" data-add-row="#override-rep">{{ icon("plus", "i-sm") }} Add port override</button></div>
+          <span class="help">Publish a service's container port on a different host port without changing the compose file. If the compose file takes that port from a variable (<code>"${WEB_PORT:-8080}:80"</code>), Slipway sets the variable, so other values that use it follow. Container ports stay the same, so services still reach each other as before.</span>
+        </div>
+        <label class="check">
+          <input type="checkbox" name="auto_ports" {{ 'checked' if not editing or instance.auto_ports }}>
+          <span><strong>Use the next free port when a host port is taken</strong><br><span class="subtle">Before starting anything, Slipway checks the host's ports in use, including ports of other Slipway instances. A taken port moves to the next free one, and Slipway keeps using it on later deploys. When this is off, the deploy stops before it changes anything.</span></span>
+        </label>
       </div>
     </section>
   </div>
