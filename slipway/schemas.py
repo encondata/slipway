@@ -395,6 +395,10 @@ class InstanceOut(Out):
     port_overrides: list[dict[str, Any]]
     # Host ports the last deployment published; ``declared`` is the port the compose file asked for.
     published_ports: list[dict[str, Any]]
+    # The compose project name Slipway uses (a claimed project keeps its own).
+    compose_project: str
+    # What the instance was claimed from, when it was claimed (see POST /hosts/{id}/claim).
+    claim: dict[str, Any] | None = None
     status: str
     current_commit_sha: str | None
     last_deployed_at: datetime | None
@@ -423,11 +427,66 @@ class InstanceOut(Out):
             auto_ports=i.auto_ports,
             port_overrides=i.port_overrides or [],
             published_ports=i.published_ports or [],
+            compose_project=i.compose_project,
+            claim=i.claim,
             status=i.status,
             current_commit_sha=i.current_commit_sha,
             last_deployed_at=i.last_deployed_at,
             created_at=i.created_at,
         )
+
+
+class ClaimGroup(BaseModel):
+    """Which unmanaged group to claim, as ``GET /hosts/{id}/unmanaged`` returned it (other fields are ignored)."""
+
+    kind: Literal["compose", "container"]
+    project: Annotated[str, Field(max_length=255), NoNul] | None = None
+    container_id: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$"), NoNul] | None = None
+
+
+class ClaimIn(BaseModel):
+    """Claim an unmanaged compose project or container as an instance.
+
+    Build settings default to what the group suggests: compose mode for a compose project (keeping
+    its project name), Dockerfile mode with the container's ports and volumes otherwise.
+    """
+
+    group: ClaimGroup
+    repository_id: uuid.UUID
+    name: Str = Field(min_length=1, max_length=100)
+    branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
+    build_source: Literal["dockerfile", "compose"] | None = None
+    dockerfile_path: Annotated[str, Field(max_length=255), NoNul] | None = None
+    build_context: Annotated[str, Field(max_length=255), NoNul] | None = None
+    compose_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    ports: list[PortMapping] | None = Field(None, max_length=100)  # Dockerfile mode; default: the container's
+    volumes: list[VolumeMapping] | None = Field(None, max_length=100)  # Dockerfile mode; default: the container's
+    auto_ports: bool | None = None
+    # Copy the containers' environment variables (minus the image's own) into the instance. They
+    # usually include secrets, so this is off unless asked for.
+    import_env: bool = False
+    # False: register only. The instance points at what runs now; nothing on the host changes.
+    deploy: bool = True
+
+    @field_validator("dockerfile_path", "compose_file")
+    @classmethod
+    def _rel(cls, v: str | None) -> str | None:
+        return None if v is None else deployer.clean_relative_path(v)
+
+    @field_validator("build_context")
+    @classmethod
+    def _ctx(cls, v: str | None) -> str | None:
+        return None if v is None else deployer.clean_relative_path(v, allow_dot=True)
+
+
+class ClaimOut(InstanceOut):
+    deployment_id: uuid.UUID | None = None
+    env_imported: list[str] = Field(default_factory=list)  # names only, never values
+    env_skipped: list[str] = Field(default_factory=list)  # containers disagree on the value, or it is unusable
+    env_files_read: list[str] = Field(default_factory=list)  # the project's env files that were imported
+    env_files_missing: list[str] = Field(default_factory=list)
+    env_files_unreadable: list[str] = Field(default_factory=list)
+    warning: str | None = None
 
 
 class ActionOut(BaseModel):

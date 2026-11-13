@@ -1,0 +1,84 @@
+{# Claim an unmanaged compose project or container (host page). slipway.js fills it from the group the Claim button belongs to. #}
+{% from "_macros.html" import icon %}
+{% from "_instance_rows.html" import port_row, volume_row %}
+<dialog class="modal" id="claim-dialog" style="width: min(760px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/hosts/{{ host.id }}/claim" data-claim-form
+        data-then="redirect:/instances/{id}" data-success="Claimed">
+    <div class="modal-head"><h2>Claim <span data-claim-text="name"></span></h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body stack" style="gap: 16px">
+      <input type="hidden" name="group" data-type="json">
+      <input type="hidden" name="build_source">
+      <p class="lede" style="margin: 0"><span data-claim-text="summary"></span></p>
+      <div class="callout warning" data-claim-warnings hidden>{{ icon("alert") }}<div><strong>Check before deploying</strong><ul data-claim-text="warnings" style="margin: 6px 0 0; padding-left: 18px"></ul></div></div>
+
+      <div class="form-grid" style="grid-template-columns: minmax(0, 2fr) minmax(0, 1fr)">
+        <div class="field">
+          <label for="claim-repo">Repository</label>
+          <select class="input" id="claim-repo" name="repository_id" data-branches-target="#claim-branch">
+            {% for r in claim_repos %}
+            <option value="{{ r.id }}" data-name="{{ r.name|lower }}" data-default="{{ r.default_branch if r.default_branch_usable else '' }}">{{ r.full_name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="claim-branch">Branch</label>
+          <select class="input" id="claim-branch" name="branch" required><option value="" selected disabled>Choose a branch</option></select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="claim-name">Instance name</label>
+        <input class="input" id="claim-name" name="name" required maxlength="100">
+      </div>
+
+      <div class="stack" style="gap: 12px" data-show-when="build_source=compose">
+        <div class="field">
+          <label for="claim-compose-file">Compose file in the repository</label>
+          <input class="input mono" id="claim-compose-file" name="compose_file" placeholder="docker-compose.yml">
+          <span class="help">Started from <code data-claim-text="config_files"></code>.</span>
+        </div>
+        <div class="callout primary">{{ icon("info") }}<div>
+          Slipway keeps the project name <code data-claim-text="project"></code>, so the named volumes and networks (<code><span data-claim-text="project"></span>_…</code>) and their data stay in use, and Compose replaces the running containers instead of starting a second copy.
+          The directory <code data-claim-text="working_dir"></code> is never changed or deleted, and no volume is removed.
+          The repository's compose file should define the same services and volumes: containers of services it does not define are removed on deploy (their volumes are kept).
+        </div></div>
+      </div>
+
+      <div class="stack" style="gap: 12px" data-show-when="build_source=dockerfile">
+        <div class="form-grid">
+          <div class="field"><label for="claim-df">Dockerfile path</label><input class="input mono" id="claim-df" name="dockerfile_path" value="Dockerfile"></div>
+          <div class="field"><label for="claim-ctx">Build context</label><input class="input mono" id="claim-ctx" name="build_context" value="."></div>
+        </div>
+        <div class="grid grid-2" style="gap: 18px">
+          <div class="field">
+            <span class="label-text">Port mapping <span class="subtle">(from the container)</span></span>
+            <div class="repeater" id="claim-port-rep" data-repeater="ports" data-min-keys="2"><template>{{ port_row() }}</template></div>
+            <div><button class="btn btn-sm" type="button" data-add-row="#claim-port-rep">{{ icon("plus", "i-sm") }} Add port mapping</button></div>
+          </div>
+          <div class="field">
+            <span class="label-text">Volume mapping <span class="subtle">(from the container)</span></span>
+            <div class="repeater" id="claim-vol-rep" data-repeater="volumes"><template>{{ volume_row() }}</template></div>
+            <div><button class="btn btn-sm" type="button" data-add-row="#claim-vol-rep">{{ icon("plus", "i-sm") }} Add volume mapping</button></div>
+          </div>
+        </div>
+        <div class="callout primary">{{ icon("info") }}<div>
+          The first deploy builds the repository's Dockerfile, stops <code data-claim-text="name"></code> just before starting the new container, and removes it once the new one runs. Its volumes are kept. If the new container does not start, <code data-claim-text="name"></code> is started again.
+        </div></div>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" name="import_env">
+        <span><strong>Import environment variables</strong><br><span class="subtle">Reads the containers' variables with <code>docker inspect</code> (leaving out the image's own)<span data-claim-env-files hidden> and the project's <code data-claim-text="env_files"></code>, including values only the compose file uses, such as ports and paths</span>. Slipway passes them to every deploy, so nothing has to be copied by hand. They usually include passwords and API keys: they are stored encrypted, and anyone who can edit the instance can read them.</span></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="auto_ports" checked>
+        <span><strong>Use the next free port when a host port is taken</strong><br><span class="subtle">The claimed containers' own ports count as free.</span></span>
+      </label>
+      <p class="subtle" style="margin: 0"><strong>Register only</strong> creates the instance and changes nothing on the host: the containers keep running as they are until you deploy.</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn" type="submit" name="deploy" value="false">Register only</button>
+      {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}<button class="btn btn-primary" type="submit" name="deploy" value="true">{{ icon("rocket") }} Claim and deploy</button>{% endif %}
+    </div>
+  </form>
+</dialog>

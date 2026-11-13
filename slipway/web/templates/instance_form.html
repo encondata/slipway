@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, meter, empty %}
+{% from "_instance_rows.html" import port_row, volume_row %}
 {% set editing = instance is not none %}
+{% set paths_locked = paths_locked if paths_locked is defined else locked %}
 {% block title %}{{ "Edit " ~ instance.name if editing else "Create Instance" }}{% endblock %}
 
 {% macro env_row(k="", v="") -%}
@@ -13,17 +15,7 @@
   </span>
 </div>
 {%- endmacro %}
-{% macro port_row(p=None) -%}
-<div class="repeater-row port">
-  <input class="input" data-f="host" type="number" min="1" max="65535" value="{{ p.host if p else '' }}" placeholder="Host port" aria-label="Host port">
-  <span class="arrow">⟷</span>
-  <input class="input" data-f="container" type="number" min="1" max="65535" value="{{ p.container if p else '' }}" placeholder="Container port" aria-label="Container port">
-  <select class="input" data-f="protocol" aria-label="Protocol">
-    <option value="tcp">TCP</option><option value="udp" {{ 'selected' if p and p.protocol == 'udp' }}>UDP</option>
-  </select>
-  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
-</div>
-{%- endmacro %}
+
 {% macro override_row(o=None) -%}
 <div class="repeater-row port-override">
   <input class="input mono" data-f="service" value="{{ o.service if o else '' }}" placeholder="service" aria-label="Compose service">
@@ -33,14 +25,6 @@
   <select class="input" data-f="protocol" aria-label="Protocol">
     <option value="tcp">TCP</option><option value="udp" {{ 'selected' if o and o.protocol == 'udp' }}>UDP</option>
   </select>
-  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
-</div>
-{%- endmacro %}
-{% macro volume_row(vol=None) -%}
-<div class="repeater-row volume">
-  <input class="input mono" data-f="source" value="{{ vol.source if vol else '' }}" placeholder="/var/lib/app-data or volume-name" aria-label="Host path or volume">
-  <span class="arrow">⟷</span>
-  <input class="input mono" data-f="target" value="{{ vol.target if vol else '' }}" placeholder="/app/data" aria-label="Container path">
   <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
 </div>
 {%- endmacro %}
@@ -110,16 +94,17 @@
           <label class="choice"><input type="radio" name="build_source" value="compose" {{ 'checked' if src == 'compose' }} {{ 'disabled' if locked }}>{{ icon("package") }}<span><strong>docker compose</strong><small>Use a compose file to build multiple services</small></span></label>
         </div>
         <div class="form-grid" data-show-when="build_source=dockerfile">
-          <div class="field"><label for="df">Dockerfile path</label><input class="input mono" id="df" name="dockerfile_path" {{ 'disabled' if locked }} value="{{ instance.dockerfile_path if editing else 'Dockerfile' }}"></div>
-          <div class="field"><label for="ctx">Build context</label><input class="input mono" id="ctx" name="build_context" {{ 'disabled' if locked }} value="{{ instance.build_context if editing else '.' }}"></div>
+          <div class="field"><label for="df">Dockerfile path</label><input class="input mono" id="df" name="dockerfile_path" {{ 'disabled' if paths_locked }} value="{{ instance.dockerfile_path if editing else 'Dockerfile' }}"></div>
+          <div class="field"><label for="ctx">Build context</label><input class="input mono" id="ctx" name="build_context" {{ 'disabled' if paths_locked }} value="{{ instance.build_context if editing else '.' }}"></div>
         </div>
         <div class="field" data-show-when="build_source=compose">
           <label for="cf">Compose file</label>
-          <input class="input mono" id="cf" name="compose_file" {{ 'disabled' if locked }} value="{{ instance.compose_file if editing else (selected_repo.compose_file if selected_repo and selected_repo.compose_file else 'docker-compose.yml') }}">
+          <input class="input mono" id="cf" name="compose_file" {{ 'disabled' if paths_locked }} value="{{ instance.compose_file if editing else (selected_repo.compose_file if selected_repo and selected_repo.compose_file else 'docker-compose.yml') }}">
           <span class="help">Ports and volumes come from the compose file; host ports can be changed under Runtime Configuration. The variables below override the repository's <code>.env</code> (next to the compose file) and are passed literally.</span>
         </div>
         <div class="callout warning" data-show-when="build_source=compose">{{ icon("alert") }}<span>Compose files run as trusted code with host-level access: anyone who can push to this branch and deploy it can take control of the host.</span></div>
-        {% if locked %}<p class="help">Host and build settings are fixed after the first deployment. To change them, destroy this instance and create a new one.</p>{% endif %}
+        {% if locked and not paths_locked %}<p class="help">This instance was claimed from containers already on the host: the host and build mode are fixed, and the paths can change until the first deployment.</p>
+        {% elif locked %}<p class="help">Host and build settings are fixed after the first deployment. To change them, destroy this instance and create a new one.</p>{% endif %}
       </div>
     </section>
 
@@ -146,7 +131,7 @@
         <div class="field">
           <label for="inst-name">Instance name</label>
           <input class="input" id="inst-name" name="name" required maxlength="100" value="{{ instance.name if editing else ((selected_repo.name ~ '-prod') if selected_repo else '') }}">
-          {% if editing %}<span class="help">Container / project name stays <code>slipway-{{ instance.slug }}</code>.</span>{% endif %}
+          {% if editing %}<span class="help">{{ "Compose project" if instance.build_source == "compose" else "Container" }} name stays <code>{{ instance.compose_project if instance.build_source == "compose" else instance.container_name }}</code>.</span>{% endif %}
         </div>
         <div class="field">
           <span class="label-text">Environment variables <span class="subtle">(encrypted at rest)</span></span>

@@ -226,8 +226,14 @@ class HostPorts:
         self.taken.setdefault((port, protocol), what)
 
 
-def parse_scan(output: str, *, instance_id: str, compose_project: str) -> HostPorts:
-    """Read ``SCAN_COMMAND`` output. Lines it does not recognise (warnings, errors) are skipped."""
+def parse_scan(
+    output: str, *, instance_id: str, compose_project: str, own_names: frozenset[str] | set[str] = frozenset(),
+) -> HostPorts:
+    """Read ``SCAN_COMMAND`` output. Lines it does not recognise (warnings, errors) are skipped.
+
+    The instance's own containers: those with its label, in its compose project, or named in
+    ``own_names`` (a claimed container the first deploy replaces).
+    """
     result = HostPorts()
     sockets: set[tuple[int, str]] = set()
     for line in output.splitlines():
@@ -246,7 +252,7 @@ def parse_scan(output: str, *, instance_id: str, compose_project: str) -> HostPo
             if len(parts) != 5:
                 continue
             _, label, project, name, ports = parts
-            own = label == instance_id or (project and project == compose_project)
+            own = label == instance_id or (project and project == compose_project) or name in own_names
             for m in _DOCKER_PORT_RE.finditer(ports):
                 if m.group(5) not in PROTOCOLS:
                     continue

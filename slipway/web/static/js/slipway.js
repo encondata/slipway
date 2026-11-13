@@ -6,7 +6,8 @@
  *   <form data-omit-unchanged="field ...">                 (leave those fields out of the body unless the user changed them)
  *   <button data-open="dialog-id">, <button data-close>
  *   <pre data-deploy-log="/api/v1/deployments/<id>">       (live build log)
- *   <div data-load="/api/v1/..." data-render="containers|logs|readme">
+ *   <div data-load="/api/v1/..." data-render="containers|unmanaged|logs|readme">
+ *   <button data-claim="<n>"> in the unmanaged list opens #claim-dialog filled from that group
  *   <button data-copy="text"> / data-copy-target="#el"
  *   <select data-fill> with <option data-fill-<field>="value">   (picking an option fills untouched fields)
  */
@@ -204,10 +205,9 @@
         }
         if (submit) submit.hidden = true;
       }
-      if (form.dataset.success) {
-        (form.dataset.then || "").startsWith("redirect") || form.dataset.then === "reload"
-          ? flashAfterReload(form.dataset.success) : toast(form.dataset.success);
-      }
+      const leaving = (form.dataset.then || "").startsWith("redirect") || form.dataset.then === "reload";
+      if (form.dataset.success) leaving ? flashAfterReload(form.dataset.success) : toast(form.dataset.success);
+      if (data && data.warning) leaving ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
       then(form.dataset.then, data);
     } catch (err) {
       toast(err.message, "error");
@@ -365,6 +365,26 @@
           return `<tr><td><strong>${esc(r.Names)}</strong></td><td class="mono subtle">${esc(r.Image)}</td><td><span class="badge ${cls}">${esc(r.State)}</span></td><td class="muted">${esc(r.Status)}</td><td class="mono subtle">${esc(r.Ports)}</td></tr>`;
         }).join("") + "</tbody></table></div>";
     },
+    unmanaged(el, groups) {
+      el._groups = groups;
+      if (!groups.length) { el.innerHTML = '<p class="muted">Every container on this host is managed by Slipway.</p>'; return; }
+      const canClaim = el.dataset.canClaim !== undefined;
+      const ports = (g) => g.ports.filter((p) => p.host).map((p) => `${p.service ? p.service + " " : ""}${p.host} → ${p.container}/${p.protocol}`);
+      const mounts = (g) => g.mounts.map((m) => `${m.type === "volume" && m.anonymous ? "anonymous volume" : m.source} → ${m.target}`);
+      const chips = (items) => items.map((t) => `<span class="chip mono">${esc(t)}</span>`).join(" ") || '<span class="muted">None</span>';
+      el.innerHTML = '<div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Image</th><th>State</th><th>Ports</th><th>Mounts</th><th></th></tr></thead><tbody>' +
+        groups.map((g, i) => {
+          const cls = g.state === "running" ? "success" : g.state === "partial" ? "warning" : g.state === "exited" ? "error" : "";
+          const kind = g.kind === "compose"
+            ? `<span class="subtle">compose · ${g.containers.length} container(s)${g.working_dir ? ` · <span class="mono">${esc(g.working_dir)}</span>` : ""}</span>`
+            : '<span class="subtle">container</span>';
+          const warn = g.warnings.length ? ` <span class="badge warning plain" title="${esc(g.warnings.join("\n"))}">${g.warnings.length} note(s)</span>` : "";
+          const claimable = canClaim && !(g.kind === "compose" && !/^[a-z0-9][a-z0-9_-]*$/.test(g.name));
+          return `<tr><td><strong>${esc(g.name)}</strong>${warn}<br>${kind}</td><td class="mono subtle">${esc(g.images.join(", "))}</td>` +
+            `<td><span class="badge ${cls}">${esc(g.state)}</span></td><td>${chips(ports(g))}</td><td>${chips(mounts(g))}</td>` +
+            `<td class="actions-cell">${claimable ? `<button class="btn btn-sm" type="button" data-claim="${i}">Claim</button>` : ""}</td></tr>`;
+        }).join("") + "</tbody></table></div>";
+    },
     logs(el, data) { el.textContent = (data && data.output) || "No log output yet."; el.scrollTop = el.scrollHeight; },
     readme(el, data) { el.textContent = (data && data.content) || "This repository has no README."; },
   };
@@ -380,6 +400,66 @@
   document.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-reload-target]");
     if (btn) { const el = $(btn.dataset.reloadTarget); if (el) load(el); }
+  });
+
+  // --------------------------------------------------------- claim dialog
+  function fillRows(rep, rows) {
+    $$(".repeater-row", rep).forEach((r) => r.remove());
+    const tpl = $("template", rep);
+    rows.forEach((row) => {
+      const frag = tpl.content.cloneNode(true);
+      $$("[data-f]", frag).forEach((input) => { if (row[input.dataset.f] !== undefined) input.value = row[input.dataset.f]; });
+      rep.insertBefore(frag, tpl);
+    });
+    if (!rows.length) rep.insertBefore(tpl.content.cloneNode(true), tpl);
+  }
+
+  function openClaim(group) {
+    const dlg = $("#claim-dialog");
+    const form = dlg && $("form", dlg);
+    if (!form) return;
+    const compose = group.kind === "compose";
+    const field = (name) => $(`[name="${name}"]`, form);
+    const text = (key, value) => $$(`[data-claim-text="${key}"]`, form).forEach((n) => { n.textContent = value || ""; });
+    form.reset();
+    field("group").value = JSON.stringify({ kind: group.kind, project: group.project, container_id: group.container_id });
+    field("build_source").value = compose ? "compose" : "dockerfile";
+    field("name").value = group.name;
+    field("compose_file").value = group.compose_file || "docker-compose.yml";
+    text("name", group.name);
+    text("project", group.project);
+    text("working_dir", group.working_dir || "(unknown)");
+    text("config_files", (group.config_files || []).join(", ") || "(unknown)");
+    text("env_files", (group.env_files || []).join(", "));
+    $("[data-claim-env-files]", form).hidden = !(group.env_files || []).length;
+    text("summary", compose
+      ? `Compose project with ${group.containers.length} container(s): ${group.containers.map((c) => c.name).join(", ")}.`
+      : `Standalone container running ${group.images.join(", ")}.`);
+    $('[data-claim-text="warnings"]', form).innerHTML = group.warnings.map((w) => `<li>${esc(w)}</li>`).join("");
+    $("[data-claim-warnings]", form).hidden = !group.warnings.length;
+    const ports = group.ports.filter((p) => p.host && (p.protocol === "tcp" || p.protocol === "udp"));
+    const unique = ports.filter((p, i) => ports.findIndex((o) => o.host === p.host && o.protocol === p.protocol) === i);
+    fillRows($("#claim-port-rep", form), compose ? [] : unique.map((p) => ({ host: p.host, container: p.container, protocol: p.protocol })));
+    fillRows($("#claim-vol-rep", form), compose ? [] : group.mounts
+      .filter((m) => (m.type === "volume" || m.type === "bind") && !m.source.includes(":"))
+      .map((m) => ({ source: m.source, target: m.target })));
+    // Pick the repository named like the project or container, if there is one.
+    const repo = field("repository_id");
+    const match = Array.from(repo.options).find((o) => o.dataset.name === group.name.toLowerCase());
+    if (match) repo.value = match.value;
+    if (!repo.dataset.branches) { repo.dataset.branches = repo.dataset.branchesTarget; wireBranches(repo); }
+    else repo.dispatchEvent(new Event("change"));
+    form.dispatchEvent(new Event("change"));
+    dlg.showModal();
+    field("name").focus();
+  }
+
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-claim]");
+    if (!btn) return;
+    const list = btn.closest("[data-render=unmanaged]");
+    const group = list && list._groups && list._groups[Number(btn.dataset.claim)];
+    if (group) openClaim(group);
   });
 
   // ---------------------------------------------------- branch picker
@@ -404,6 +484,11 @@
       target.title = err.message; // keep the default branch so the form still works
     }
     target.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function wireBranches(sel) {
+    sel.addEventListener("change", () => { $(sel.dataset.branches).dataset.current = ""; loadBranches(sel); });
+    loadBranches(sel);
   }
 
   // ----------------------------- option defaults: <select data-fill> + <option data-fill-<field>="value">
@@ -482,10 +567,7 @@
     $$("[data-deploy-log]").forEach(streamLog);
     $$("[data-load]").forEach(load);
     $$("select[data-fill]").forEach(wireFill);
-    $$("select[data-branches]").forEach((sel) => {
-      sel.addEventListener("change", () => { $(sel.dataset.branches).dataset.current = ""; loadBranches(sel); });
-      loadBranches(sel);
-    });
+    $$("select[data-branches]").forEach(wireBranches);
     $$("form").forEach(wireShowWhen);
     $$("form[data-preview-form]").forEach(wirePreview);
     const params = new URLSearchParams(location.search);

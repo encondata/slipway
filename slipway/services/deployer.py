@@ -24,6 +24,12 @@ Every deployment gets its own release directory, so the one ``current`` points t
 touched by a redeploy. A failed deployment removes its release again unless containers were
 started from it. Persistent data must live in named volumes or absolute host paths:
 relative bind mounts (``./data``) do not survive a redeploy.
+
+Claimed instances (see ``api.v1.unmanaged``) were running before Slipway knew them. A claimed
+compose project keeps its project name, so Compose replaces its containers and keeps its named
+volumes. A claimed standalone container is stopped just before ``docker run``, removed once the
+new container started (or started again if it did not), and reached by its id until then. No
+command run for a claimed instance removes a volume.
 """
 
 from __future__ import annotations
@@ -266,18 +272,56 @@ def _label(instance: Instance) -> str:
 
 
 def _remove_containers(instance: Instance) -> str:
-    """Remove the Dockerfile-mode container and its anonymous volumes.
+    """Remove the Dockerfile-mode container and its anonymous volumes (a claimed instance keeps them).
 
     Containers are found by this instance's label, never by name alone, so a container of
     another instance that happens to have the same name is left alone.
     """
-    return f"docker ps -aq --filter {q('label=' + _label(instance))} | xargs -r docker rm -f -v >/dev/null 2>&1 || true"
+    v = "" if instance.claim else " -v"
+    return f"docker ps -aq --filter {q('label=' + _label(instance))} | xargs -r docker rm -f{v} >/dev/null 2>&1 || true"
 
 
 def _compose_project_down(instance: Instance) -> str:
-    """Remove the compose project's containers (with anonymous volumes) by project name."""
+    """Remove the compose project's containers by project name, with their anonymous volumes.
+
+    A claimed instance keeps anonymous volumes: they may hold the app's data from before the claim.
+    Named volumes are never removed.
+    """
     p = q(instance.compose_project)
-    return f"(cd / && docker compose -p {p} rm -f -s -v; docker compose -p {p} down --remove-orphans) >/dev/null 2>&1 || true"
+    v = "" if instance.claim else " -v"
+    return f"(cd / && docker compose -p {p} rm -f -s{v}; docker compose -p {p} down --remove-orphans) >/dev/null 2>&1 || true"
+
+
+# ------------------------------------------------- claimed standalone containers
+#
+# A claimed standalone container has no ``slipway.instance`` label, so it is reached by the id
+# stored in ``Instance.claim`` until the first deployment replaces it: that deployment stops it
+# just before ``docker run``, removes it (never its volumes) once the new container started, and
+# starts it again if ``docker run`` failed.
+
+
+def _claimed_id(instance: Instance) -> str:
+    cid = instance.claimed_container or ""
+    if not _CONTAINER_ID.fullmatch(cid):
+        raise DeployError(f"Invalid claimed container id {cid!r}")
+    return cid
+
+
+def claimed_state_command(instance: Instance) -> str:
+    """Prints ``true`` / ``false`` (running or not), or ``missing`` when the container is gone."""
+    return f"docker container inspect --format '{{{{.State.Running}}}}' {_claimed_id(instance)} 2>/dev/null || echo missing"
+
+
+def _stop_claimed(instance: Instance) -> str:
+    """Stop the claimed container if it is still there; fail (so nothing runs twice) if it won't stop."""
+    cid = _claimed_id(instance)
+    return f"if docker container inspect {cid} >/dev/null 2>&1; then docker stop {cid} >/dev/null || exit 1; fi"
+
+
+def claimed_remove_command(instance: Instance) -> str:
+    """Remove the claimed container, keeping its volumes (no ``-v``)."""
+    cid = _claimed_id(instance)
+    return f"if docker container inspect {cid} >/dev/null 2>&1; then docker rm -f {cid} >/dev/null; fi"
 
 
 PULL_NEVER_UNSUPPORTED = "docker run on this host does not accept --pull=never: Slipway needs Docker 20.10 or later"
@@ -342,7 +386,8 @@ def build_commands(
         f"{_PULL_NEVER_CHECK}; cd {q(release_dir)} && BUILDKIT_PROGRESS=plain docker build --pull "
         f"-t {q(image)} -f {q(instance.dockerfile_path)} --label {q(label)} {q(instance.build_context)} "
         f"&& docker image inspect --format . {q(image)} >/dev/null",
-        f"{_remove_containers(instance)}; {_compose_project_down(instance)}",
+        (f"{_stop_claimed(instance)}; " if instance.claimed_container else "")
+        + f"{_remove_containers(instance)}; {_compose_project_down(instance)}",
         " ".join(run),
     ]
 
@@ -389,7 +434,11 @@ def _not_owned_message(instance: Instance) -> str:
 def control_command(instance: Instance, action: str) -> str:
     if action not in ACTIONS:
         raise ValueError(f"Unknown action {action}")
+    if instance.claimed_container:
+        return f"docker {action} {_claimed_id(instance)}"
     if instance.build_source == BuildSource.COMPOSE:
+        if instance.claim_pending:  # no release yet: Compose finds the project's containers by name
+            return f"cd / && docker compose -p {q(instance.compose_project)} {action}"
         return f"cd {q(paths_for(instance).current)} && {_compose(instance)} {action}"
     return (
         f"{_owned_container(instance)} || {{ echo {_not_owned_message(instance)}; exit 1; }}; "
@@ -408,11 +457,18 @@ def status_command(instance: Instance) -> str:
         flt = f"label=com.docker.compose.project={instance.compose_project}"
     else:
         flt = f"label=slipway.instance={instance.id}"
-    return f"docker ps -a --filter {q(flt)} --format {q(_CONTAINER_FORMAT)}"
+    command = f"docker ps -a --filter {q(flt)} --format {q(_CONTAINER_FORMAT)}"
+    if instance.claimed_container:
+        command += f"; docker ps -a --filter id={_claimed_id(instance)} --format {q(_CONTAINER_FORMAT)}"
+    return command
 
 
 def logs_command(instance: Instance, tail: int = 200) -> str:
     tail = max(1, min(int(tail), 5000))
+    if instance.claimed_container:
+        return f"docker logs --tail {tail} --timestamps {_claimed_id(instance)} 2>&1"
+    if instance.build_source == BuildSource.COMPOSE and instance.claim_pending:
+        return f"cd / && docker compose -p {q(instance.compose_project)} logs --tail {tail} --timestamps --no-color 2>&1"
     if instance.build_source == BuildSource.COMPOSE:
         return (
             f"cd {q(paths_for(instance).current)} && "
@@ -435,6 +491,7 @@ def teardown_command(instance: Instance) -> str:
         f"| sort -u | xargs -r docker image rm -f >/dev/null 2>&1"
     )
     return "; ".join([
+        *([claimed_remove_command(instance)] if instance.claimed_container else []),
         _remove_containers(instance),
         _compose_project_down(instance),
         f"(cd {q(paths.current)} && {_compose(instance)} down --remove-orphans --rmi local) >/dev/null 2>&1",
@@ -445,9 +502,11 @@ def teardown_command(instance: Instance) -> str:
 
 def leftovers_command(instance: Instance) -> str:
     """Prints the ids of any container still belonging to the instance (stderr is mixed in)."""
+    claimed = f" && docker ps -aq --filter id={_claimed_id(instance)}" if instance.claimed_container else ""
     return (
         f"docker ps -aq --filter {q('label=' + _label(instance))} && "
         f"docker ps -aq --filter {q('label=com.docker.compose.project=' + instance.compose_project)}"
+        f"{claimed}"
     )
 
 
@@ -494,6 +553,13 @@ def remove_dir_command(instance: Instance) -> str:
     )
 
 
+def _claim_dir_inside(instance: Instance, directory: str) -> bool:
+    """The claimed compose project's own directory is ``directory`` or below it (never delete it)."""
+    working_dir = (instance.claim or {}).get("working_dir") or ""
+    norm = posixpath.normpath(working_dir) if working_dir else ""
+    return bool(norm) and (norm == directory or norm.startswith(directory + "/") or directory.startswith(norm + "/"))
+
+
 async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_session) -> str | None:
     """Remove the instance's containers, images and files from its host.
 
@@ -506,6 +572,8 @@ async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_sess
         _, left = await remote.run(leftovers_command(instance), timeout=60)
         if _container_ids(left):
             raise DeployError(f"Containers of {instance.name} are still on {instance.host.name}; nothing was deleted")
+        if _claim_dir_inside(instance, paths.base):
+            return f"Kept {paths.base} on {instance.host.name}: the claimed project's own directory is inside it"
         status, output = await remote.run(remove_dir_command(instance), check=False, timeout=600)
     if status == 0:
         return None
@@ -811,7 +879,10 @@ async def _plan_ports(
             overrides[(o["service"], int(o["container"]), o.get("protocol") or "tcp")] = int(o["host"])
     async with _host_port_locks[instance.host_id]:
         _, output = await remote.run(ports.SCAN_COMMAND, check=False, timeout=60)
-        host_ports = ports.parse_scan(output, instance_id=str(instance.id), compose_project=instance.compose_project)
+        own_names = {instance.running_container_name} if instance.claimed_container else set()
+        host_ports = ports.parse_scan(
+            output, instance_id=str(instance.id), compose_project=instance.compose_project, own_names=own_names,
+        )
         for port, protocol, name in await _reserved_ports(instance):
             host_ports.reserve(port, protocol, f"Slipway instance {name}")
         try:
@@ -959,6 +1030,33 @@ async def _prepare_compose_ports(
     return files
 
 
+async def _restart_claimed(remote: ssh.RemoteSession, instance: Instance, sink: LogSink) -> None:
+    """After a failed first deploy: start the claimed container again (it was running before)."""
+    name = instance.running_container_name
+    try:
+        await remote.run(f"docker start {_claimed_id(instance)}", timeout=120)
+    except Exception as exc:
+        log.warning("Could not restart claimed container %s: %s", name, exc)
+        await sink.line(f"Warning: could not start the claimed container {name} again; start it by hand")
+    else:
+        await sink.line(f"Started the claimed container {name} again")
+
+
+async def _replace_claimed(remote: ssh.RemoteSession, instance: Instance, sink: LogSink) -> None:
+    """After the first successful deploy of a claimed instance: drop the old container, mark the claim done."""
+    if instance.claimed_container:
+        name = instance.running_container_name
+        status, _ = await remote.run(claimed_remove_command(instance), check=False, timeout=120)
+        if status == 0:
+            await sink.line(f"Removed the claimed container {name}; its volumes were kept")
+        else:
+            await sink.line(f"Warning: could not remove the claimed container {name} (stopped); remove it by hand")
+    claim = {**(instance.claim or {}), "replaced": True, "replaced_at": utcnow().isoformat()}
+    async with session_scope() as db:
+        await db.execute(update(Instance).where(Instance.id == instance.id).values(claim=claim))
+    instance.claim = claim
+
+
 async def _install(
     remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, tarball: Path,
     env: dict[str, str], sink: LogSink,
@@ -967,6 +1065,7 @@ async def _install(
     release = paths.release(sha, deployment_id)
     upload = f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz"
     compose = instance.build_source == BuildSource.COMPOSE
+    claimed_running = stopped_claimed = False  # the claimed container ran / this deploy stopped it
     await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
     try:
         await remote.put(tarball, upload)
@@ -979,6 +1078,9 @@ async def _install(
         await remote.write_text(env_path, content)
         await sink.line(f"Wrote {len(env)} environment variable(s) to {env_path}")
 
+        if instance.claimed_container:
+            _, state = await remote.run(claimed_state_command(instance), check=False, timeout=60)
+            claimed_running = state.strip().splitlines()[-1:] == ["true"]
         commands = build_commands(instance, release, sha)
         if compose:
             await sink.line(f"$ {commands[0]}")
@@ -988,12 +1090,19 @@ async def _install(
         elif instance.ports:
             await _plan_ports(remote, instance, ports.dockerfile_bindings(instance.ports), sink)
             commands = build_commands(instance, release, sha)
+        stop_claimed = _stop_claimed(instance) if instance.claimed_container else None
         for command in commands:
             await sink.line(f"$ {command}")
+            if stop_claimed and stop_claimed in command:
+                stopped_claimed = claimed_running
             await remote.run(command, on_line=sink.line, timeout=3600)
     except Exception:
+        if stopped_claimed:
+            await _restart_claimed(remote, instance, sink)
         await _discard_release(remote, instance, release, upload, sink)
         raise
+    if instance.claim_pending:
+        await _replace_claimed(remote, instance, sink)
     await remote.run(f"ln -sfn {q(release)} {q(paths.current)}")
     await sink.line(f"Switched {paths.current} to {release}")
     status, output = await remote.run(prune_command(instance, release), check=False, timeout=600)
