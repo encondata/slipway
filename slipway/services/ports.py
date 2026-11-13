@@ -16,7 +16,9 @@ In compose mode a moved port is passed back to Compose in one of two ways:
   Slipway sets that variable, so everything else that interpolates it (``APP_URL:
   http://host:${WEB_PORT}``) gets the new port too.
 * Otherwise Slipway writes an override file that replaces the service's ``ports`` with
-  ``!override`` (Docker Compose 2.24.4 or later). The repository's files are never changed.
+  ``!override`` (Docker Compose 2.24.4 or later). An older Compose adds those ports instead of
+  replacing them, so there Slipway runs the release from the whole resolved compose file with
+  the new ports. The repository's files are never changed.
 
 Only the host side of a mapping moves. Container ports stay the same, so services keep
 reaching each other on the compose network as before.
@@ -28,6 +30,8 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+import yaml
 
 PROTOCOLS = ("tcp", "udp")
 _VAR_RE = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?-[^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))$")
@@ -144,6 +148,49 @@ def dockerfile_bindings(ports: list[dict[str, Any]]) -> list[Binding]:
         Binding(None, int(p["container"]), "udp" if p.get("protocol") == "udp" else "tcp", int(p["host"]))
         for p in ports
     ]
+
+
+_HEX_LINE = re.compile(r"^(?:\s*[0-9a-f]{2})+\s*$")
+
+
+def parse_compose_output(output: str) -> dict[str, Any]:
+    """The configuration printed by ``deployer.compose_config_command``: a hex dump of the JSON.
+
+    Lines that are not hex (a warning from the login shell, say) are skipped. Output that holds
+    no hex at all is read as JSON text.
+    """
+    hex_lines = [line for line in output.splitlines() if _HEX_LINE.match(line)]
+    if not hex_lines:
+        return parse_compose_json(output)
+    try:
+        text = bytes.fromhex("".join("".join(hex_lines).split())).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise PortError(f"Could not read the configuration Docker Compose printed: {exc}") from exc
+    return parse_compose_json(text)
+
+
+class _ComposeLoader(yaml.SafeLoader):
+    """Safe YAML loading that reads Compose's own tags (``!reset``, ``!override``) as plain values."""
+
+
+def _untagged(loader: yaml.SafeLoader, suffix: str, node: yaml.Node) -> Any:
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node, deep=True)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    return loader.construct_scalar(node)
+
+
+_ComposeLoader.add_multi_constructor("!", _untagged)
+
+
+def load_compose_yaml(text: str) -> dict[str, Any] | None:
+    """A compose file as written (variables not interpolated), or None if it does not parse."""
+    try:
+        data = yaml.load(text, Loader=_ComposeLoader)  # noqa: S506 - a SafeLoader subclass
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def parse_compose_json(output: str) -> dict[str, Any]:
@@ -321,6 +368,22 @@ def compose_changes(
                 entry["published"] = str(final[key])
             lines.append(f"      - {json.dumps(entry, sort_keys=True)}")
     return variables, "\n".join(lines) + "\n"
+
+
+def resolved_with_ports(config: dict[str, Any], plan_: PortPlan) -> str:
+    """``config`` (``docker compose config --format json``) with the planned host ports, as JSON.
+
+    Used whole as the compose file where Compose ignores ``!override``. Compose prints ``$`` in
+    values as ``$$``, so reading it back gives the same values.
+    """
+    final = {(b.service, b.container, b.protocol, b.host_ip): b.host for b in plan_.bindings}
+    out = json.loads(json.dumps(config))
+    for name, svc in (out.get("services") or {}).items():
+        for p in (svc or {}).get("ports") or []:
+            key = (name, p.get("target"), p.get("protocol") or "tcp", str(p.get("host_ip") or ""))
+            if isinstance(p, dict) and key in final:
+                p["published"] = str(final[key])
+    return json.dumps(out, indent=1, sort_keys=True) + "\n"
 
 
 def binding_rows(plan_: PortPlan) -> list[dict[str, Any]]:

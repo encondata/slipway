@@ -11,7 +11,7 @@ from sqlalchemy import text, update
 
 from slipway.db.session import get_sessionmaker
 from slipway.models import Deployment, Host, Instance
-from slipway.services import deployer, ports
+from slipway.services import deployer, ports, ssh
 from tests.test_deployer import FakeGitHub, FakeRemote, _connect, _seed
 
 ID = "00000000-0000-0000-0000-000000000001"
@@ -256,13 +256,98 @@ async def test_compose_deploy_sets_the_port_variable():
     assert len(merges) == 2 and merges[1] < remote.commands.index(up)
 
 
-async def test_compose_deploy_fails_when_compose_ignores_the_override():
+def _old_compose_remote(scan: str, *, resolved_works: bool = True) -> FakeRemote:
+    """Compose before 2.24.4: ``!override`` adds ports, and ``--no-interpolate`` fails on a port variable."""
+    def config(remote, command):
+        if "--no-interpolate" in command:
+            raise ssh.CommandFailed(command, 1, "error decoding 'Ports': Invalid ip address: ${WEB_PORT")
+        if "compose.resolved.json" in command:
+            written = json.loads(remote.files["/opt/slipway/web-prod/shared/compose.resolved.json"])
+            return json.dumps(written if resolved_works else CONFIG)
+        if "compose.ports.yml" in command:  # the old port and the new one
+            cfg = json.loads(json.dumps(CONFIG))
+            cfg["services"]["db"]["ports"].append({"target": 5432, "published": "5433", "protocol": "tcp"})
+            return json.dumps(cfg)
+        return json.dumps(CONFIG)
+    return FakeRemote(responses={" config --format json": config, "/proc/net": scan})
+
+
+async def test_compose_deploy_falls_back_to_the_resolved_file_on_old_compose():
     dep_id = await _compose_seed()
-    remote = _compose_remote("proc tcp 00000000:1538")  # 5432 taken; old compose prints the file unchanged
+    remote = _old_compose_remote("proc tcp 00000000:1538")  # 5432 taken
     await deployer.run_deployment(dep_id, connect=_connect(remote), github=FakeGitHub)
     dep = await _get(Deployment, dep_id)
-    assert dep.status == "failed" and "Docker Compose 2.24.4 or later" in dep.error
+    assert dep.status == "succeeded", dep.log
+    assert "does not support !override (it needs 2.24.4 or later)" in dep.log
+    resolved = json.loads(remote.files["/opt/slipway/web-prod/shared/compose.resolved.json"])
+    assert resolved["services"]["db"]["ports"][0] == {"mode": "ingress", "target": 5432, "published": "5433", "protocol": "tcp"}
+    assert resolved["services"]["web"] == CONFIG["services"]["web"]
+    up = next(c for c in remote.commands if " up -d --build" in c)
+    assert ("--project-directory /opt/slipway/web-prod/releases/" in up
+            and "-f /opt/slipway/web-prod/shared/compose.resolved.json up -d" in up
+            and "-f compose.yml" not in up)
+    # The override was removed again, so nothing later picks it up.
+    assert any(c == "rm -f -- /opt/slipway/web-prod/shared/compose.ports.yml" for c in remote.commands)
+
+
+async def test_compose_deploy_fails_when_no_way_applies_the_ports():
+    dep_id = await _compose_seed()
+    remote = _old_compose_remote("proc tcp 00000000:1538", resolved_works=False)
+    await deployer.run_deployment(dep_id, connect=_connect(remote), github=FakeGitHub)
+    dep = await _get(Deployment, dep_id)
+    assert dep.status == "failed"
+    assert "did not apply the new host ports (expected db 5433->5432/tcp; got db 5432->5432/tcp)" in dep.error
     assert not any(" up -d" in c for c in remote.commands)
+
+
+async def test_old_compose_reads_port_variables_from_the_repository_file(monkeypatch):
+    # --no-interpolate fails, so WEB_PORT is found in the compose file from the source archive.
+    monkeypatch.setattr(FakeGitHub, "download_tarball", _tarball_with({
+        "compose.yml": 'services:\n  web:\n    ports: ["${WEB_PORT:-8080}:80", "127.0.0.1:9000:9000/udp"]\n'
+                       "  db:\n    ports: !reset []\n",
+    }))
+    dep_id = await _compose_seed()
+    remote = _old_compose_remote("proc tcp 00000000:1F90")  # 8080 taken
+    moved = _moved_config(p80="8081")
+    base = remote.responses[" config --format json"]
+    remote.responses[" config --format json"] = lambda r, c: (
+        json.dumps(moved) if "WEB_PORT" in str(r.files.get("/opt/slipway/web-prod/shared/slipway.env")) and "--no-interpolate" not in c
+        else base(r, c))
+    await deployer.run_deployment(dep_id, connect=_connect(remote), github=FakeGitHub)
+    dep = await _get(Deployment, dep_id)
+    assert dep.status == "succeeded", dep.log
+    assert "Set WEB_PORT=8081 for the compose file" in dep.log and "resolved" not in dep.log
+
+
+def _tarball_with(files):
+    async def download_tarball(self, repo_id, sha, dest):
+        from tests.test_deployer import write_source_archive
+        size = write_source_archive(dest, files)
+        FakeGitHub.archive = dest.read_bytes()
+        return size
+    return download_tarball
+
+
+def test_compose_output_arrives_byte_for_byte():
+    data = {"services": {"web": {"environment": {"PW": "pässwörd 🔑 $$x"}}}}
+    raw = json.dumps(data, ensure_ascii=False).encode()
+    dump = "\n".join(" " + " ".join(f"{b:02x}" for b in raw[i:i + 16]) for i in range(0, len(raw), 16))
+    assert ports.parse_compose_output("motd: welcome\n" + dump + "\n") == data
+    assert ports.parse_compose_output(json.dumps(data)) == data  # plain JSON still reads
+
+
+def test_load_compose_yaml_reads_compose_tags():
+    data = ports.load_compose_yaml("services:\n  web:\n    ports: !override ['${P:-1}:80']\n    environment: !reset {}\n")
+    assert data == {"services": {"web": {"ports": ["${P:-1}:80"], "environment": {}}}}
+    assert ports.load_compose_yaml("a: [") is None and ports.load_compose_yaml("- 1") is None
+
+
+def test_resolved_with_ports():
+    p = ports.plan(ports.compose_bindings(CONFIG), _host({(9000, "udp"): "x"}), auto=True, host_name="h")
+    out = json.loads(ports.resolved_with_ports(CONFIG, p))
+    assert out["services"]["web"]["ports"][1] == {"mode": "ingress", "host_ip": "127.0.0.1", "target": 9000,
+                                                   "published": "9001", "protocol": "udp"}
+    assert out["services"]["db"] == CONFIG["services"]["db"]
 
 
 async def test_compose_deploy_without_auto_stops_before_anything_changes():

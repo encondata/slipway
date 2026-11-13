@@ -152,8 +152,11 @@ overrides** (service, container port, host port) without changing the compose fi
 back to Compose through the compose file's own variable when the port is written as one
 (`"${WEB_PORT:-8080}:80"`), so every other value that uses `${WEB_PORT}` follows; otherwise through
 `shared/compose.ports.yml`, which replaces the service's `ports` with `!override` (Docker Compose 2.24.4 or
-later; the deploy fails with a clear error on an older Compose). Only host ports move: container ports stay
-the same, so services still reach each other on the compose network.
+later). An older Compose adds those ports instead of replacing them, so there Slipway deploys the release from
+the whole resolved compose file with the new ports, `shared/compose.resolved.json`. Like `shared/.env`, that
+file holds the interpolated environment values and is readable only by the SSH user. Either way Slipway checks
+with `docker compose config` that the ports came out as planned before it stops or starts anything. Only host
+ports move: container ports stay the same, so services still reach each other on the compose network.
 
 An instance's host and build settings (host, Dockerfile or compose, Dockerfile path, build context, compose
 file) can only change before its first deployment; after that, destroy it and create a new one. Deleting an

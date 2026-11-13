@@ -14,7 +14,9 @@ Pipeline for one deployment:
 5. Check the host ports the deployment publishes against the ports in use on the host, and
    move taken ones to the next free port when the instance allows it (see ``services.ports``).
    Compose mode reads them from ``docker compose config`` and passes moved ports back through
-   the compose file's own variables or ``shared/compose.ports.yml``.
+   the compose file's own variables or ``shared/compose.ports.yml``; a Compose older than
+   2.24.4 ignores that file's ``!override``, so then the release runs from the resolved compose
+   file with the new ports (``shared/compose.resolved.json``).
 6. ``docker build`` + ``docker run`` (Dockerfile mode) or ``docker compose up -d --build``.
 7. Point ``current`` at the new release and prune old releases/images.
 
@@ -196,6 +198,14 @@ class InstancePaths:
         return f"{self.shared}/compose.ports.yml"
 
     @property
+    def resolved_compose_file(self) -> str:
+        """Compose mode, older Compose only: the whole resolved compose file with the moved ports.
+
+        Holds interpolated environment values, so it is written mode 600 like ``env_file``.
+        """
+        return f"{self.shared}/compose.resolved.json"
+
+    @property
     def current(self) -> str:
         return f"{self.base}/current"
 
@@ -209,26 +219,45 @@ def paths_for(instance: Instance) -> InstancePaths:
     return InstancePaths(clean_deploy_root(instance.host.deploy_root), instance.slug)
 
 
-def _compose(instance: Instance, override: str | None = None) -> str:
-    """The compose command line. ``override`` (the ports override file) is only passed where
-    containers are created; start, stop, restart and logs do not depend on the host ports."""
+def _project_dir(instance: Instance, release_dir: str) -> str:
+    """The directory holding the compose file in a release: Compose resolves relative paths from it."""
+    return posixpath.normpath(posixpath.join(release_dir, posixpath.dirname(instance.compose_file) or "."))
+
+
+def _compose(
+    instance: Instance, override: str | None = None, *, resolved: str | None = None, release_dir: str | None = None
+) -> str:
+    """The compose command line.
+
+    The port files are only passed where containers are created (start, stop, restart and logs do
+    not depend on the host ports): ``override`` is added after the compose file, and ``resolved``
+    replaces it, keeping the project directory in ``release_dir``.
+    """
     env_file = paths_for(instance).env_file
+    base = f"docker compose -p {q(instance.compose_project)} --env-file {q(env_file)}"
+    if resolved:
+        if release_dir is None:
+            raise ValueError("resolved needs release_dir")
+        return f"{base} --project-directory {q(_project_dir(instance, release_dir))} -f {q(resolved)}"
     extra = f" -f {q(override)}" if override else ""
-    return f"docker compose -p {q(instance.compose_project)} --env-file {q(env_file)} -f {q(instance.compose_file)}{extra}"
+    return f"{base} -f {q(instance.compose_file)}{extra}"
 
 
-def compose_config_command(instance: Instance, release_dir: str, *, override: str | None = None, interpolate: bool = True) -> str:
-    """Print the resolved compose file as JSON, folded into short lines (join them with no separator).
+def compose_config_command(
+    instance: Instance, release_dir: str, *, override: str | None = None, resolved: str | None = None,
+    interpolate: bool = True,
+) -> str:
+    """Print the resolved compose file as JSON, as a hex dump (``od``) so it arrives byte for byte.
 
     Run after the merged ``.env`` is in place. On failure prints Compose's error instead. The
     output holds environment values: it is parsed, never logged.
     """
-    compose = _compose(instance, override)
+    compose = _compose(instance, override, resolved=resolved, release_dir=release_dir)
     flag = "" if interpolate else " --no-interpolate"
     return (
         f"cd {q(release_dir)} && "
         f"{{ out=$({compose} config --format json{flag} 2>/dev/null) || {{ {compose} config --quiet{flag}; exit 1; }}; }} && "
-        "if command -v fold >/dev/null 2>&1; then printf '%s\\n' \"$out\" | fold -w 4000; else printf '%s\\n' \"$out\"; fi"
+        "printf '%s' \"$out\" | od -An -v -tx1"
     )
 
 
@@ -265,7 +294,7 @@ def _root_rm(parent: str, name: str) -> str:
 def compose_env_command(instance: Instance, release_dir: str) -> str:
     """Build ``shared/.env``: the repository's .env defaults, with Slipway's values after them so they win."""
     paths = paths_for(instance)
-    project_dir = posixpath.normpath(posixpath.join(release_dir, posixpath.dirname(instance.compose_file) or "."))
+    project_dir = _project_dir(instance, release_dir)
     env, merged = q(paths.env_file), q(paths.env_file + ".new")
     return (
         f"cd {q(project_dir)} && umask 077 && "
@@ -274,11 +303,13 @@ def compose_env_command(instance: Instance, release_dir: str) -> str:
     )
 
 
-def build_commands(instance: Instance, release_dir: str, sha: str, *, override: str | None = None) -> list[str]:
+def build_commands(
+    instance: Instance, release_dir: str, sha: str, *, override: str | None = None, resolved: str | None = None
+) -> list[str]:
     """Commands (run in order) that build and start a release.
 
-    ``override`` is the compose ports override file, when Slipway moved ports that the compose
-    file fixes.
+    When Slipway moved ports that the compose file fixes, ``override`` is the ports override file,
+    or ``resolved`` the whole resolved compose file to use instead (older Compose).
     """
     paths = paths_for(instance)
     label = _label(instance)
@@ -286,7 +317,8 @@ def build_commands(instance: Instance, release_dir: str, sha: str, *, override: 
         return [
             compose_env_command(instance, release_dir),
             _remove_containers(instance),
-            f"cd {q(release_dir)} && {_compose(instance, override)} up -d --build --remove-orphans",
+            f"cd {q(release_dir)} && {_compose(instance, override, resolved=resolved, release_dir=release_dir)} "
+            "up -d --build --remove-orphans",
         ]
 
     image = f"slipway/{instance.slug}:{sha[:12]}"
@@ -820,52 +852,111 @@ def _merge_overrides(current: list[dict[str, Any]], plan: ports.PortPlan) -> lis
 async def _compose_config(remote: ssh.RemoteSession, instance: Instance, release: str, **kw: Any) -> dict[str, Any]:
     _, output = await remote.run(compose_config_command(instance, release, **kw), timeout=300)
     try:
-        return ports.parse_compose_json("".join(output.splitlines()))
+        return ports.parse_compose_output(output)
     except ports.PortError as exc:
         raise DeployError(str(exc)) from exc
 
 
+def read_source_file(tarball: Path, path: str, limit: int = 2 * 1024 * 1024) -> str | None:
+    """The text of release path ``path`` in the source archive (None if missing, not a file or too big)."""
+    try:
+        with tarfile.open(tarball, "r:gz") as archive:
+            while (member := archive.next()) is not None:
+                archive.members.clear()
+                if _extracted_name(member.name) != path:
+                    continue
+                if not member.isfile() or member.size > limit:
+                    return None
+                fh = archive.extractfile(member)
+                return fh.read().decode("utf-8", "replace") if fh else None
+    except (tarfile.TarError, OSError, EOFError, zlib.error):
+        return None
+    return None
+
+
+async def _port_variables_source(
+    remote: ssh.RemoteSession, instance: Instance, release: str, tarball: Path | None,
+) -> dict[str, Any] | None:
+    """The compose file with its ``${...}`` left in, to find the variables that set host ports.
+
+    ``docker compose config --no-interpolate`` follows ``extends`` and ``include``; a Compose
+    older than about 2.20 fails on a variable in a short-syntax port, so then the compose file
+    is read from the source archive instead.
+    """
+    try:
+        return await _compose_config(remote, instance, release, interpolate=False)
+    except (DeployError, ssh.SSHError):
+        pass
+    if tarball is None:
+        return None
+    text = await asyncio.to_thread(read_source_file, tarball, posixpath.normpath(instance.compose_file))
+    return ports.load_compose_yaml(text) if text is not None else None
+
+
+def _port_tuples(bindings: list[ports.Binding]) -> list[tuple[str, int, str, str, int]]:
+    return sorted((b.service or "", b.container, b.protocol, b.host_ip, b.host) for b in bindings)
+
+
+def _port_mismatch(instance: Instance, plan: ports.PortPlan, applied: list[ports.Binding]) -> DeployError:
+    want, got = set(_port_tuples(plan.bindings)), set(_port_tuples(applied))
+    fmt = lambda items: ", ".join(f"{s} {h}->{c}/{p}" for s, c, p, _, h in sorted(items)) or "none"  # noqa: E731
+    return DeployError(
+        f"Docker Compose on {instance.host.name} did not apply the new host ports "
+        f"(expected {fmt(want - got)}; got {fmt(got - want)}); nothing was started"
+    )
+
+
 async def _prepare_compose_ports(
     remote: ssh.RemoteSession, instance: Instance, release: str, env: dict[str, str], sink: LogSink,
-) -> str | None:
+    tarball: Path | None = None,
+) -> dict[str, str]:
     """Check the compose file's host ports and pass any that move back to Compose.
 
-    Runs after ``shared/.env`` is merged. Returns the override file to pass to ``up``, if any.
+    Runs after ``shared/.env`` is merged. Returns the port file arguments for ``build_commands``:
+    ``{}``, ``{"override": ...}`` or, when this Compose ignores ``!override``, ``{"resolved": ...}``.
     """
     paths = paths_for(instance)
     await sink.line("Checking the host ports the compose file publishes")
     config = await _compose_config(remote, instance, release)
-    try:
-        raw = await _compose_config(remote, instance, release, interpolate=False)
-    except (DeployError, ssh.SSHError):
-        raw = None  # only needed to find port variables; without it moved ports use the override file
+    raw = await _port_variables_source(remote, instance, release, tarball)
     declared = ports.compose_bindings(config, raw)
     plan = await _plan_ports(remote, instance, declared, sink)
     variables, override = ports.compose_changes(plan, config)
     for old, new in plan.changed:
         if not any(old.key == w.key for w, _, _ in plan.moved):
             await sink.line(f"Using host port {new.host} for {old.service} container port {old.container} (port override)")
-    await remote.run(f"rm -f -- {q(paths.ports_override_file)}")
+    await remote.run(f"rm -f -- {q(paths.ports_override_file)} {q(paths.resolved_compose_file)}")
     if variables:
         await remote.write_text(paths.slipway_env_file, render_compose_env({**env, **variables}))
         await remote.run(compose_env_command(instance, release))
         await sink.line("Set " + ", ".join(f"{k}={v}" for k, v in sorted(variables.items())) + " for the compose file")
     if override is None and not variables:
-        return None
+        return {}
+    files: dict[str, str] = {}
     if override is not None:
         await remote.write_text(paths.ports_override_file, override)
         await sink.line(f"Wrote host port changes to {paths.ports_override_file}")
-    # Check that Compose applied them: an older Compose ignores !override.
-    applied = ports.compose_bindings(await _compose_config(remote, instance, release, override=override and paths.ports_override_file))
-    want = sorted((b.service or "", b.container, b.protocol, b.host_ip, b.host) for b in plan.bindings)
-    got = sorted((b.service or "", b.container, b.protocol, b.host_ip, b.host) for b in applied)
-    if want != got:
-        raise DeployError(
-            f"Docker Compose on {instance.host.name} did not apply the new host ports. Moving a port the compose "
-            "file sets as a number needs Docker Compose 2.24.4 or later; or take the port from a variable, "
-            "such as \"${WEB_PORT:-8080}:80\""
-        )
-    return paths.ports_override_file if override is not None else None
+        files = {"override": paths.ports_override_file}
+    # Check that Compose applied them before anything starts.
+    applied = ports.compose_bindings(await _compose_config(remote, instance, release, **files))
+    if _port_tuples(applied) == _port_tuples(plan.bindings):
+        return files
+    if override is None:
+        raise _port_mismatch(instance, plan, applied)
+    # A Compose older than 2.24.4 adds the override's ports to the file's instead of replacing them.
+    # Run this release from the resolved compose file with the planned ports instead.
+    await remote.run(f"rm -f -- {q(paths.ports_override_file)}")
+    await sink.line(
+        f"Docker Compose on {instance.host.name} does not support !override (it needs 2.24.4 or later); "
+        f"using the resolved compose file with the new ports, {paths.resolved_compose_file}"
+    )
+    current = await _compose_config(remote, instance, release)  # with any variables set above
+    await remote.write_text(paths.resolved_compose_file, ports.resolved_with_ports(current, plan))
+    files = {"resolved": paths.resolved_compose_file}
+    applied = ports.compose_bindings(await _compose_config(remote, instance, release, **files))
+    if _port_tuples(applied) != _port_tuples(plan.bindings):
+        raise _port_mismatch(instance, plan, applied)
+    return files
 
 
 async def _install(
@@ -888,13 +979,12 @@ async def _install(
         await remote.write_text(env_path, content)
         await sink.line(f"Wrote {len(env)} environment variable(s) to {env_path}")
 
-        override = None
         commands = build_commands(instance, release, sha)
         if compose:
             await sink.line(f"$ {commands[0]}")
             await remote.run(commands[0], on_line=sink.line, timeout=3600)
-            override = await _prepare_compose_ports(remote, instance, release, env, sink)
-            commands = build_commands(instance, release, sha, override=override)[1:]
+            files = await _prepare_compose_ports(remote, instance, release, env, sink, tarball)
+            commands = build_commands(instance, release, sha, **files)[1:]
         elif instance.ports:
             await _plan_ports(remote, instance, ports.dockerfile_bindings(instance.ports), sink)
             commands = build_commands(instance, release, sha)
