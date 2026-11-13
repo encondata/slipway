@@ -18,8 +18,10 @@
       </div>
       <div class="field">
         <label for="sy-key">API key</label>
-        <input class="input mono" id="sy-key" name="api_key" type="password" autocomplete="off" placeholder="{{ 'Saved; leave empty to keep it' if sy_has_key else 'sy_…' }}" {{ '' if sy_has_key else 'required' }}>
-        <span class="help">Encrypted at rest and never shown again.</span>
+        <input class="input mono" id="sy-key" name="api_key" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+          pattern="sy_[A-Za-z0-9_\-]{20,200}" title="A Switchyard API key: sy_ followed by the rest of the key"
+          placeholder="{{ 'Saved; leave empty to keep it' if sy_has_key else 'sy_…' }}" {{ '' if sy_has_key else 'required' }}>
+        <span class="help">{% if sy_key_prefix %}Saved key: <code>{{ sy_key_prefix }}…</code>, the same prefix Switchyard lists under API keys. {% endif %}Encrypted at rest and never shown again.</span>
       </div>
       <div class="field">
         <label for="sy-tls">Default certificate for new hostnames</label>

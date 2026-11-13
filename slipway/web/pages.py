@@ -520,6 +520,7 @@ async def settings_integrations(request: Request, db: DB, ctx: PageAuth) -> HTML
     return await render(
         request, db, "settings/integrations.html", ctx, tab="integrations",
         sy=(row.value if row else None) or {}, sy_has_key=bool(row and row.secret),
+        sy_key_prefix=(row.secret or "")[: switchyard.KEY_PREFIX_LEN] if row else "",
         required_operations=switchyard.REQUIRED_OPERATIONS,
     )
 

@@ -48,6 +48,9 @@ TLS_MODES = ("auto", "dns", "internal", "off")
 REQUIRED_OPERATIONS = (
     "hosts.list", "hosts.get", "hosts.create", "hosts.update", "hosts.delete", "config.preview", "config.apply",
 )
+# Switchyard keys are "sy_" and 43 URL-safe base64 characters; it lists each by its first 9 characters.
+API_KEY_RE = re.compile(r"^sy_[A-Za-z0-9_-]{20,200}$")
+KEY_PREFIX_LEN = 9
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 MARKER = "Managed by Slipway"
 
@@ -92,6 +95,16 @@ def clean_url(value: str) -> str:
         value = value[:-4]
     if not re.match(r"^https?://[^\s/]+(?:/[^\s]*)?$", value):
         raise ValueError("Switchyard URL must start with http:// or https://, such as https://switchyard.example.com")
+    return value
+
+
+def clean_api_key(value: str) -> str:
+    value = (value or "").strip()
+    if not API_KEY_RE.match(value):
+        raise ValueError(
+            "That is not a Switchyard API key: those start with sy_ and are shown once, when the key is made. "
+            "If your browser filled this box in, clear it and paste the key."
+        )
     return value
 
 

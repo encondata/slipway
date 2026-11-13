@@ -15,7 +15,7 @@ from slipway.services import deployer, switchyard
 from tests.conftest import login, make_user
 from tests.test_deployer import FakeGitHub, FakeRemote, _connect, _instance, _seed
 
-KEY = "sy_test_key"
+KEY = "sy_" + "T3stK3y" * 6 + "x"  # sy_ and 43 characters, like a real key
 
 
 class FakeSwitchyard:
@@ -337,13 +337,26 @@ async def test_settings_api(admin_client, fake_sy):
     # An empty key keeps the stored one.
     r = await admin_client.put("/api/v1/settings/switchyard", json={"url": "https://sy.example.test", "api_key": ""})
     assert r.json()["has_api_key"] and r.json()["default_tls_mode"] == "auto"
+    assert r.json()["api_key_prefix"] == KEY[:9]
     r = await admin_client.post("/api/v1/settings/switchyard/test")
     assert r.status_code == 200 and r.json()["message"].startswith("Connected: Switchyard has 0 host(s).")
+    # A browser-filled password is refused instead of saved.
+    r = await admin_client.put("/api/v1/settings/switchyard", json={"url": "https://sy.example.test", "api_key": "MyLoginPassw0rd!"})
+    assert r.status_code == 422 and "not a Switchyard API key" in r.text
+    # A key Switchyard does not know: the hint names the saved prefix and the URL.
+    other = "sy_" + "w" * 43
+    r = await admin_client.put("/api/v1/settings/switchyard", json={"url": "https://sy.example.test", "api_key": other})
+    assert r.status_code == 200
+    r = await admin_client.post("/api/v1/settings/switchyard/test")
+    assert r.status_code == 502 and "starts with sy_wwwwww…" in r.json()["detail"] and "https://sy.example.test" in r.json()["detail"]
+    r = await admin_client.put("/api/v1/settings/switchyard", json={"url": "https://sy.example.test", "api_key": " " + KEY + "\n"})
+    assert r.status_code == 200
     fake_sy.denied.add("GET /api/config/preview")
     r = await admin_client.post("/api/v1/settings/switchyard/test")
     assert r.status_code == 502 and "config.apply" in r.json()["detail"]
     page = await admin_client.get("/settings/integrations")
     assert page.status_code == 200 and "sy.example.test" in page.text and KEY not in page.text
+    assert f"Saved key: <code>{KEY[:9]}…</code>" in page.text and 'autocomplete="new-password"' in page.text
     r = await admin_client.put("/api/v1/settings/switchyard", json={"clear": True})
     assert r.json()["configured"] is False
 

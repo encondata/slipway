@@ -32,6 +32,8 @@ class SwitchyardOut(BaseModel):
     configured: bool
     url: str
     has_api_key: bool
+    # The key's first characters, as Switchyard's API keys page lists them.
+    api_key_prefix: str = ""
     default_tls_mode: str
     required_operations: list[str] = list(switchyard.REQUIRED_OPERATIONS)
 
@@ -46,6 +48,7 @@ def _out(row: AppSetting | None) -> SwitchyardOut:
         configured=bool(row and row.secret and value.get("url")),
         url=value.get("url", ""),
         has_api_key=bool(row and row.secret),
+        api_key_prefix=(row.secret or "")[: switchyard.KEY_PREFIX_LEN] if row else "",
         default_tls_mode=value.get("default_tls_mode") or "auto",
     )
 
@@ -73,11 +76,18 @@ async def put_switchyard(body: SwitchyardIn, ctx: Admin, request: Request, db: D
         db.add(row)
     if not body.api_key and not row.secret:
         raise HTTPException(422, "Enter the Switchyard API key")
+    key = None
+    if body.api_key:
+        try:
+            key = switchyard.clean_api_key(body.api_key)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     row.value = {**(row.value or {}), "url": url, "default_tls_mode": body.default_tls_mode}
     changed = ["URL", "default TLS mode"]
-    if body.api_key:
-        row.secret = body.api_key.strip()
-        changed.append("API key")
+    if key:
+        row.secret = key
+        row.value = {**row.value, "edits": {}}  # a new key may be for another Switchyard
+        changed.append(f"API key {key[: switchyard.KEY_PREFIX_LEN]}…")
     audit.record(db, "settings.switchyard", actor=ctx.user, summary=f"Updated the Switchyard connection ({', '.join(changed)})",
                  details={"url": url}, request=request)
     await db.commit()
@@ -95,7 +105,13 @@ async def test_switchyard(ctx: Admin, db: DB) -> dict[str, object]:
     except switchyard.SwitchyardError as exc:
         hint = ""
         if exc.status_code == 401:
-            hint = " Check the API key: it may be wrong, revoked or expired."
+            prefix = config.api_key[: switchyard.KEY_PREFIX_LEN]
+            hint = (
+                f" Slipway's saved key starts with {prefix}…; in Switchyard under Administration → API keys, "
+                "check that an active key with that prefix exists"
+                + (f" on {config.url}" if config.url else "")
+                + ". If not, paste the key again (browsers sometimes fill this box with a saved password)."
+            )
         elif exc.status_code == 403:
             hint = " Give the key these operations in Switchyard: " + ", ".join(switchyard.REQUIRED_OPERATIONS) + "."
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"{exc}.{hint}") from exc
