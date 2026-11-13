@@ -1,0 +1,23 @@
+{# Repeater rows shared by the instance form and the claim dialog. #}
+{% from "_macros.html" import icon %}
+
+{% macro port_row(p=None) -%}
+<div class="repeater-row port">
+  <input class="input" data-f="host" type="number" min="1" max="65535" value="{{ p.host if p else '' }}" placeholder="Host port" aria-label="Host port">
+  <span class="arrow">⟷</span>
+  <input class="input" data-f="container" type="number" min="1" max="65535" value="{{ p.container if p else '' }}" placeholder="Container port" aria-label="Container port">
+  <select class="input" data-f="protocol" aria-label="Protocol">
+    <option value="tcp">TCP</option><option value="udp" {{ 'selected' if p and p.protocol == 'udp' }}>UDP</option>
+  </select>
+  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+</div>
+{%- endmacro %}
+
+{% macro volume_row(vol=None) -%}
+<div class="repeater-row volume">
+  <input class="input mono" data-f="source" value="{{ vol.source if vol else '' }}" placeholder="/var/lib/app-data or volume-name" aria-label="Host path or volume">
+  <span class="arrow">⟷</span>
+  <input class="input mono" data-f="target" value="{{ vol.target if vol else '' }}" placeholder="/app/data" aria-label="Container path">
+  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+</div>
+{%- endmacro %}

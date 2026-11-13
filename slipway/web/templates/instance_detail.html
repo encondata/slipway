@@ -27,6 +27,16 @@
   </div>
 </div>
 
+{% if instance.claim_pending %}
+<div class="callout primary">{{ icon("info") }}<div><strong>Claimed, not deployed by Slipway yet.</strong>
+  {% if instance.build_source == "compose" %}
+  The compose project <code>{{ instance.compose_project }}</code> runs as it was started{% if instance.claim.working_dir %} from <code>{{ instance.claim.working_dir }}</code>{% endif %}. The first deploy builds <code>{{ instance.branch }}</code> under the same project name, so Compose replaces its containers and keeps its volumes. That directory is never changed or deleted.
+  {% else %}
+  The container <code>{{ instance.running_container_name }}</code> runs as it was started. The first deploy builds <code>{{ instance.branch }}</code>, stops it just before starting the new container and removes it once the new one runs; its volumes are kept. If the new container does not start, it is started again.
+  {% endif %}
+</div></div>
+{% endif %}
+
 <div class="grid grid-main">
   <section class="card">
     <div class="card-head"><span class="head-icon">{{ icon("info", "i-lg") }}</span><h2>Overview</h2></div>
@@ -37,7 +47,14 @@
         <dt>{{ icon("commit", "i-sm") }} Running commit</dt><dd class="mono">{{ instance.current_commit_sha[:12] if instance.current_commit_sha else "—" }}</dd>
         <dt>{{ icon("clock", "i-sm") }} Last deployed</dt><dd>{{ instance.last_deployed_at|timeago }}</dd>
         <dt>{{ icon("instances", "i-sm") }} Build</dt><dd>{% if instance.build_source == "compose" %}docker compose · <span class="mono">{{ instance.compose_file }}</span>{% else %}Dockerfile · <span class="mono">{{ instance.dockerfile_path }}</span> (context <span class="mono">{{ instance.build_context }}</span>){% endif %}</dd>
-        <dt>{{ icon("box", "i-sm") }} Container</dt><dd class="mono">{{ instance.container_name }}</dd>
+        {% if instance.build_source == "compose" %}
+        <dt>{{ icon("box", "i-sm") }} Compose project</dt><dd class="mono">{{ instance.compose_project }}</dd>
+        {% else %}
+        <dt>{{ icon("box", "i-sm") }} Container</dt><dd class="mono">{{ instance.running_container_name }}</dd>
+        {% endif %}
+        {% if instance.claim %}
+        <dt>{{ icon("package", "i-sm") }} Claimed from</dt><dd>{{ "compose project" if instance.claim.kind == "compose" else "container" }} <span class="mono">{{ instance.claim.name }}</span>{% if instance.claim.working_dir %} in <span class="mono">{{ instance.claim.working_dir }}</span>{% endif %} <span class="subtle">· {{ "replaced by Slipway's deploy" if instance.claim.replaced else "not deployed by Slipway yet" }}</span></dd>
+        {% endif %}
         {% if instance.build_source == "dockerfile" %}
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.ports %}<span class="chip mono">{{ p.host }} → {{ p.container }}/{{ p.protocol }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         <dt>{{ icon("database", "i-sm") }} Volumes</dt><dd>{% for v in instance.volumes %}<span class="chip mono">{{ v.source }} → {{ v.target }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
@@ -98,7 +115,7 @@
 
 {% if auth.can(Perm.INSTANCES_WRITE) %}
 <section class="card">
-  <div class="card-head"><span class="head-icon" style="color: var(--error)">{{ icon("alert", "i-lg") }}</span><div><h2>Danger zone</h2><p>Destroying removes the containers, images and release files from {{ instance.host.name }}.{% if instance.status == "deploying" %} Wait for the running deployment to finish first.{% endif %}</p></div></div>
+  <div class="card-head"><span class="head-icon" style="color: var(--error)">{{ icon("alert", "i-lg") }}</span><div><h2>Danger zone</h2><p>Destroying removes the containers, images and release files from {{ instance.host.name }}.{% if instance.claim %} Volumes are kept{% if instance.claim.working_dir %}, and so is {{ instance.claim.working_dir }}{% endif %}.{% endif %}{% if instance.status == "deploying" %} Wait for the running deployment to finish first.{% endif %}</p></div></div>
   <div class="card-body row wrap">
     <button class="btn btn-danger solid" data-api="DELETE /api/v1/instances/{{ instance.id }}" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Destroy {{ instance.name }}? Containers and files on {{ instance.host.name }} will be removed." data-then="redirect:/instances">{{ icon("trash") }} Destroy instance</button>
     <button class="btn btn-danger" data-api="DELETE /api/v1/instances/{{ instance.id }}?purge=false" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Remove {{ instance.name }} from Slipway but leave everything running on the host?" data-then="redirect:/instances">Remove from Slipway only</button>

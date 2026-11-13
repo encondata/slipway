@@ -21,7 +21,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Accounts | Email/password (Argon2), GitHub OAuth sign-in, link/unlink GitHub, server-side sessions, CSRF protection, login and sign-up rate limiting, personal API tokens (`Authorization: Bearer slipway_pat_…`) that admins can list and revoke |
 | Permissions | Role-based: built-in `admin`, `maintainer`, `developer`, `viewer` + custom roles; users can hold several roles; no privilege escalation (you can only grant, remove or manage what you hold: `users:write` only reaches users whose every permission you also have); last-admin protection; the UI only shows what your roles allow |
 | Repositories | Sync from GitHub (owner, collaborator, org repos), detect `Dockerfile` / compose file, README preview, branch picker. Repositories are addressed by their GitHub id, so renames and transfers are followed and a repository re-created under an old name is never deployed |
-| Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently) |
+| Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
 | Instances | Repo + branch + host + Dockerfile *or* docker compose; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
@@ -158,6 +158,40 @@ file holds the interpolated environment values and is readable only by the SSH u
 with `docker compose config` that the ports came out as planned before it stops or starts anything. Only host
 ports move: container ports stay the same, so services still reach each other on the compose network.
 
+### Claiming containers Slipway did not deploy
+
+The host page lists **unmanaged containers**: compose projects (grouped by `com.docker.compose.project`) and
+standalone containers that Slipway did not start, with their image, state, published ports, mounts and, for
+compose, the project directory and compose files (`GET /api/v1/hosts/{id}/unmanaged`, needs `hosts:read` and
+`instances:read`). Containers labelled `slipway.instance` and compose projects named `slipway-…` are Slipway's
+own and are not listed. **Claim** one to have Slipway maintain it from a repository and branch from then on
+(`POST /api/v1/hosts/{id}/claim`, needs `instances:write`, plus `deployments:create` to deploy straight away;
+audited as `instance.claim`):
+
+- A **compose project** becomes a compose instance that **keeps its project name**. Compose prefixes named
+  volumes and networks with the project name (`shop_pgdata`), so every later deploy uses the same volumes and
+  Compose replaces the running containers instead of starting a second copy next to them. Services that the
+  repository's compose file does not define are removed on deploy (`--remove-orphans`, volumes kept). The
+  original project directory is never changed or deleted, but bind mounts written relative to it (`./data`)
+  resolve to Slipway's release directory after the claim: the host page warns about them, so change them to
+  absolute paths in the repository first.
+- A **standalone container** becomes a Dockerfile instance with the container's fixed host ports and its
+  named volumes, anonymous volumes (by their id) and bind mounts copied. Other `docker run` options (networks,
+  command, restart policy, read-only mounts, an address a port was bound to) are not, and the host page says
+  which ones it saw. The first deploy builds the repository's Dockerfile, stops the old container just before
+  `docker run` starts the new one, and removes it (never its volumes) once the new one runs. If the new
+  container does not start, the old one is started again.
+- **Register only** creates the instance without deploying. Nothing on the host changes: the instance shows
+  as running (or stopped) with the claimed containers' status, logs and start/stop/restart, its ports are
+  reserved like any deployed instance's, and its host and build settings are fixed. Deploy when ready.
+- **Import environment variables** is off by default: it reads the containers' variables with `docker
+  inspect` (leaving out the ones the image sets), which usually include passwords and API keys. They are
+  stored encrypted like any instance's variables; the audit log records their names, never their values.
+
+A claimed instance never removes volumes: not on deploy, not when it is destroyed (destroying it removes its
+containers, images and Slipway's own `<deploy_root>/<slug>`, and keeps anonymous volumes too). Slipway refuses a
+claim whose project directory or bind mounts overlap `<deploy_root>/<slug>`, the directory it would own.
+
 An instance's host and build settings (host, Dockerfile or compose, Dockerfile path, build context, compose
 file) can only change before its first deployment; after that, destroy it and create a new one. Deleting an
 instance, or changing these settings, is refused while a deployment is queued or running.
@@ -271,7 +305,8 @@ slipway/
   core/        config, permissions catalogue, encryption, password/token hashing, rate limiting
   db/          engine/session, declarative base + portable column types
   models/      users/roles/sessions/tokens, hosts, repositories, instances/deployments, audit
-  services/    auth, users, github, ssh, hosts (health), repos (sync), deployer (pipeline + runner)
+  services/    auth, users, github, ssh, hosts (health), repos (sync), deployer (pipeline + runner),
+               ports (host port checks), discovery (unmanaged containers)
   api/v1/      JSON API routers
   web/         page routes, GitHub OAuth flow, Jinja templates, static CSS/JS/icons
 alembic/       migrations

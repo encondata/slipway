@@ -360,7 +360,11 @@ async def host_detail(request: Request, db: DB, ctx: PageAuth, host_id: uuid.UUI
         (await db.scalars(select(Instance).where(Instance.host_id == host.id).order_by(Instance.name))).all()
         if ctx.can(Perm.INSTANCES_READ) else []
     )
-    return await render(request, db, "host_detail.html", ctx, host=host, instances=instances)
+    # Repositories to pick from when claiming an unmanaged container (the same list as the instance form).
+    claim_repos = (
+        (await _form_context(db))["repos"] if ctx.can(Perm.INSTANCES_WRITE) and ctx.can(Perm.INSTANCES_READ) else []
+    )
+    return await render(request, db, "host_detail.html", ctx, host=host, instances=instances, claim_repos=claim_repos)
 
 
 @router.get("/instances")
@@ -414,10 +418,13 @@ async def edit_instance(request: Request, db: DB, ctx: PageAuth, instance_id: uu
         select(Deployment.id).where(Deployment.instance_id == instance.id, Deployment.started_at.is_not(None)).limit(1)
     )
     locked = instance.status != InstanceStatus.CREATED or started is not None
+    # A claimed instance's repository paths stay editable until Slipway first deploys it.
+    paths_locked = locked and not (instance.claim_pending and started is None)
     # An unreadable env renders as one blank row; PATCH keeps the stored values unless new ones are entered.
     return await render(
         request, db, "instance_form.html", ctx, instance=instance, env=instance.env or {},
-        env_unreadable=await env_unreadable(db, instance), selected_repo=instance.repository, locked=locked, **context,
+        env_unreadable=await env_unreadable(db, instance), selected_repo=instance.repository, locked=locked,
+        paths_locked=paths_locked, **context,
     )
 
 

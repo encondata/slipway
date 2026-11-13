@@ -67,6 +67,14 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     # Host ports the last deployment published, [{service, container, protocol, host, host_ip?, declared?}].
     published_ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
 
+    # Compose project name of a claimed compose project. Compose prefixes named volumes and networks
+    # with the project name, so a claimed project keeps its own name on every deploy (None: slipway-<slug>).
+    compose_project_name: Mapped[str | None] = mapped_column(String(255))
+    # Set on instances claimed from containers Slipway did not deploy: {kind: "compose" | "container",
+    # name, container_id?, container_name?, working_dir?, config_files?, claimed_at, replaced}. Until the
+    # first successful deploy (``replaced``), a claimed standalone container is reached by its id.
+    claim: Mapped[dict[str, Any] | None] = mapped_column()
+
     status: Mapped[str] = mapped_column(String(16), default=InstanceStatus.CREATED)
     current_commit_sha: Mapped[str | None] = mapped_column(String(40))
     last_deployed_at: Mapped[datetime | None]
@@ -81,7 +89,26 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
 
     @property
     def compose_project(self) -> str:
-        return f"slipway-{self.slug}"
+        return self.compose_project_name or f"slipway-{self.slug}"
+
+    @property
+    def claim_pending(self) -> bool:
+        """Claimed, and no Slipway deployment has replaced the claimed containers yet."""
+        return bool(self.claim) and not self.claim.get("replaced")
+
+    @property
+    def claimed_container(self) -> str | None:
+        """Id of the claimed standalone container the first deployment still has to replace."""
+        if self.claim_pending and self.claim.get("kind") == "container":
+            return self.claim.get("container_id") or None
+        return None
+
+    @property
+    def running_container_name(self) -> str:
+        """The container's name on the host: the claimed one until the first deploy replaces it."""
+        if self.claimed_container:
+            return self.claim.get("container_name") or self.claimed_container[:12]
+        return self.container_name
 
 
 class Deployment(UUIDPrimaryKey, Timestamps, Base):
