@@ -104,6 +104,7 @@ async def create_host(body: HostCreate, ctx: Writer, request: Request, db: DB) -
         environment=body.environment or "",
         description=body.description or "",
         deploy_root=body.deploy_root or "/opt/slipway",
+        proxy_address=body.proxy_address or None,
         metrics={},
         created_by_id=ctx.user.id,
     )
@@ -151,6 +152,8 @@ async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request
         value = getattr(body, field)
         if value is not None:
             setattr(host, field, value)
+    if body.proxy_address is not None:
+        host.proxy_address = body.proxy_address or None
     _apply_credentials(host, body)
     summary = f"Updated host {host.name}"
     if moved:  # possibly a different machine: forget the pinned host key and re-verify

@@ -436,6 +436,7 @@ textarea.input { height: auto; min-height: 110px; padding: 10px 12px; font-famil
 .repeater-row.port { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) 96px auto; }
 .repeater-row.volume { grid-template-columns: minmax(0, 1.2fr) auto minmax(0, 1fr) auto; }
 .repeater-row.port-override { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto minmax(0, 1fr) 96px auto; }
+.repeater-row.route { grid-template-columns: minmax(0, 1.6fr) auto minmax(0, 1fr) minmax(0, 0.8fr) 130px auto; }
 .repeater .arrow { color: var(--text-muted); }
 
 .stepper { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
@@ -594,5 +595,7 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
   h1 { font-size: 23px; }
   .repeater-row.port, .repeater-row.volume { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
   .repeater-row.port-override { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .repeater-row.route { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .repeater-row.route [data-f="hostname"] { grid-column: 1 / -1; }
   .repeater-row .arrow { display: none; }
 }

@@ -7,6 +7,7 @@
   <a href="/settings/tokens" class="{{ 'active' if tab == 'tokens' }}">{{ icon("key", "i-sm") }} API tokens</a>
   {% if auth.can(Perm.USERS_READ) %}<a href="/settings/users" class="{{ 'active' if tab == 'users' }}">{{ icon("users", "i-sm") }} Users</a>{% endif %}
   {% if auth.can(Perm.ROLES_READ) %}<a href="/settings/roles" class="{{ 'active' if tab == 'roles' }}">{{ icon("shield", "i-sm") }} Roles &amp; permissions</a>{% endif %}
+  {% if auth.can(Perm.SETTINGS_WRITE) %}<a href="/settings/integrations" class="{{ 'active' if tab == 'integrations' }}">{{ icon("globe", "i-sm") }} Integrations</a>{% endif %}
   {% if auth.can(Perm.AUDIT_READ) %}<a href="/settings/audit" class="{{ 'active' if tab == 'audit' }}">{{ icon("activity", "i-sm") }} Audit log</a>{% endif %}
 </nav>
 {% block settings %}{% endblock %}
