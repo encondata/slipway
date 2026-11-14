@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import AsyncExitStack
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm.attributes import flag_modified
 
 from slipway.api.deps import DB, Auth, not_found, require
 from slipway.core.permissions import Perm
-from slipway.models import Host, HostAuthMethod, HostStatus, Instance, InstanceStatus
+from slipway.models import Deployment, DeploymentStatus, Host, HostAuthMethod, HostStatus, Instance, InstanceStatus
 from slipway.schemas import HostCreate, HostOut, HostUpdate, host_out
-from slipway.services import audit, ssh
+from slipway.services import audit, deployer, ssh
 from slipway.services.auth import AuthContext
 from slipway.services.hosts import check_host
 
@@ -121,51 +123,116 @@ async def get_host(host_id: uuid.UUID, ctx: Reader, db: DB) -> HostOut:
     return host_out(await _get(db, host_id))
 
 
-async def _deployed_instances(db: DB, host: Host) -> int:
+async def _deployed_instances(db: DB, host: Host) -> list[Instance]:
     """Instances on the host that have ever been deployed (they have files under its deploy root)."""
     ever_deployed = or_(
         Instance.status != InstanceStatus.CREATED,
         Instance.current_commit_sha.is_not(None),
         Instance.last_deployed_at.is_not(None),
     )
-    stmt = select(func.count()).select_from(Instance).where(Instance.host_id == host.id, ever_deployed)
-    return await db.scalar(stmt) or 0
+    stmt = select(Instance).where(Instance.host_id == host.id, ever_deployed).order_by(Instance.name)
+    return list(await db.scalars(stmt))
+
+
+async def _deploying(db: DB, instances: list[Instance]) -> bool:
+    if any(inst.status == InstanceStatus.DEPLOYING for inst in instances):
+        return True
+    active = select(func.count()).select_from(Deployment).where(
+        Deployment.instance_id.in_([inst.id for inst in instances]),
+        Deployment.status.in_([DeploymentStatus.QUEUED, DeploymentStatus.RUNNING]),
+    )
+    return bool(await db.scalar(active))
 
 
 @router.patch("/{host_id}")
 async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request: Request, db: DB) -> HostOut:
+    """Update the host. A new deploy root moves the files of instances deployed on it over SSH.
+
+    Answers the host, with a ``warning`` when the move left something for the user to do.
+    """
     host = await _get(db, host_id)
-    if body.deploy_root is not None and body.deploy_root != host.deploy_root:
-        if deployed := await _deployed_instances(db, host):
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"{deployed} instance(s) on this host have been deployed; destroy them before changing the deploy root",
-            )
     if body.name and body.name != host.name:
         if await db.scalar(select(Host).where(Host.name == body.name)):
             raise HTTPException(status.HTTP_409_CONFLICT, "A host with this name already exists")
-        host.name = body.name
-    moved = (body.hostname and body.hostname != host.hostname) or (body.port and body.port != host.port)
-    old_address = host.address
-    old_fingerprint = await _stored_fingerprint(db, host) if moved else None
-    for field in ("hostname", "port", "username", "environment", "description", "deploy_root"):
-        value = getattr(body, field)
-        if value is not None:
-            setattr(host, field, value)
-    if body.proxy_address is not None:
-        host.proxy_address = body.proxy_address or None
-    _apply_credentials(host, body)
-    summary = f"Updated host {host.name}"
-    if moved:  # possibly a different machine: forget the pinned host key and re-verify
-        _forget_host_key(host)
-        summary += f" (address {old_address} -> {host.address})"
-    audit.record(db, "host.update", actor=ctx.user, target=host, summary=summary, request=request)
-    if moved and old_fingerprint:
-        audit.record(
-            db, "host.key_reset", actor=ctx.user, target=host, request=request,
-            summary=f"Cleared pinned key {old_fingerprint} for {host.name}: address changed to {host.address}",
+    old_root = host.deploy_root
+    to_move: list[Instance] = []
+    if body.deploy_root is not None and body.deploy_root != old_root:
+        to_move = await _deployed_instances(db, host)
+    if to_move:
+        reconnects = (
+            (body.hostname and body.hostname != host.hostname)
+            or (body.port and body.port != host.port)
+            or (body.username and body.username != host.username)
+            or body.auth_method
+            or body.private_key
+            or body.password
         )
-    await db.commit()
+        if reconnects:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Change the deploy root on its own: Slipway moves the instances' files over the current connection. "
+                "Save the address or sign-in change separately.",
+            )
+
+    async def save() -> None:
+        if body.name and body.name != host.name:
+            host.name = body.name
+        moved = (body.hostname and body.hostname != host.hostname) or (body.port and body.port != host.port)
+        old_address = host.address
+        old_fingerprint = await _stored_fingerprint(db, host) if moved else None
+        for field in ("hostname", "port", "username", "environment", "description", "deploy_root"):
+            value = getattr(body, field)
+            if value is not None:
+                setattr(host, field, value)
+        if body.proxy_address is not None:
+            host.proxy_address = body.proxy_address or None
+        _apply_credentials(host, body)
+        summary = f"Updated host {host.name}"
+        if moved:  # possibly a different machine: forget the pinned host key and re-verify
+            _forget_host_key(host)
+            summary += f" (address {old_address} -> {host.address})"
+        if to_move:
+            summary += f" (moved {', '.join(i.name for i in to_move)} from {old_root} to {host.deploy_root})"
+        audit.record(db, "host.update", actor=ctx.user, target=host, summary=summary, request=request)
+        if moved and old_fingerprint:
+            audit.record(
+                db, "host.key_reset", actor=ctx.user, target=host, request=request,
+                summary=f"Cleared pinned key {old_fingerprint} for {host.name}: address changed to {host.address}",
+            )
+        await db.commit()
+
+    if not to_move:
+        await save()
+        return host_out(host)
+
+    notes: list[str] = []
+    try:
+        async with AsyncExitStack() as stack:
+            for inst in to_move:
+                await stack.enter_async_context(deployer.runner.exclusive(inst.id))
+            if await _deploying(db, to_move):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A deployment is in progress on this host; change the deploy root when it finishes",
+                )
+            await db.commit()  # release the DB connection during SSH
+            notes = await deployer.move_deploy_root(host, to_move, body.deploy_root, save=save)
+    except deployer.RunnerBusy as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except deployer.DeployError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ssh.SSHError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"Could not move the files on {host.name}: {exc}. Nothing was changed."
+        ) from exc
+    if notes:
+        audit.record(
+            db, "host.deploy_root_notes", actor=ctx.user, target=host, request=request,
+            summary=f"Moving {host.name}'s deploy root to {host.deploy_root}: {' '.join(notes)}",
+            details={"warning": " ".join(notes)},
+        )
+        await db.commit()
+        return JSONResponse({**host_out(host).model_dump(mode="json"), "warning": " ".join(notes)})
     return host_out(host)
 
 
