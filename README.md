@@ -119,7 +119,16 @@ command with `/bin/sh`, so the deploy user's login shell (bash, zsh, …) does n
    different *type* of host key is also reported as a mismatch.
 
 Changing a host's hostname or port forgets its pinned key, so verify it again afterwards (the change is
-audited). A check that was running while the address or key changed is discarded. The deploy root cannot change once any instance on the host has been deployed.
+audited). A check that was running while the address or key changed is discarded.
+
+Changing the deploy root of a host with deployed instances moves their files: Slipway copies each
+`<slug>/` directory to the new root (through a throwaway container for files containers wrote as root),
+re-points `current` and each release's `.env` link, saves the new root, then deletes the old directory.
+Containers keep running and named volumes are not touched. An old directory a container still
+bind-mounts from is kept, with a note to redeploy that instance and delete it. If a copy fails, the
+copies are removed and nothing changes. Change the deploy root on its own, not together with the
+address or sign-in, and not while a deployment runs. **On Unraid, use a folder under
+`/mnt/user/appdata`: Unraid clears `/opt` when it restarts.**
 
 On the host each instance lives in `<deploy_root>/<slug>/` with `releases/<sha12>-<deployment>`,
 `current → releases/…` and `shared/.env` (mode 600). Every deployment, even of the same commit, gets a

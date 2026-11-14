@@ -194,6 +194,7 @@
     omitUnchanged(form, body);
     if (submit && submit.name) body[submit.name] = submit.value === "true" ? true : submit.value === "false" ? false : submit.value;
     setLoading(submit, true);
+    formError(form, "");
     try {
       const data = await api(method, url, body);
       form.dispatchEvent(new CustomEvent("slipway:success", { detail: data, bubbles: true }));
@@ -211,11 +212,35 @@
       if (data && data.warning) leaving ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
       then(form.dataset.then, data);
     } catch (err) {
-      toast(err.message, "error");
+      if (!formError(form, err.message)) toast(err.message, "error");
     } finally {
       setLoading(submit, false);
     }
   });
+
+  // A modal dialog covers the toasts, so a form in one shows its error inside the dialog.
+  // Returns whether it did.
+  function formError(form, message) {
+    const dlg = form.closest("dialog");
+    let box = $("[data-form-error]", form);
+    if (!message) {
+      if (box) box.remove();
+      return false;
+    }
+    if (!dlg || !dlg.open) return false;
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "callout error";
+      box.setAttribute("role", "alert");
+      box.dataset.formError = "";
+      const body = $(".modal-body", form) || form;
+      body.prepend(box);
+    }
+    box.textContent = message;
+    box.style.whiteSpace = "pre-line";
+    box.scrollIntoView({ block: "nearest" });
+    return true;
+  }
 
   // --------------------------------------------------------- repeaters
   document.addEventListener("click", (ev) => {
@@ -248,7 +273,7 @@
     const opener = ev.target.closest("[data-open]");
     if (opener) {
       const dlg = document.getElementById(opener.dataset.open);
-      if (dlg) { dlg.showModal(); const f = $("input:not([type=hidden]), textarea, select", dlg); if (f) f.focus(); }
+      if (dlg) { $$("[data-form-error]", dlg).forEach((el) => el.remove()); dlg.showModal(); const f = $("input:not([type=hidden]), textarea, select", dlg); if (f) f.focus(); }
     }
     const closer = ev.target.closest("[data-close]");
     if (closer) closer.closest("dialog").close();

@@ -27,7 +27,7 @@
   <div class="field span-2">
     <label for="hf-root">Deploy root</label>
     <input class="input mono" id="hf-root" name="deploy_root" value="{{ h.deploy_root if h else '/opt/slipway' }}">
-    <span class="help">Where Slipway keeps releases on the host. The SSH user must own it and be in the <code>docker</code> group.</span>
+    <span class="help">Where Slipway keeps releases on the host. The SSH user must own it and be in the <code>docker</code> group.{% if h %} Changing it moves the files of instances deployed here; their containers keep running.{% endif %} On Unraid, use a folder under <code>/mnt/user/appdata</code>: Unraid clears <code>/opt</code> when it restarts.</span>
   </div>
   <div class="field span-2">
     <label for="hf-proxy">Address for the reverse proxy <span class="subtle">(optional)</span></label>
