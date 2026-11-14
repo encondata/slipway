@@ -27,6 +27,11 @@
 <div class="callout warning">{{ icon("alert") }}<div><strong>{{ "Cannot reach host" if host.status == "unreachable" else "Docker problem" }}:</strong> <span class="mono">{{ host.last_error }}</span></div></div>
 {% endif %}
 
+{% if root_in_ram %}
+<div class="callout warning">{{ icon("alert") }}<div><strong>Unraid clears {{ host.deploy_root }} when it restarts.</strong> Only <code>/mnt</code> and <code>/boot</code> survive a restart, so releases and settings kept there are lost.
+  {% if auth.can(Perm.HOSTS_WRITE) %}Edit the host and set the deploy root to a folder under <code>/mnt/user</code>, such as <code>/mnt/user/appdata</code>: Slipway moves the instances deployed here.{% endif %}</div></div>
+{% endif %}
+
 {% if not host.is_pinned and host.public_key %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("key", "i-lg") }}</span>

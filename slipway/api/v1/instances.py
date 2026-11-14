@@ -52,6 +52,22 @@ async def _check_hostnames(db: AsyncSession, routes: list[Any] | None, instance_
             raise HTTPException(status.HTTP_409_CONFLICT, f"{sorted(taken)[0]} is already a hostname of instance {name}")
 
 
+async def _check_folder(db: AsyncSession, host: Host, folder: str, instance_id: uuid.UUID | None) -> None:
+    """Answer 409 when ``folder`` is, holds or is inside another instance's folder on the same host."""
+    others = (await db.scalars(select(Instance).where(Instance.host_id == host.id, Instance.id != instance_id))).all()
+    for other in others:
+        try:
+            theirs = deployer.instance_dir(other)
+        except deployer.DeployError:
+            continue
+        if folder == theirs or folder.startswith(theirs + "/") or theirs.startswith(folder + "/"):
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{folder} overlaps {theirs}, the folder of instance {other.name}")
+
+
+def _folder_of(host: Host, slug: str, deploy_dir: str | None) -> str:
+    return deploy_dir or f"{deployer.clean_deploy_root(host.deploy_root)}/{slug}"
+
+
 async def _get(db: DB, instance_id: uuid.UUID) -> Instance:
     instance = await db.get(Instance, instance_id)
     if instance is None:
@@ -158,6 +174,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
     if await db.scalar(select(Instance).where(Instance.slug == slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"An instance named '{slug}' already exists")
     await _check_hostnames(db, body.routes, None)
+    await _check_folder(db, host, _folder_of(host, slug, body.deploy_dir or None), None)
     if not body.branch and not repo.default_branch_usable:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -175,6 +192,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         dockerfile_path=body.dockerfile_path or "Dockerfile",
         build_context=body.build_context or ".",
         compose_file=body.compose_file or repo.compose_file or "docker-compose.yml",
+        deploy_dir=body.deploy_dir or None,
         env=body.env or {},
         ports=[p.model_dump() for p in body.ports or []],
         volumes=[v.model_dump() for v in body.volumes or []],
@@ -219,6 +237,10 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
     instance = await _get(db, instance_id)
     data = body.model_dump(exclude_unset=True)
     changing = {f for f in _PLACEMENT_FIELDS if data.get(f) is not None and data[f] != getattr(instance, f)}
+    if body.deploy_dir is not None and (body.deploy_dir or None) != instance.deploy_dir:
+        if changing:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Change the folder on its own, without the host or build settings")
+        return await _change_folder(db, instance, body, data, ctx, request)
     if not changing:
         return await _apply_update(db, instance, body, data, ctx, request)
     # Hold the instance's deploy lock until the commit, so no deployment starts in between.
@@ -239,6 +261,44 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
+async def _change_folder(
+    db: DB, instance: Instance, body: InstanceUpdate, data: dict[str, Any], ctx: AuthContext, request: Request
+) -> Response | InstanceOut:
+    """Give the instance another folder. Once it has been deployed, its files move there over SSH first."""
+    old = deployer.instance_dir(instance)
+    new = _folder_of(instance.host, instance.slug, body.deploy_dir or None)
+    await _check_folder(db, instance.host, new, instance.id)
+    result: list[InstanceOut] = []
+
+    async def save() -> None:
+        result.append(await _apply_update(db, instance, body, data, ctx, request))
+
+    try:
+        async with deployer.runner.exclusive(instance.id):
+            if await _active_deployment(db, instance.id) is not None:
+                raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
+            if new == old or not await _ever_deployed(db, instance):
+                await save()
+                return result[0]
+            await db.commit()  # release the DB connection during SSH
+            notes = await deployer.move_instance_dir(instance, new, save=save)
+    except deployer.RunnerBusy as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except deployer.DeployError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ssh.SSHError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"Could not move the files on {instance.host.name}: {exc}. Nothing was changed."
+        ) from exc
+    audit.record(db, "instance.move", actor=ctx.user, target=instance, request=request,
+                 summary=f"Moved {instance.name}'s folder from {old} to {new}" + (f": {' '.join(notes)}" if notes else ""),
+                 details={"from": old, "to": new, **({"warning": " ".join(notes)} if notes else {})})
+    await db.commit()
+    if notes:
+        return JSONResponse({**result[0].model_dump(mode="json"), "warning": " ".join(notes)})
+    return result[0]
+
+
 async def _apply_update(
     db: DB, instance: Instance, body: InstanceUpdate, data: dict[str, Any], ctx: AuthContext, request: Request
 ) -> InstanceOut:
@@ -248,6 +308,8 @@ async def _apply_update(
         if host is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown host")
         instance.host = host
+    if body.deploy_dir is not None:
+        instance.deploy_dir = body.deploy_dir or None
     for field in ("name", "branch", "build_source", "dockerfile_path", "build_context", "compose_file"):
         if data.get(field) is not None:
             setattr(instance, field, data[field])

@@ -354,7 +354,7 @@ async def open_session(target: SSHTarget, *, allow_unpinned: bool = False) -> As
 # --------------------------------------------------------------------------- probe
 
 PROBE_COMMAND = f"""
-( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" ) || uname -sr; echo '{_SEP}'
+( [ -f /etc/unraid-version ] && . /etc/unraid-version && echo "Unraid $version" ) || ( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" ) || uname -sr; echo '{_SEP}'
 nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1; echo '{_SEP}'
 cat /proc/loadavg 2>/dev/null; echo '{_SEP}'
 grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null; echo '{_SEP}'

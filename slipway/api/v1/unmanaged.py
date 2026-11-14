@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from slipway.api.deps import DB, not_found, require
-from slipway.api.v1.instances import queue_deployment
+from slipway.api.v1.instances import _check_folder, queue_deployment
 from slipway.core.permissions import Perm
 from slipway.db.base import utcnow
 from slipway.models import BuildSource, Host, Instance, InstanceStatus, Repository
@@ -138,7 +138,8 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
             f"Slipway could not store the default branch of {repo.full_name} (its name is longer than "
             f"{BRANCH_MAX} characters); specify a branch",
         )
-    base = f"{deployer.clean_deploy_root(host.deploy_root)}/{slug}"
+    base = body.deploy_dir or f"{deployer.clean_deploy_root(host.deploy_root)}/{slug}"
+    await _check_folder(db, host, base, None)
     projects, containers = await _claimed(db, host)
     await db.commit()  # release the DB connection during SSH
 
@@ -238,6 +239,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
         repository=repo,
         host=host,
         branch=body.branch or repo.default_branch,
+        deploy_dir=body.deploy_dir or None,
         env=env,
         auto_ports=True if body.auto_ports is None else body.auto_ports,
         # The app runs on the host already: it counts as deployed (its ports are reserved, its host

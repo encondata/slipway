@@ -113,7 +113,7 @@
       <div class="card-body stack" style="gap: 10px">
         {% for h in hosts %}
         <label class="choice">
-          <input type="radio" name="host_id" value="{{ h.id }}" {{ 'disabled' if locked }} data-label="{{ h.name }} ({{ h.address }})" {{ 'checked' if (editing and instance.host_id == h.id) or (not editing and loop.first) }}>
+          <input type="radio" name="host_id" value="{{ h.id }}" {{ 'disabled' if locked }} data-label="{{ h.name }} ({{ h.address }})" data-root="{{ h.deploy_root }}" data-unraid="{{ '1' if (h.os_info or '').startswith('Unraid') else '' }}" {{ 'checked' if (editing and instance.host_id == h.id) or (not editing and loop.first) }}>
           <span><strong>{{ h.name }}</strong><small class="mono">{{ h.address }}</small></span>
           <span class="choice-meta">
             {{ badge("host", h.status) }}
@@ -122,6 +122,13 @@
         </label>
         {% endfor %}
         {% if hosts|rejectattr("is_pinned")|list %}<p class="subtle">Hosts must pass a connection check (which pins their SSH key) before Slipway will deploy to them.</p>{% endif %}
+        <div class="field" style="margin-top: 6px">
+          <label for="deploy-dir">Folder on the host <span class="subtle">(optional)</span></label>
+          <input class="input mono" id="deploy-dir" name="deploy_dir" value="{{ (instance.deploy_dir or '') if editing else '' }}" data-keep-empty
+                 data-slug="{{ instance.slug if editing else '' }}" placeholder="{{ folder if editing else '' }}" autocapitalize="off" spellcheck="false">
+          <span class="help">Where Slipway keeps this instance's releases and settings: any folder of its own on the host. Leave it empty for <code data-folder-default>{{ folder if editing else "the host's deploy root / instance name" }}</code>.{% if editing and locked %} Changing it moves the instance's files there when you save; its containers keep running.{% endif %}</span>
+          <div class="callout warning" data-unraid-warning hidden>{{ icon("alert") }}<span>This host runs Unraid, which clears everything outside <code>/mnt</code> and <code>/boot</code> when it restarts. Use a folder under <code>/mnt/user</code>, such as <code>/mnt/user/appdata/&lt;name&gt;</code>.</span></div>
+        </div>
       </div>
     </section>
 
@@ -213,6 +220,7 @@
         <dt>{{ icon("branch", "i-sm") }} Branch</dt><dd data-preview="branch">—</dd>
         <dt>{{ icon("instances", "i-sm") }} Build source</dt><dd data-preview="source">—</dd>
         <dt>{{ icon("hosts", "i-sm") }} Target host</dt><dd data-preview="host">—</dd>
+        <dt>{{ icon("database", "i-sm") }} Folder</dt><dd class="mono" data-preview="folder">—</dd>
         <dt>{{ icon("box", "i-sm") }} Instance name</dt><dd data-preview="name">—</dd>
         <dt>{{ icon("key", "i-sm") }} Environment</dt><dd data-preview="env">—</dd>
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd data-preview="ports">—</dd>

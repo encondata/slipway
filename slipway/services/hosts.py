@@ -7,13 +7,13 @@ import logging
 import uuid
 
 from fastapi import Request
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from slipway.core.config import get_settings
 from slipway.db.base import utcnow
 from slipway.db.session import session_scope
-from slipway.models import Host, HostStatus, User
+from slipway.models import Host, HostStatus, Instance, InstanceStatus, User
 from slipway.services import audit, ssh
 
 log = logging.getLogger(__name__)
@@ -82,8 +82,36 @@ async def check_host(
         current.docker_version = ssh.clip(result.docker_version, 64) if result.docker_version else None
         current.os_info = ssh.clip(result.os_info, 255)
         current.metrics = result.metrics
+        await _unraid_deploy_root(db, current, actor=actor, request=request)
     await db.commit()
     return current
+
+
+DEFAULT_DEPLOY_ROOT = "/opt/slipway"
+UNRAID_DEPLOY_ROOT = "/mnt/user/appdata"
+
+
+async def _unraid_deploy_root(db: AsyncSession, host: Host, *, actor: User | None, request: Request | None) -> None:
+    """On Unraid, swap the untouched default deploy root (in RAM, cleared at restart) for /mnt/user/appdata.
+
+    Only while no instance has files there; otherwise the host page warns and the root can be moved.
+    """
+    if not (host.os_info or "").startswith("Unraid") or host.deploy_root != DEFAULT_DEPLOY_ROOT:
+        return
+    used = await db.scalar(
+        select(Instance.id).where(
+            Instance.host_id == host.id, Instance.deploy_dir.is_(None),
+            or_(Instance.status != InstanceStatus.CREATED, Instance.last_deployed_at.is_not(None)),
+        ).limit(1)
+    )
+    if used is not None:
+        return
+    host.deploy_root = UNRAID_DEPLOY_ROOT
+    audit.record(
+        db, "host.update", actor=actor, target=host, request=request,
+        summary=f"{host.name} runs Unraid, which clears {DEFAULT_DEPLOY_ROOT} when it restarts: "
+                f"deploy root set to {UNRAID_DEPLOY_ROOT}",
+    )
 
 
 async def _check_by_id(host_id: uuid.UUID) -> None:

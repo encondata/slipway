@@ -99,7 +99,9 @@ def test_compose_commands():
     assert env_cmd.startswith("cd /opt/slipway/web-prod/releases/x &&")
     assert "ln -sfn /opt/slipway/web-prod/shared/.env .env" in env_cmd
     assert deployer.control_command(inst, "stop").endswith(f"{compose} stop")
-    assert "rm -rf -- /opt/slipway/web-prod" in deployer.remove_dir_command(inst)
+    remove = deployer.remove_dir_command(inst)
+    assert "cd /opt/slipway/web-prod" in remove and "rmdir -- /opt/slipway/web-prod" in remove
+    assert "rm -rf -- /opt/slipway/web-prod " not in remove + " "  # never the whole folder
     with pytest.raises(ValueError):
         deployer.control_command(inst, "explode")
 

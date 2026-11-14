@@ -127,10 +127,25 @@ re-points `current` and each release's `.env` link, saves the new root, then del
 Containers keep running and named volumes are not touched. An old directory a container still
 bind-mounts from is kept, with a note to redeploy that instance and delete it. If a copy fails, the
 copies are removed and nothing changes. Change the deploy root on its own, not together with the
-address or sign-in, and not while a deployment runs. **On Unraid, use a folder under
-`/mnt/user/appdata`: Unraid clears `/opt` when it restarts.**
+address or sign-in, and not while a deployment runs.
 
-On the host each instance lives in `<deploy_root>/<slug>/` with `releases/<sha12>-<deployment>`,
+**Unraid** keeps only `/mnt` and `/boot` across a restart; the rest of the filesystem lives in RAM. Slipway
+recognizes Unraid when it checks the host (`/etc/unraid-version`). A new Unraid host whose deploy root is still
+the default `/opt/slipway` gets `/mnt/user/appdata` instead, so instances land in `/mnt/user/appdata/<name>`.
+If something is already deployed under a folder Unraid clears, the host page, the instance page and every
+deploy log say so; change the deploy root or the instance's folder and Slipway moves the files.
+
+**Each instance's folder** is `<deploy_root>/<slug>/` unless the instance is given a folder of its own
+(*Folder on the host* on the instance form or the claim dialog, `deploy_dir` in the API): any absolute path,
+such as `/mnt/user/appdata/shop` or `/srv/apps/shop`. Slipway refuses system folders and the roots that hold
+other data (`/`, `/etc`, `/usr`, `/boot`, `/mnt/user`, `/mnt/user/appdata`, `/mnt/diskN`, …), a folder that
+is, holds or sits inside another instance's, and, on deploy, a folder that already holds files that aren't
+Slipway's. It marks the folders it uses with `.slipway-instance`, and deleting an instance removes only what
+Slipway put there (`releases/`, `shared/`, `current`, the marker); anything else stays, with a note. Changing
+the folder of a deployed instance moves its files there the same way the deploy root moves (an empty folder
+made in advance is fine). Instances with a folder of their own stay put when the host's deploy root changes.
+
+On the host each instance's folder holds `releases/<sha12>-<deployment>`,
 `current → releases/…` and `shared/.env` (mode 600). Every deployment, even of the same commit, gets a
 fresh release directory; the one `current` points to is never touched by a redeploy, and a failed
 deployment removes its release again. Keep persistent data in **named volumes or absolute host paths**:
