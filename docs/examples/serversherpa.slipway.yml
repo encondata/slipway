@@ -4,6 +4,10 @@
 # SeaweedFS (the db and storage stacks). deploy/stack/ss-stack does the work;
 # Slipway writes <instance folder>/shared/.env from deploy/stack/env.example and
 # runs ss-stack from the release.
+#
+# Set other env.example values (SS_KIOSK_SIGNING_DIGESTS, SS_ANTHROPIC_API_KEY,
+# SS_SMTP_HOST and the rest of the SS_SMTP_* keys...) as environment variables on
+# the Slipway instance. With mailpit off, ss-stack needs SS_SMTP_HOST; learn needs wiki.
 version: 1
 name: ServerSherpa
 env_file: deploy/stack/env.example
@@ -43,6 +47,7 @@ services:
   spaces:  {port: 9000, port_var: STACK_SPACES_PORT,  hostname: "spaces.{STACK_DOMAIN}"}
   kiosk:   {port: 8090, port_var: STACK_KIOSK_PORT,   hostname: "kiosk.{STACK_DOMAIN}", optional: true}
   wiki:    {port: 8096, port_var: STACK_WIKI_PORT,    hostname: "wiki.{STACK_DOMAIN}", optional: true}
+  learn:   {port: 8092, port_var: STACK_LEARN_PORT,   hostname: "learn.{STACK_DOMAIN}", optional: true}
   status:  {port: 8095, port_var: STACK_STATUS_PORT,  hostname: "status.{STACK_DOMAIN}", optional: true}
   mailpit: {port: 8025, port_var: STACK_MAILPIT_PORT, optional: true}
 
@@ -61,6 +66,7 @@ images:
   - "serversherpa-portal:{STACK_IMAGE_TAG}"
   - "serversherpa-kiosk:{STACK_IMAGE_TAG}"
   - "serversherpa-wiki:{STACK_IMAGE_TAG}"
+  - "serversherpa-learn:{STACK_IMAGE_TAG}"
   - "serversherpa-status:{STACK_IMAGE_TAG}"
 
 commands:
