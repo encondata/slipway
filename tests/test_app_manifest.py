@@ -436,7 +436,8 @@ def test_env_file_lines_slipway_does_not_set_are_kept_as_written():
         manifest.plan(man, template=template, builtins=BUILTINS, settings={}, chosen=None, host_ports={}, secrets={}, env={})
 
 
-@pytest.mark.parametrize("value", ["pa;id", "~/data", "a b", "it's", 'say "hi"', "50%", "a#b", "*", "x=y,z"])
+@pytest.mark.parametrize("value", ["pa;id", "~/data", "a b", "it's", 'say "hi"', "50%", "a#b", "*", "x=y,z",
+                                   "pa55\\", "it's a\\b", 'it\'s \\ "q"\\', "C:\\dir\\"])
 def test_env_values_read_the_same_in_a_shell_as_written(tmp_path, value):
     (tmp_path / ".env").write_text(f"V={manifest.format_value(value, 'V')}\n")
     out = subprocess.run(["/bin/sh", "-c", 'set -a; . ./.env; printf %s "$V"'], cwd=tmp_path, capture_output=True,
@@ -444,10 +445,18 @@ def test_env_values_read_the_same_in_a_shell_as_written(tmp_path, value):
     assert out.returncode == 0 and out.stdout == value, out
 
 
-@pytest.mark.parametrize("value", ["it's $5", "it's `id`", "it's a\\b"])
-def test_env_values_no_quoting_can_carry_are_refused(value):
-    with pytest.raises(manifest.ManifestError, match="single quote"):
+@pytest.mark.parametrize(("value", "why"), [("it's $5", "single quote"), ("it's `id`", "single quote"),
+                                           ("$HOME\\", "backslash at the end"), ("`id`\\", "backslash at the end")])
+def test_env_values_no_quoting_can_carry_are_refused(value, why):
+    with pytest.raises(manifest.ManifestError, match=why):
         manifest.format_value(value, "V")
+
+
+@pytest.mark.parametrize("value", ["pa55\\", "it's a\\b", 'it\'s \\ "q"\\', "a\\nb\\", "plain\\path"])
+def test_env_values_compose_reads_as_written(value):
+    """Compose's dotenv reading (as parse_env_template mirrors it) gets the value back, the line after intact."""
+    _, values = manifest.parse_env_template(f"V={manifest.format_value(value, 'V')}\nNEXT=after\n")
+    assert values == {"V": value, "NEXT": "after"}
 
 
 def test_vars_see_final_ports_and_earlier_vars_only():
@@ -541,7 +550,10 @@ async def test_a_failed_deploy_leaves_the_app_state_of_the_live_release(tmp_path
     teardown = deployer.teardown_command(inst)
     assert all(f"-p {p} down" in teardown for p in inst.app_state["known_projects"])
     assert "demo-web-prod-app" in deployer.leftovers_command(inst) and "demo-web-prod-app" in deployer.bind_sources_command(inst)
-    assert "demo-web-prod-app" not in deployer.status_command(inst)
+    # The failed release's new project may have containers up: status, logs and stop see it too.
+    assert "demo-web-prod-app" in deployer.status_command(inst) and "demo-web-prod-app" in deployer.logs_command(inst)
+    assert inst.app_state["starting"] == ["demo-web-prod-app", "demo-web-prod-db"]
+    assert deployer.app_projects(inst) == ["demo-web-prod-web", "demo-web-prod-db", "demo-web-prod-app"]
 
 
 async def test_two_apps_on_a_host_cannot_share_a_project(tmp_path, docker_shim):  # noqa: F811
@@ -578,3 +590,271 @@ async def test_the_instances_list_names_apps(admin_client):
     await _seed_app(Path("/opt/slipway"), signed_in=True)
     page = (await admin_client.get("/instances")).text
     assert '<td class="muted">App</td>' in page
+
+
+# ------------------------------------------------------------ review fixes (phase 1, round 2)
+
+
+def test_running_compose_env_again_keeps_the_repository_defaults(tmp_path):
+    """A retry or a port move runs it again on the same release: the repository's .env is still read."""
+    from tests.test_final_remote import _at
+    inst = _at(tmp_path, build_source="compose")
+    paths = deployer.paths_for(inst)
+    release = Path(paths.release(SHA, uuid.uuid4()))
+    release.mkdir(parents=True)
+    (release / ".env").write_text("POSTGRES_DB=app\n")
+    Path(paths.shared).mkdir(parents=True)
+    Path(paths.slipway_env_file).write_text("SECRET=x\n")
+    for _ in range(2):
+        out = subprocess.run(["sh", "-c", deployer.compose_env_command(inst, str(release))], capture_output=True, text=True)
+        assert out.returncode == 0, out
+        assert Path(paths.env_file).read_text() == "POSTGRES_DB=app\n\nSECRET=x\n"
+    assert (release / ".env").is_symlink() and (release / deployer.REPO_ENV_FILE).read_text() == "POSTGRES_DB=app\n"
+
+
+def test_unexpanded_env_file_defaults_cannot_be_copied():
+    man = manifest.parse(APP_YML.replace('  APP_TAG: "{slipway.sha12}"\n', '  APP_TAG: "{slipway.sha12}"\n  APP_CORS: "{APP_URL}"\n'))
+    with pytest.raises(manifest.ManifestError, match=r"vars.APP_CORS: \{APP_URL\} comes from deploy/env.example with a \$"):
+        _plan(man, template=ENV_EXAMPLE + "APP_URL=https://www.${APP_DOMAIN}\n")
+    # Single quotes are literal for Compose too, and a default Slipway sets is its own value.
+    assert _plan(man, template=ENV_EXAMPLE + "APP_URL='https://www.${APP_DOMAIN}'\n").env["APP_CORS"] == "https://www.${APP_DOMAIN}"
+    assert _plan(man, template=ENV_EXAMPLE + "APP_URL=https://www.example.com\n").env["APP_CORS"] == "https://www.example.com"
+    # A $ in a comment isn't part of the value.
+    for line in ("APP_URL=https://www.example.com  # or ${APP_DOMAIN}\n", 'APP_URL="https://www.example.com" # was $OLD\n'):
+        assert _plan(man, template=ENV_EXAMPLE + line).env["APP_CORS"] == "https://www.example.com"
+
+
+def test_app_start_and_stop_fail_when_docker_cannot_list_containers(tmp_path, docker_shim):  # noqa: F811
+    env, _ = docker_shim
+    for action in ("start", "stop"):
+        command = deployer.control_command(_app(), action)
+        assert subprocess.run(["sh", "-c", command], env={**env, "FAKE_PS_FAILS": "1"}, capture_output=True).returncode != 0
+        assert subprocess.run(["sh", "-c", command], env=env, capture_output=True).returncode == 0  # no containers: nothing to do
+
+
+async def _raw_app_secrets(instance_id: uuid.UUID, value: str | None) -> None:
+    from sqlalchemy import Text, column, table
+    raw = table("instances", column("id", Instance.__table__.c.id.type), column("app_secrets", Text()))
+    async with get_sessionmaker()() as db:
+        await db.execute(update(raw).where(raw.c.id == instance_id).values(app_secrets=value))
+        await db.commit()
+
+
+async def test_unreadable_app_secrets_are_never_replaced_by_new_ones(tmp_path, docker_shim):  # noqa: F811
+    from slipway.core.crypto import encrypt
+    env, _ = docker_shim
+    remote = ShellRemote("sh", {**env, "APP_LOG": str(tmp_path / "app.log")})
+    inst_id, user_id = await _seed_app(tmp_path / "root")
+    await _raw_app_secrets(inst_id, encrypt("null"))  # what rotate-encryption-key --clear-unreadable leaves
+    dep = await _deploy(inst_id, user_id, remote)
+    assert dep.status == "failed" and "can't be decrypted" in dep.error and "APP_SECRET, APP_KEY" in dep.error
+    assert (await _instance_row(inst_id)).app_secrets is None  # nothing was generated
+
+    # Setting every secret on the instance (their old values) lets it deploy again.
+    async with get_sessionmaker()() as db:
+        inst = await db.get(Instance, inst_id)
+        inst.env = {"A": "1", "APP_SECRET": "old-secret", "APP_KEY": "old-key"}
+        await db.commit()
+    dep = await _deploy(inst_id, user_id, remote)
+    assert dep.status == "succeeded", (dep.error, dep.log)
+    written = (tmp_path / "root" / "web-prod" / "shared" / ".env").read_text()
+    assert "APP_SECRET=old-secret\n" in written and "APP_KEY=old-key\n" in written
+    # They are kept as the app's secrets (not new random ones), so the variables can go again.
+    assert (await _instance_row(inst_id)).app_secrets == {"APP_SECRET": "old-secret", "APP_KEY": "old-key"}
+    async with get_sessionmaker()() as db:
+        (await db.get(Instance, inst_id)).env = {"A": "1"}
+        await db.commit()
+    assert (await _deploy(inst_id, user_id, remote)).status == "succeeded"
+    assert "APP_SECRET=old-secret\n" in (tmp_path / "root" / "web-prod" / "shared" / ".env").read_text()
+
+
+async def test_clearing_unreadable_keys_flags_app_secrets_for_re_entry(tmp_path):
+    from slipway import cli
+    inst_id, _ = await _seed_app(tmp_path / "root")
+    await _raw_app_secrets(inst_id, "not-a-token-any-key-can-read")
+    async with get_sessionmaker()() as db:
+        await cli._rotate_secrets(db, clear_unreadable=True)
+        await db.commit()
+    async with get_sessionmaker()() as db:
+        stored = await db.scalar(select(Instance.app_secrets.is_not(None)).where(Instance.id == inst_id))
+        assert stored and (await db.get(Instance, inst_id)).app_secrets is None
+
+
+async def test_projects_already_on_the_host_are_not_taken_over(tmp_path, docker_shim):  # noqa: F811
+    env, _ = docker_shim
+    root = tmp_path / "root"
+    inst_id, user_id = await _seed_app(root)
+    shell = {**env, "APP_LOG": str(tmp_path / "app.log")}
+    dep = await _deploy(inst_id, user_id, ShellRemote("sh", {**shell, "FAKE_PS": "aaaaaaaaaaaa"}))
+    assert dep.status == "failed" and "already runs containers in the Compose projects demo-web-prod-db, demo-web-prod-web," in dep.error
+
+    # Volumes without containers: a deleted instance's data, made with secrets this one doesn't have.
+    (root / ".slipway-kept").mkdir(parents=True)
+    (root / ".slipway-kept" / "web-prod-0123abcd.env").write_text("APP_SECRET=old\n")
+    volumes = {**shell, "FAKE_VOLUMES": "demo-web-prod-db_data"}
+    dep = await _deploy(inst_id, user_id, ShellRemote("sh", volumes))
+    assert dep.status == "failed" and "already has the volumes demo-web-prod-db_data" in dep.error
+    assert "Set APP_SECRET, APP_KEY as environment variables" in dep.error
+    assert str(root / ".slipway-kept" / "web-prod-0123abcd.env") in dep.error
+    assert not (await _instance_row(inst_id)).app_secrets  # neither check kept generated secrets
+
+    async with get_sessionmaker()() as db:
+        inst = await db.get(Instance, inst_id)
+        inst.env = {"APP_SECRET": "old", "APP_KEY": "old-key"}
+        await db.commit()
+    assert (await _deploy(inst_id, user_id, ShellRemote("sh", volumes))).status == "succeeded"
+    assert (await _instance_row(inst_id)).app_secrets == {"APP_SECRET": "old", "APP_KEY": "old-key"}
+    # Its own projects from then on: their volumes are its data.
+    async with get_sessionmaker()() as db:
+        inst = await db.get(Instance, inst_id)
+        inst.env = {}
+        await db.commit()
+    dep = await _deploy(inst_id, user_id, ShellRemote("sh", volumes))
+    assert dep.status == "succeeded", dep.error
+    assert "starting" not in (await _instance_row(inst_id)).app_state
+
+
+async def test_deleting_an_app_keeps_its_env_next_to_its_volumes(tmp_path, docker_shim):  # noqa: F811
+    from tests.test_final_remote import _at
+    env, _ = docker_shim
+    inst = _at(tmp_path, build_source="app", app_state={"projects": ["demo-x-web"], "known_projects": ["demo-x-db"]})
+    paths = deployer.paths_for(inst)
+    Path(paths.shared).mkdir(parents=True)
+    Path(paths.env_file).write_text("APP_SECRET=s3cret\n")
+    warning = await deployer.destroy(inst, connect=_local(ShellRemote("sh", {**env, "FAKE_VOLUMES": "demo-x-db_data"})))
+    kept = Path(deployer.kept_env_path(paths, inst))
+    assert kept.read_text() == "APP_SECRET=s3cret\n" and kept.stat().st_mode & 0o777 == 0o600
+    assert warning and str(kept) in warning and not Path(paths.base).exists()
+
+    # Without volumes there is no data to open, and nothing is kept.
+    inst2 = _at(tmp_path / "two", build_source="app", app_state={"projects": ["demo-y-web"]})
+    paths2 = deployer.paths_for(inst2)
+    Path(paths2.shared).mkdir(parents=True)
+    Path(paths2.env_file).write_text("APP_SECRET=s3cret\n")
+    assert await deployer.destroy(inst2, connect=_local(ShellRemote("sh", env))) is None
+    assert not (tmp_path / "two" / ".slipway-kept").exists()
+
+
+async def test_an_app_whose_env_cannot_be_copied_keeps_its_folder(tmp_path, docker_shim):  # noqa: F811
+    """The folder's parent isn't writable (mkdir's error names .slipway-kept): the folder and its .env stay."""
+    from tests.test_final_remote import _at
+    env, _ = docker_shim
+    parent = tmp_path / "opt"
+    inst = _at(parent, build_source="app", app_state={"projects": ["demo-x-web"]})
+    paths = deployer.paths_for(inst)
+    Path(paths.shared).mkdir(parents=True)
+    Path(paths.env_file).write_text("APP_SECRET=s3cret\n")
+    parent.chmod(0o555)
+    try:
+        warning = await deployer.destroy(inst, connect=_local(ShellRemote("sh", {**env, "FAKE_VOLUMES": "demo-x-web_data"})))
+    finally:
+        parent.chmod(0o755)
+    assert Path(paths.env_file).read_text() == "APP_SECRET=s3cret\n"
+    assert warning and f"they stay in {paths.env_file}" in warning
+
+
+async def test_a_delete_that_fails_removes_the_copy_it_made(tmp_path, docker_shim):  # noqa: F811
+    from tests.test_final_remote import _at
+    env, _ = docker_shim
+    inst = _at(tmp_path, build_source="app", app_state={"projects": ["demo-x-web"]})
+    paths = deployer.paths_for(inst)
+    Path(paths.shared).mkdir(parents=True)
+    Path(paths.env_file).write_text("APP_SECRET=s3cret\n")
+    remote = ShellRemote("sh", {**env, "FAKE_VOLUMES": "demo-x-web_data", "FAKE_PS": "aaaaaaaaaaaa"})
+    with pytest.raises(deployer.DeployError, match="still on"):
+        await deployer.destroy(inst, connect=_local(remote))
+    assert not Path(deployer.kept_env_path(paths, inst)).exists() and Path(paths.env_file).exists()
+
+
+async def test_an_empty_variable_does_not_stand_in_for_an_unreadable_secret(tmp_path, docker_shim):  # noqa: F811
+    from slipway.core.crypto import encrypt
+    env, _ = docker_shim
+    inst_id, user_id = await _seed_app(tmp_path / "root")
+    async with get_sessionmaker()() as db:
+        (await db.get(Instance, inst_id)).env = {"APP_SECRET": "", "APP_KEY": "old-key"}
+        await db.commit()
+    await _raw_app_secrets(inst_id, encrypt("null"))
+    dep = await _deploy(inst_id, user_id, ShellRemote("sh", {**env, "APP_LOG": str(tmp_path / "app.log")}))
+    assert dep.status == "failed" and "can't be decrypted" in dep.error and "APP_SECRET" in dep.error
+    assert (await _instance_row(inst_id)).app_secrets is None
+
+
+async def test_failed_deploys_do_not_pile_up_releases(tmp_path, docker_shim):  # noqa: F811
+    env, _ = docker_shim
+    flag = tmp_path / "fail"
+    root = tmp_path / "root"
+    inst_id, user_id = await _seed_app(root)
+    remote = ShellRemote("sh", {**env, "APP_LOG": str(tmp_path / "app.log"), "FAIL_FLAG": str(flag)})
+    assert (await _deploy(inst_id, user_id, remote)).status == "succeeded"
+    live = (root / "web-prod" / "current").resolve()
+    flag.write_text("")
+    for _ in range(5):
+        last = await _deploy(inst_id, user_id, remote)
+        assert last.status == "failed"
+    releases = list((root / "web-prod" / "releases").iterdir())
+    assert len(releases) == deployer.KEEP_RELEASES + 1  # the live one and the newest failed ones
+    assert Path(last.release) in releases and live in [r.resolve() for r in releases]
+    assert "Removed the release of an older failed deployment" in last.log
+
+    # Retrying a failed deployment whose release is gone downloads its commit again.
+    async with get_sessionmaker()() as db:
+        oldest = (await db.execute(select(Deployment).where(Deployment.instance_id == inst_id, Deployment.status == "failed")
+                                   .order_by(Deployment.created_at))).scalars().first()
+    assert not Path(oldest.release).exists()
+    flag.unlink()
+    retry = await _retry(oldest, user_id, remote)
+    assert retry.status == "succeeded", (retry.error, retry.log)
+    assert "no longer on prod-01: downloading the commit again" in retry.log
+    assert {s["key"]: s["status"] for s in retry.steps}["source"] == "succeeded"
+
+
+async def test_retry_is_refused_once_the_instance_deploys_another_branch(admin_client, monkeypatch):
+    monkeypatch.setattr(deployer.runner, "submit", lambda dep_id, inst_id: None)
+    inst_id, user_id = await _seed_app(Path("/srv/never-used"), signed_in=True)
+    dep_id = await _queue(inst_id, user_id)
+    async with get_sessionmaker()() as db:
+        await db.execute(update(Deployment).where(Deployment.id == dep_id).values(
+            status="failed", commit_sha=SHA, branch="experimental"))
+        await db.commit()
+    r = await admin_client.post(f"/api/v1/deployments/{dep_id}/retry")
+    assert r.status_code == 409 and "now deploys main" in r.json()["detail"]
+    page = await admin_client.get(f"/deployments/{dep_id}")
+    assert f"/api/v1/deployments/{dep_id}/retry" not in page.text
+
+
+async def test_only_those_who_set_up_instances_read_manifests(client, make_client):
+    from tests.conftest import login, make_user
+    await make_user("admin@example.com")
+    await make_user("viewer@example.com", roles=["viewer"])
+    async with get_sessionmaker()() as db:
+        repo = Repository(github_id=8, full_name="acme/v", owner="acme", name="v", html_url="https://github.com/acme/v",
+                          detected_config={})
+        db.add(repo)
+        await db.commit()
+        repo_id = repo.id
+    await login(client, "viewer@example.com")
+    r = await client.get(f"/api/v1/repositories/{repo_id}/manifest?branch=main&path=.env.production")
+    assert r.status_code == 403
+    admin = make_client()
+    await login(admin, "admin@example.com")
+    r = await admin.get(f"/api/v1/repositories/{repo_id}/manifest?branch=main&path=.env.production")
+    assert r.status_code == 400 and "not a .yml or .yaml file" in r.json()["detail"]
+
+
+def test_asset_version_survives_a_file_vanishing(tmp_path, monkeypatch):
+    from slipway.web import pages
+    (tmp_path / "a.css").write_text("a")
+    gone = tmp_path / "b.js"
+    gone.write_text("b")
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        result = real_is_file(self)
+        if self == gone:
+            self.unlink()  # replaced between the check and the stat
+        return result
+
+    monkeypatch.setattr(pages, "STATIC_DIR", tmp_path)
+    monkeypatch.setattr(pages, "_asset_stamp", (0.0, ""))
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert len(pages.asset_version()) == 12

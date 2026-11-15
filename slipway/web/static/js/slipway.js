@@ -606,7 +606,12 @@
     const settingsInput = $('[name="app_settings"]', box), servicesInput = $('[name="app_services"]', box);
     const parse = (v) => { try { return JSON.parse(v); } catch (e) { return null; } };
     const saved = parse(box.dataset.settings) || {};
-    let chosen = parse(box.dataset.services);  // null: each optional service's default
+    // The instance's saved choice (null: each optional service's default) and what was ticked or unticked
+    // here. app_services is only sent once a box was changed, so an untouched form keeps the defaults
+    // (a new optional service the repository adds then gets its default too).
+    const chosen = parse(box.dataset.services);
+    const toggled = {};
+    let touched = false;
     const fallback = parse(box.dataset.fallback);
     let manifest = null, seq = 0;
 
@@ -619,9 +624,9 @@
         if (v) { values[i.dataset.appSetting] = v; saved[i.dataset.appSetting] = v; } else delete saved[i.dataset.appSetting];
       });
       settingsInput.value = JSON.stringify(values);
-      if (manifest.services.some((s) => s.optional)) {
-        chosen = $$("[data-app-service]", servicesBox).filter((c) => c.checked).map((c) => c.dataset.appService);
-        servicesInput.value = JSON.stringify(chosen);
+      if (touched && manifest.services.some((s) => s.optional)) {
+        servicesInput.value = JSON.stringify(
+          $$("[data-app-service]", servicesBox).filter((c) => c.checked).map((c) => c.dataset.appService));
       } else servicesInput.value = "";
     };
 
@@ -635,7 +640,7 @@
       const optional = m.services.filter((s) => s.optional);
       servicesField.hidden = !optional.length;
       servicesBox.innerHTML = optional.map((s) => {
-        const on = chosen ? chosen.includes(s.name) : s.default;
+        const on = s.name in toggled ? toggled[s.name] : chosen ? chosen.includes(s.name) : s.default;
         return `<label class="check"><input type="checkbox" data-app-service="${esc(s.name)}" ${on ? "checked" : ""}><span><strong>${esc(s.name)}</strong></span></label>`;
       }).join("");
       const services = m.services.map((s) => `<span class="chip mono">${esc(s.name)}${s.port ? " " + s.port : ""}${s.hostname ? " · " + esc(s.hostname) : ""}</span>`).join(" ");
@@ -680,7 +685,12 @@
     };
 
     box.addEventListener("input", (ev) => { if (ev.target.dataset.appSetting !== undefined) sync(); });
-    box.addEventListener("change", (ev) => { if (ev.target.dataset.appService !== undefined) sync(); });
+    box.addEventListener("change", (ev) => {
+      if (ev.target.dataset.appService === undefined) return;
+      toggled[ev.target.dataset.appService] = ev.target.checked;
+      touched = true;
+      sync();
+    });
     if (file) file.addEventListener("change", load);
     if (branch) branch.addEventListener("change", load);
     $$('[name="build_source"]', form).forEach((r) => r.addEventListener("change", load));

@@ -62,6 +62,7 @@ case "$1" in
       inspect) [ -n "$FAKE_NO_IMAGE" ] && { echo "Error: No such image: $5" >&2; exit 1; } ;;
       ls) [ -n "$FAKE_IMAGES" ] && printf '%s\\n' $FAKE_IMAGES ;;
     esac ;;
+  volume) [ -n "$FAKE_VOLUMES" ] && printf '%s\\n' $FAKE_VOLUMES ;;
   run)
     if [ -n "$FAKE_OLD_DOCKER" ]; then  # Docker before 20.10
       case " $* " in *" --pull"*) printf "unknown flag: --pull\\nSee 'docker run --help'.\\n" >&2; exit 125 ;; esac

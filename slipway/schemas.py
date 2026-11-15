@@ -401,6 +401,11 @@ class _InstanceFields(BaseModel):
     def _rel(cls, v: str | None) -> str | None:
         return None if v is None else deployer.clean_relative_path(v)
 
+    @field_validator("manifest_file")
+    @classmethod
+    def _manifest_file(cls, v: str | None) -> str | None:
+        return None if v is None else manifest.clean_manifest_file(v)
+
     @field_validator("build_context")
     @classmethod
     def _ctx(cls, v: str | None) -> str | None:

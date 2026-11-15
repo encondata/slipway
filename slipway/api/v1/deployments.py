@@ -64,6 +64,11 @@ async def retry_deployment(deployment_id: uuid.UUID, ctx: Deployer, request: Req
     if not dep.commit_sha:
         raise HTTPException(status.HTTP_409_CONFLICT, "This deployment failed before it resolved a commit: deploy again instead")
     instance = dep.instance
+    if dep.branch != instance.branch:
+        # Changing what an instance deploys takes instances:write; a retry must not get around that.
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"This deployment was of branch {dep.branch}, and the instance now deploys {instance.branch}: "
+                            "deploy the instance instead")
     new = await queue_deployment(db, instance, ctx.user, retry_of=dep)
     audit.record(db, "deployment.retry", actor=ctx.user, target=new,
                  summary=f"Retry {instance.name}@{dep.commit_sha[:7]} (deployment {dep.id.hex[:8]})", request=request)

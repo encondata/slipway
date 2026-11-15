@@ -23,6 +23,9 @@ router = APIRouter(prefix="/repositories", tags=["repositories"])
 
 Reader = Annotated[AuthContext, require(Perm.REPOS_READ)]
 Syncer = Annotated[AuthContext, require(Perm.REPOS_SYNC)]
+# Reading a manifest reads a file of the repository (its errors quote it): only for those who set up instances,
+# who can deploy the repository's code anyway.
+ManifestReader = Annotated[AuthContext, require(Perm.REPOS_READ, Perm.INSTANCES_WRITE)]
 
 
 async def _get(db: DB, repo_id: uuid.UUID) -> Repository:
@@ -86,14 +89,14 @@ async def branches(repo_id: uuid.UUID, ctx: Reader, db: DB) -> list[str]:
 
 @router.get("/{repo_id}/manifest")
 async def get_manifest(
-    repo_id: uuid.UUID, ctx: Reader, db: DB,
+    repo_id: uuid.UUID, ctx: ManifestReader, db: DB,
     branch: Annotated[str, Query(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._/-]+$")],
     path: Annotated[str, Query(max_length=255)] = manifest.DEFAULT_FILE,
 ) -> dict[str, Any]:
     """The repository's slipway.yml on ``branch``, checked: ``{found, manifest?, error?}``."""
     repo = await _get(db, repo_id)
     try:
-        path = deployer.clean_relative_path(path)
+        path = manifest.clean_manifest_file(deployer.clean_relative_path(path))
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     token, _ = github_token_for(ctx.user)

@@ -232,6 +232,13 @@ def clean_repo_path(value: Any, where: str) -> str:
     return norm
 
 
+def clean_manifest_file(path: str) -> str:
+    """The manifest's path in the repository: a ``.yml`` or ``.yaml`` file (raises ValueError otherwise)."""
+    if not path.lower().endswith((".yml", ".yaml")):
+        raise ValueError(f"'{path}' is not a .yml or .yaml file")
+    return path
+
+
 def _port(value: Any, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise _err(where, "must be a port number, 1-65535")
@@ -450,6 +457,21 @@ def parse_env_template(text: str) -> tuple[list[str], dict[str, str]]:
     return lines, values
 
 
+def expanding_keys(text: str) -> set[str]:
+    """The keys whose value in an env file (the last assignment) is unquoted or double-quoted and holds a
+    ``$``: Compose expands those when it reads the file, so their text isn't the value the app gets."""
+    keys: set[str] = set()
+    for line in text.replace("\r\n", "\n").split("\n"):
+        m = _ENV_LINE.match(line)
+        if m:
+            raw = m.group(2).strip()
+            if raw[:1] != "'" and "$" in _env_value(raw):  # the value only: never a # comment after it
+                keys.add(m.group(1))
+            else:
+                keys.discard(m.group(1))
+    return keys
+
+
 def _env_value(raw: str) -> str:
     raw = raw.strip()
     if raw[:1] == "'":
@@ -474,17 +496,19 @@ def _env_value(raw: str) -> str:
 def format_value(value: str, key: str = "the value") -> str:
     """A value as written to .env, so that Compose and a shell sourcing the file both read ``value``.
 
-    Raw when that is safe, else in single quotes (literal for both). A value with a single quote goes in
-    double quotes, which only works when it has no ``$``, backtick or backslash: one with both can't be
-    written so that both read it the same, so it is refused.
+    Raw when that is safe, else in single quotes (literal for both). Compose reads a quote after a
+    backslash as escaped, so a value ending in a backslash, like one with a single quote, goes in double
+    quotes with each backslash and double quote escaped. That only works when it has no ``$`` or
+    backtick: one with both can't be written so that both read it the same, so it is refused.
     """
     if _RAW_VALUE.match(value):
         return value
-    if "'" not in value:
+    if "'" not in value and not value.endswith("\\"):
         return f"'{value}'"
-    if any(c in value for c in "$`\\"):
-        raise ManifestError(f"{key}: a value with a single quote can't also hold $, ` or \\ in the .env; change one of them")
-    return '"' + value.replace('"', '\\"') + '"'
+    if any(c in value for c in "$`"):
+        why = "a single quote" if "'" in value else "a backslash at the end"
+        raise ManifestError(f"{key}: a value with {why} can't also hold $ or ` in the .env; change one of them")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def render_env(lines: list[str], values: dict[str, str], keys: list[str] | set[str] | None = None) -> str:
@@ -586,12 +610,20 @@ def plan(
     # what templates render is stored and logged).
     hidden = manifest.secret_keys()
     blocked = {k: "is set in the instance's environment variables and can't be used here" for k in env if k not in hidden}
+    # An env_file default Compose expands (${OTHER}) would be copied as its unexpanded text.
+    expanding = expanding_keys(template or "")
+
+    def unexpanded() -> dict[str, str]:
+        return {k: f"comes from {manifest.env_file} with a $ that Compose expands and Slipway doesn't; "
+                   "set it in settings or vars instead" for k in expanding if k not in written}
+
     # vars in order: each sees the ones before it, never an env_file default of one still to come.
     later = {k: "is set later in vars: list it first" for k in manifest.vars}
     for key, tmpl in manifest.vars.items():
         later.pop(key)
-        ctx = {k: v for k, v in values.items() if k not in hidden and k not in blocked}
-        put(key, render(tmpl, builtins, ctx, f"vars.{key}", hidden=hidden, blocked={**blocked, **later,
+        stale = unexpanded()
+        ctx = {k: v for k, v in values.items() if k not in hidden and k not in blocked and k not in stale}
+        put(key, render(tmpl, builtins, ctx, f"vars.{key}", hidden=hidden, blocked={**blocked, **stale, **later,
                         key: "is the variable being set"}))
     for s in manifest.secrets:
         put(s.key, secrets[s.key])
@@ -605,27 +637,30 @@ def plan(
                 f"{'it' if len(left) == 1 else 'them'} as an app setting or environment variable"
             )
     public = {k: v for k, v in values.items() if k not in hidden and k not in blocked}
+    stale = unexpanded()
+    usable = {k: v for k, v in public.items() if k not in stale}
+    blocked = {**blocked, **stale}
     routes = []
     for s in on:
         if s.hostname:
-            host = render(s.hostname, builtins, public, f"services.{s.name}.hostname", hidden=hidden, blocked=blocked).lower()
+            host = render(s.hostname, builtins, usable, f"services.{s.name}.hostname", hidden=hidden, blocked=blocked).lower()
             if not HOSTNAME_RE.match(host):
                 raise ManifestError(f"services.{s.name}.hostname: '{host}' is not a hostname")
             routes.append({"hostname": host, "service": s.name, "container": s.port})
     projects = []
     for i, tmpl in enumerate(manifest.projects):
-        name = render(tmpl, builtins, public, f"projects[{i}]", hidden=hidden, blocked=blocked)
+        name = render(tmpl, builtins, usable, f"projects[{i}]", hidden=hidden, blocked=blocked)
         if not PROJECT_RE.match(name):
             raise ManifestError(f"projects[{i}]: '{name}' is not a Compose project name")
         projects.append(name)
     images = []
     for i, tmpl in enumerate(manifest.images):
-        ref = render(tmpl, builtins, public, f"images[{i}]", hidden=hidden, blocked=blocked)
+        ref = render(tmpl, builtins, usable, f"images[{i}]", hidden=hidden, blocked=blocked)
         if not IMAGE_RE.match(ref):
             raise ManifestError(f"images[{i}]: '{ref}' is not an image name with a tag, such as example-api:1a2b3c4d5e6f")
         images.append(ref)
     commands = {
-        key: [render(a, builtins, public, f"commands.{key}[{i}]", hidden=hidden, blocked=blocked) for i, a in enumerate(argv)]
+        key: [render(a, builtins, usable, f"commands.{key}[{i}]", hidden=hidden, blocked=blocked) for i, a in enumerate(argv)]
         for key, argv in manifest.commands.items()
     }
     for key, argv in commands.items():

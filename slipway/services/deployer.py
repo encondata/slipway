@@ -426,14 +426,23 @@ def _root_rm(parent: str, name: str) -> str:
     return f"docker run --rm --network none -v {parent}:/r {CLEANUP_IMAGE} rm -rf -- /r/{name}"
 
 
+REPO_ENV_FILE = ".env.slipway-repo"  # the repository's own .env, once .env is a link to shared/.env
+
+
 def compose_env_command(instance: Instance, release_dir: str) -> str:
-    """Build ``shared/.env``: the repository's .env defaults, with Slipway's values after them so they win."""
+    """Build ``shared/.env``: the repository's .env defaults, with Slipway's values after them so they win.
+
+    The first run moves the repository's .env aside before linking .env to ``shared/.env``, so running it
+    again on the same release (a port move, a retry) still starts from the repository's defaults.
+    """
     paths = paths_for(instance)
     project_dir = _project_dir(instance, release_dir)
     env, merged = q(paths.env_file), q(paths.env_file + ".new")
     return (
         f"cd {q(project_dir)} && umask 077 && "
-        f"{{ if [ -f .env ] && [ ! -L .env ]; then cat .env; echo; fi; cat {q(paths.slipway_env_file)}; }} > {merged} && "
+        f"{{ if [ -f .env ] && [ ! -L .env ]; then mv -f .env {REPO_ENV_FILE}; fi; }} && "
+        f"{{ if [ -f {REPO_ENV_FILE} ] && [ ! -L {REPO_ENV_FILE} ]; then cat {REPO_ENV_FILE}; echo; fi; "
+        f"cat {q(paths.slipway_env_file)}; }} > {merged} && "
         f"mv -f {merged} {env} && ln -sfn {env} .env"
     )
 
@@ -556,7 +565,9 @@ def _app_projects_command(instance: Instance, action: str) -> str:
         projects = projects[::-1]
     if not projects:
         return "echo 'Nothing to do: this app has not been deployed yet'"
-    parts = [f'ids=$(docker ps -aq --filter {_project_filter(p)}); [ -z "$ids" ] || docker compose -p {q(p)} {action} || rc=1'
+    # A failed docker ps fails the action too: its empty output would otherwise read as "no containers".
+    parts = [f'if ids=$(docker ps -aq --filter {_project_filter(p)}); then '
+             f'[ -z "$ids" ] || docker compose -p {q(p)} {action} || rc=1; else rc=1; fi'
              for p in projects]
     return "cd / && rc=0; " + "; ".join(parts) + "; exit $rc"
 
@@ -691,28 +702,63 @@ def _claim_dir_inside(instance: Instance, directory: str) -> bool:
     return bool(norm) and (norm == directory or norm.startswith(directory + "/") or directory.startswith(norm + "/"))
 
 
+KEPT_MARK = "slipway-env-kept"  # a line of its own: error messages naming the .slipway-kept folder never equal it
+
+
+def keep_env_command(instance: Instance) -> str:
+    """App mode: copy ``shared/.env`` out of the folder (mode 600) when the app's projects still have volumes,
+    so their data can be opened again. Prints ``KEPT_MARK`` when it copied it."""
+    paths = paths_for(instance)
+    dest = kept_env_path(paths, instance)
+    vols = "; ".join(f"docker volume ls -q --filter {_project_filter(p)}" for p in app_known_projects(instance))
+    return (
+        f"v=$({{ {vols}; }} 2>/dev/null); [ -n \"$v\" ] && [ -f {q(paths.env_file)} ] || exit 0; "
+        f"umask 077 && mkdir -p {q(posixpath.dirname(dest))} && cp -f {q(paths.env_file)} {q(dest)} && echo {q(KEPT_MARK)}"
+    )
+
+
 async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_session) -> str | None:
     """Remove the instance's containers, images and files from its host.
 
     Raises if containers are left behind. Returns a warning naming what is left when only
-    files could not be removed.
+    files could not be removed, or, for an app whose volumes stay, where its ``.env`` was kept.
     """
     paths = paths_for(instance)
+    host = instance.host.name
+    kept: str | None = None  # where the app's .env was copied
+    keep_folder = False  # the copy failed: the folder, with its .env, stays
     async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+        if instance.build_source == BuildSource.APP and app_known_projects(instance):
+            # The volumes stay (Slipway never removes data); their secrets are only in the .env and this row.
+            status, output = await remote.run(keep_env_command(instance), check=False, timeout=120)
+            if status == 0 and any(line.strip() == KEPT_MARK for line in output.splitlines()):
+                kept = kept_env_path(paths, instance)
+            elif status != 0:
+                keep_folder = True
         await remote.run(teardown_command(instance), timeout=600)
         _, left = await remote.run(leftovers_command(instance), timeout=60)
         if _container_ids(left):
-            raise DeployError(f"Containers of {instance.name} are still on {instance.host.name}; nothing was deleted")
+            if kept:  # the instance stays: so does its .env, in its folder
+                with contextlib.suppress(Exception):
+                    await remote.run(f"rm -f -- {q(kept)}", check=False, timeout=60)
+            raise DeployError(f"Containers of {instance.name} are still on {host}; nothing was deleted")
+        notes = [f"Kept the app's volumes on {host}, and its settings and secrets in {kept} "
+                 f"(readable only by {instance.host.username})"] if kept else []
+        if keep_folder:
+            return (f"Kept {paths.base} on {host}: the app's volumes stay, and its settings and secrets could not be "
+                    f"copied to {posixpath.dirname(kept_env_path(paths, instance))}, so they stay in {paths.env_file}")
         if _claim_dir_inside(instance, paths.base):
-            return f"Kept {paths.base} on {instance.host.name}: the claimed project's own directory is inside it"
+            return " ".join([*notes, f"Kept {paths.base} on {host}: the claimed project's own directory is inside it"])
         status, output = await remote.run(remove_dir_command(instance), check=False, timeout=600)
     if status == 0:
-        return None
+        return " ".join(notes) or None
     left = left_behind(output)
     if left is not None:
-        return f"Kept {paths.base} on {instance.host.name}: it also holds files Slipway did not put there ({left})"
+        notes.append(f"Kept {paths.base} on {host}: it also holds files Slipway did not put there ({left})")
+        return " ".join(notes)
     detail = clean_text(output.strip().splitlines()[-1])[:200] if output.strip() else ""
-    return f"Could not remove {paths.base} on {instance.host.name}; delete it by hand" + (f" ({detail})" if detail else "")
+    notes.append(f"Could not remove {paths.base} on {host}; delete it by hand" + (f" ({detail})" if detail else ""))
+    return " ".join(notes)
 
 
 # ------------------------------------------------------------ moving the deploy root
@@ -1677,6 +1723,7 @@ async def _install(
             with contextlib.suppress(Exception):
                 await remote.run(f"rm -f -- {q(run.upload)}", check=False, timeout=60)
             await sink.line(f"Kept {release} so a retry can start from it")
+            await _prune_after_failure(remote, instance, release, sink)
         else:
             await _discard_release(remote, instance, release, run.upload, sink)
         raise
@@ -1693,6 +1740,52 @@ async def _install(
             await sink.line(f"Warning: some old releases could not be removed. {detail}".strip())
         if state is not None:
             await _prune_app_images(remote, instance, state, sink)
+
+
+async def _prune_after_failure(remote: ssh.RemoteSession, instance: Instance, release: str, sink: LogSink) -> None:
+    """Best effort: keep only the newest few releases that failed deploys kept, so a run of failures doesn't fill
+    the host's disk.
+
+    Newest goes by the last deployment that used a release (a retry reuses one). Never removed: the live release,
+    one a succeeded deployment ran (the normal prune keeps those), one a container still uses, and any image
+    (the live release's may be older than the failed ones).
+    """
+    try:
+        paths = paths_for(instance)
+        async with session_scope() as db:
+            rows = (await db.execute(
+                select(Deployment.release, Deployment.status).where(
+                    Deployment.instance_id == instance.id, Deployment.release.is_not(None))
+                .order_by(Deployment.created_at.desc())
+            )).all()
+        ran = {posixpath.basename(r) for r, st in rows if st == DeploymentStatus.SUCCEEDED}
+        failed = [n for n in dict.fromkeys(posixpath.basename(r) for r, st in rows
+                                           if st in (DeploymentStatus.FAILED, DeploymentStatus.CANCELLED,
+                                                     DeploymentStatus.RUNNING))
+                  if _RELEASE_NAME.fullmatch(n) and n not in ran]
+        _, listing = await remote.run(_image_list_command(paths.releases), check=False, timeout=60)
+        present = {line.strip() for line in listing.splitlines()}
+        failed = [n for n in failed if n in present]  # a release discarded when its build failed takes no place
+        keep = {posixpath.basename(release), *failed[:KEEP_RELEASES]}
+        old = [n for n in failed if n not in keep]
+        if not old:
+            return
+        _, current = await remote.run(f"readlink {q(paths.current)}", check=False, timeout=60)
+        _, users = await remote.run(release_users_command(instance), timeout=60)
+        used = {posixpath.basename(current.strip())} | {
+            n for n in old for line in users.splitlines()
+            if line.strip() == f"{paths.releases}/{n}" or line.strip().startswith(f"{paths.releases}/{n}/")}
+        for name in old:
+            if name in used:
+                continue
+            status, _ = await remote.run(discard_command(instance, f"{paths.releases}/{name}", f"{paths.releases}/.none"),
+                                         check=False, timeout=600)
+            await sink.line(f"Removed the release of an older failed deployment: {name}" if status == 0
+                            else f"Warning: could not remove the release of an older failed deployment: {name}")
+        if instance.build_source == BuildSource.APP and instance.app_state:
+            await _prune_app_images(remote, instance, dict(instance.app_state), sink)
+    except Exception as exc:
+        log.warning("Could not prune releases after a failed deployment: %s", exc)
 
 
 async def _claimed_state(remote: ssh.RemoteSession, instance: Instance, run: _Run) -> None:
@@ -1833,16 +1926,30 @@ async def _install_app(
             if template is None:
                 raise DeployError(f"slipway.yml: env_file {man.env_file} was not found in the repository (or it is a link)")
         if job.secrets is None:
-            raise DeployError("The app's stored secrets can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY; "
-                              "restore the old key (see slipway rotate-encryption-key) before deploying")
-        secrets = dict(job.secrets)
+            unset = [s.key for s in man.secrets if not env.get(s.key)]
+            if unset:
+                raise DeployError(
+                    "The app's stored secrets can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY. Restore "
+                    "the old key (see slipway rotate-encryption-key), or set each of them as an environment variable "
+                    f"of the instance: {', '.join(unset)} (their old values, or the app's existing data won't open)")
+            await sink.line("The stored secrets can't be decrypted; the instance's environment variables set every one")
+        secrets = dict(job.secrets or {})
         fresh = manifest.new_secrets(man, secrets)
-        if fresh:
-            secrets.update(fresh)
-            await _save_instance(instance, app_secrets=secrets)
-            await sink.line(f"Generated {len(fresh)} secret(s) and kept them with the instance: {', '.join(sorted(fresh))}")
+        # A secret the instance's variables set is kept as that value (the one the app's data was made with),
+        # never replaced by a new one: the variable can then be removed safely.
+        adopted = sorted(k for k in fresh if env.get(k))
+        fresh.update({k: env[k] for k in adopted})
+        secrets.update(fresh)
         first = plan_with({})
         await _check_projects_free(instance, first.projects)
+        await _check_projects_on_host(remote, instance, first.projects, [s.key for s in man.secrets], env)
+        if fresh:  # kept only once the app may use them
+            await _save_instance(instance, app_secrets=secrets)
+            generated = sorted(set(fresh) - set(adopted))
+            if generated:
+                await sink.line(f"Generated {len(generated)} secret(s) and kept them with the instance: {', '.join(generated)}")
+            if adopted:
+                await sink.line(f"Kept {', '.join(adopted)} from the instance's environment variables as the app's secrets")
         await sink.line(f"{man.name}: running {', '.join(s.name for s in first.services) or 'no services'}")
 
     planned = [s for s in first.services if s.port_var]
@@ -1866,6 +1973,10 @@ async def _install_app(
 
     async with steps.step("settings"):
         final = plan_with(host_ports)
+        moved = [p for p in final.projects if p not in first.projects]  # a project name that uses a moved port
+        if moved:
+            await _check_projects_free(instance, moved)
+            await _check_projects_on_host(remote, instance, moved, [s.key for s in man.secrets], env)
         lines, _ = manifest.parse_env_template(template or "")
         try:
             content = manifest.render_env(lines, final.env, final.written)
@@ -1878,9 +1989,12 @@ async def _install_app(
         releases = dict(old.get("releases") or {})
         releases[name] = sorted(set(releases.get(name) or []) | set(final.images))
         known = list(dict.fromkeys([*app_known_projects(instance), *final.projects]))
-        # Only what cleanup needs is saved now (the images this release builds, every project the app may
-        # have containers in); the rest once the release is live, in the finish step.
-        await _save_instance(instance, app_state={**old, "releases": releases, "known_projects": known})
+        # Only what cleanup and the controls need is saved now (the images this release builds, every project
+        # the app may have containers in, the ones this release starts); the rest once the release is live, in
+        # the finish step.
+        await _save_instance(instance, app_state={**old, "releases": releases, "known_projects": known,
+                                                  "starting": list(dict.fromkeys([*(old.get("starting") or []),
+                                                                                  *final.projects]))})
         state = {
             "manifest": man.to_json(), "routes": final.routes, "projects": final.projects,
             "commands": final.commands, "images": final.images, "releases": releases, "known_projects": known,
@@ -1922,8 +2036,11 @@ async def _prune_app_images(remote: ssh.RemoteSession, instance: Instance, state
 
 
 def app_projects(instance: Instance) -> list[str]:
-    """The Compose projects the app's live release runs (status, logs, start and stop)."""
-    return [p for p in ((instance.app_state or {}).get("projects") or []) if manifest.PROJECT_RE.match(str(p))]
+    """The Compose projects status, logs, start and stop act on: the live release's, then those of a deploy
+    that failed after it (``starting``, dropped once a release goes live), whose containers may be up."""
+    state = instance.app_state or {}
+    names = [*(state.get("projects") or []), *(state.get("starting") or [])]
+    return [p for p in dict.fromkeys(str(n) for n in names) if manifest.PROJECT_RE.match(p)]
 
 
 def app_known_projects(instance: Instance) -> list[str]:
@@ -1944,6 +2061,67 @@ async def _check_projects_free(instance: Instance, projects: list[str]) -> None:
         if clash:
             raise DeployError(f"slipway.yml: the Compose project {', '.join(clash)} is also instance {other.name}'s on "
                               f"{instance.host.name}; make the project names in slipway.yml include {{slipway.slug}}")
+
+
+HOST_MARK = "slipway-host:"
+
+
+def kept_env_path(paths: InstancePaths, instance: Instance) -> str:
+    """Where deleting an app instance leaves its ``.env`` (secrets included) when its volumes stay."""
+    return f"{paths.root}/.slipway-kept/{paths.slug}-{instance.id.hex[:8]}.env"
+
+
+def projects_on_host_command(instance: Instance, projects: list[str]) -> str:
+    """Prints ``HOST_MARK c <project>`` for each project with containers on the host, ``HOST_MARK v <project>
+    <volume>`` for each of its volumes, and ``HOST_MARK k <file>`` for each ``.env`` a deleted instance in
+    the same folder left. Fails when docker can't list them."""
+    paths = paths_for(instance)
+    parts = []
+    for p in projects:
+        flt = _project_filter(p)
+        parts.append(
+            f'ids=$(docker ps -aq --filter {flt}) || exit 1; [ -z "$ids" ] || echo {q(f"{HOST_MARK} c {p}")}; '
+            f'vols=$(docker volume ls -q --filter {flt}) || exit 1; '
+            f'[ -z "$vols" ] || printf \'%s\\n\' "$vols" | sed {q(f"s/^/{HOST_MARK} v {p} /")}'
+        )
+    kept = q(f"{paths.root}/.slipway-kept")
+    name = q(paths.slug.replace(".", "\\.") + "-[0-9a-f]*\\.env")
+    parts.append(f"{{ ls -1 {kept} 2>/dev/null | grep -x -- {name} | sed {q(f's/^/{HOST_MARK} k /')}; true; }}")
+    return "; ".join(parts)
+
+
+async def _check_projects_on_host(
+    remote: ssh.RemoteSession, instance: Instance, projects: list[str], secrets: list[str], env: dict[str, str]
+) -> None:
+    """Refuse projects that are new to this instance but already on the host.
+
+    Their containers aren't the app's own: the port check would count them as free and stop and delete
+    would act on them. Their volumes hold data made with secrets this instance doesn't have (another
+    stack's, or a deleted instance's), unless the instance's environment variables set every secret.
+    """
+    new = [p for p in projects if p not in app_known_projects(instance)]
+    if not new:
+        return
+    _, output = await remote.run(projects_on_host_command(instance, new), timeout=60)
+    rows = [ln.split(HOST_MARK, 1)[1].split() for ln in output.splitlines() if HOST_MARK in ln]
+    running = sorted({r[1] for r in rows if len(r) >= 2 and r[0] == "c"})
+    volumes = sorted({r[2] for r in rows if len(r) >= 3 and r[0] == "v"})
+    kept_dir = f"{paths_for(instance).root}/.slipway-kept"
+    kept = sorted({f"{kept_dir}/{r[1]}" for r in rows if len(r) >= 2 and r[0] == "k"})
+    host = instance.host.name
+    if running:
+        raise DeployError(
+            f"{host} already runs containers in the Compose project{'s' if len(running) > 1 else ''} "
+            f"{', '.join(running)}, which Slipway didn't start "
+            "for this instance; remove them, or change the project names in slipway.yml")
+    unset = [k for k in secrets if not env.get(k)]
+    if volumes and unset:
+        where = f" A deleted instance's values are in {', '.join(kept)}." if kept else ""
+        raise DeployError(
+            f"{host} already has the volumes {', '.join(volumes[:10])}{' and more' if len(volumes) > 10 else ''} of "
+            f"Compose project(s) this instance is about to use. Their data was made with other secrets than the ones "
+            f"Slipway would generate. Set {', '.join(unset)} as environment variables of the instance, with the values "
+            f"that data was made with, or remove the volumes (docker volume rm) to start afresh.{where}")
 
 
 def has_routes(instance: Instance) -> bool:
@@ -1986,6 +2164,14 @@ async def _pipeline(
                         .values(commit_sha=commit.sha, commit_message=message, commit_author=author or None)
                     )
                 await sink.line(f"Commit {commit.sha[:7]} — {message} ({author})")
+            if reuse:
+                assert job.retry is not None and job.retry.release
+                kept = posixpath.join(paths_for(instance).releases, posixpath.basename(job.retry.release))
+                async with connect(ssh.SSHTarget.from_host(host)) as probe:
+                    gone, _ = await probe.run(f"[ -d {q(kept)} ]", check=False, timeout=60)
+                if gone:
+                    await sink.line(f"The release {kept} is no longer on {host.name}: downloading the commit again")
+                    job.retry.reusable = reuse = False
             if reuse:
                 await steps.skip("source", f"Reusing the release of deployment {job.retry.id.hex[:8]}")
             else:

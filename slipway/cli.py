@@ -174,6 +174,9 @@ def create_admin(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
+_REENTER_COLUMNS = {("instances", "env"), ("instances", "app_secrets")}
+
+
 async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -> tuple[int, list[str]]:
     """Re-encrypt every stored secret with the first key, bypassing the ORM types.
 
@@ -197,9 +200,10 @@ async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -
                 unreadable.append(f"{source.name}.{col.name} (id {row_id})")
                 if not clear_unreadable:
                     continue
-                # Instance env becomes an encrypted JSON null, not NULL: the deployer treats that as
-                # "needs re-entry" and refuses to deploy, instead of deploying with no variables.
-                new = encrypt("null") if (source.name, col.name) == ("instances", "env") else None
+                # Instance env and app secrets become an encrypted JSON null, not NULL: the deployer treats
+                # that as "needs re-entry" and refuses to deploy, instead of deploying with no variables or
+                # generating new secrets the app's existing data won't open with.
+                new = encrypt("null") if (source.name, col.name) in _REENTER_COLUMNS else None
             else:
                 rotated += 1
             await db.execute(update(raw).where(raw.c.id == row_id).values({col.name: new}))
@@ -216,7 +220,8 @@ def rotate_encryption_key(args: argparse.Namespace) -> None:
         return
     if args.clear_unreadable:
         print(f"Erased {len(unreadable)} secret(s) no configured key could decrypt; re-enter them in Slipway.")
-        print("Instances listed here refuse to deploy until their variables are re-entered or cleared:")
+        print("Instances listed here refuse to deploy until their variables are re-entered or cleared, or, for")
+        print("app secrets, until each secret is set as an instance variable (its old value, to keep the app's data):")
         print("\n".join(f"  {u}" for u in unreadable))
         return
     print(f"{len(unreadable)} secret(s) could not be decrypted with any configured key and were left unchanged:")
