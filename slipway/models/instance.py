@@ -20,6 +20,7 @@ from slipway.models.user import User
 class BuildSource(StrEnum):
     DOCKERFILE = "dockerfile"
     COMPOSE = "compose"
+    APP = "app"  # the repository's slipway.yml says how (see services.manifest)
 
 
 class InstanceStatus(StrEnum):
@@ -58,6 +59,16 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     # The instance's own folder on the host (releases, shared settings, ``current``). None: a folder
     # named after the slug in the host's deploy root, which moves with that root.
     deploy_dir: Mapped[str | None] = mapped_column(String(255))
+
+    # App mode (BuildSource.APP): the manifest's path in the repository, the values of its settings,
+    # the optional services that run (None: each one's default), the secrets Slipway generated for it
+    # (kept for good: changing one can lock the app out of its own data), and what the last deploy read
+    # and rendered: {manifest, routes: [{hostname, service, container}], projects, commands, release}.
+    manifest_file: Mapped[str] = mapped_column(String(255), default="slipway.yml", server_default="slipway.yml")
+    app_settings: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+    app_services: Mapped[list[str] | None] = mapped_column()
+    app_secrets: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
+    app_state: Mapped[dict[str, Any] | None] = mapped_column()
 
     env: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
     ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list)  # [{host, container, protocol}]
@@ -135,6 +146,13 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
     finished_at: Mapped[datetime | None]
     error: Mapped[str | None] = mapped_column(Text)
     log: Mapped[str] = mapped_column(Text, default="")
+    # The numbered steps, in order: [{key, name, status, started_at?, finished_at?, offset?, note?}];
+    # ``offset`` is where the step's part of ``log`` begins.
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+    # The release folder on the host (kept after a failure once the build succeeded, for a retry).
+    release: Mapped[str | None] = mapped_column(Text)  # a folder of up to 255 characters, plus the release
+    # A retry runs the same commit again and skips the steps the earlier run finished that it can reuse.
+    retry_of_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("deployments.id", ondelete="SET NULL"))
 
     instance: Mapped[Instance] = relationship(lazy="selectin")
     triggered_by: Mapped[User | None] = relationship(lazy="selectin")

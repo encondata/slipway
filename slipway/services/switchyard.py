@@ -220,13 +220,17 @@ class Target:
 def route_targets(instance: Instance) -> list[Target]:
     """Each route of ``instance`` with the host port its container port is published on."""
     out = []
-    compose = instance.build_source == BuildSource.COMPOSE
+    compose = instance.build_source in (BuildSource.COMPOSE, BuildSource.APP)
     if compose:
         published = [p for p in instance.published_ports or [] if p.get("protocol", "tcp") == "tcp"]
     else:
         published = [{"service": None, "container": p["container"], "host": p["host"]}
                      for p in instance.ports or [] if p.get("protocol", "tcp") == "tcp"]
-    for r in instance.routes or []:
+    routes = list(instance.routes or [])
+    if instance.build_source == BuildSource.APP:  # the hostnames slipway.yml gives its services
+        mine = {r["hostname"] for r in routes}
+        routes += [r for r in (instance.app_state or {}).get("routes") or [] if r.get("hostname") not in mine]
+    for r in routes:
         hostname, tls = r["hostname"], r.get("tls_mode") or "auto"
         want = (r.get("service") or None) if compose else None
         match = next(

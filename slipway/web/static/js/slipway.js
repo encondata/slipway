@@ -354,6 +354,17 @@
     failed: ["Failed", "error"], cancelled: ["Cancelled", ""],
   };
 
+  const STEP_BADGE = { succeeded: "success", failed: "error", running: "warning spin", warning: "warning", skipped: "plain" };
+  function renderSteps(steps, active) {
+    const list = $("[data-steps]");
+    if (!list || !steps || !steps.length) return;
+    list.innerHTML = steps.map((st) => {
+      const label = st.status === "pending" && !active ? "Not run" : st.status.charAt(0).toUpperCase() + st.status.slice(1);
+      return `<li class="step-${esc(st.status)}"><span class="badge ${STEP_BADGE[st.status] || ""}">${esc(label)}</span> ` +
+        `<strong>${esc(st.name)}</strong>${st.note ? ` <span class="subtle">${esc(st.note)}</span>` : ""}</li>`;
+    }).join("");
+  }
+
   function streamLog(pre) {
     let offset = 0;
     const url = pre.dataset.deployLog;
@@ -368,6 +379,7 @@
           if (atBottom) follow();
         }
         offset = d.log_offset;
+        renderSteps(d.steps, d.status === "queued" || d.status === "running");
         if (badge && STATUS[d.status]) {
           badge.className = "badge " + STATUS[d.status][1];
           badge.textContent = STATUS[d.status][0];
@@ -547,9 +559,12 @@
       const dockerfile = field("dockerfile_path"), composeFile = field("compose_file");
       const set = (key, value) => $$(`[data-preview="${key}"]`).forEach((n) => { n.textContent = value || "—"; });
       const compose = (source && source.value) === "compose";
+      const app = (source && source.value) === "app";
       set("repository", repo && repo.selectedOptions[0] ? repo.selectedOptions[0].textContent.trim() : "");
       set("branch", data.branch);
-      set("source", compose ? `docker compose (${(composeFile && composeFile.value) || "docker-compose.yml"})`
+      const manifestFile = field("manifest_file");
+      set("source", app ? `App (${(manifestFile && manifestFile.value) || "slipway.yml"})`
+        : compose ? `docker compose (${(composeFile && composeFile.value) || "docker-compose.yml"})`
         : `Dockerfile (${(dockerfile && dockerfile.value) || "Dockerfile"})`);
       set("host", host ? host.dataset.label : "");
       set("name", data.name);
@@ -570,25 +585,118 @@
       }
       set("env", Object.keys(data.env || {}).length + " variable(s)");
       const overrides = (data.port_overrides || []).map((o) => `${o.service} ${o.host} → ${o.container}`);
-      set("ports", compose ? (overrides.length ? `Compose file, with ${overrides.join(", ")}` : "Defined by compose file") : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");
-      set("hostnames", (data.routes || []).map((r) => `${r.hostname} → ${r.service ? r.service + ":" : ""}${r.container || "?"}`).join(", ") || "None");
-      set("volumes", compose ? "Defined by compose file" : (data.volumes || []).map((v) => `${v.source} → ${v.target}`).join(", ") || "None");
+      set("ports", app ? (overrides.length ? `From slipway.yml, with ${overrides.join(", ")}` : "From slipway.yml") : compose ? (overrides.length ? `Compose file, with ${overrides.join(", ")}` : "Defined by compose file") : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");
+      const routes = (data.routes || []).map((r) => `${r.hostname} → ${r.service ? r.service + ":" : ""}${r.container || "?"}`);
+      set("hostnames", app ? ["From slipway.yml", ...routes].join(", ") : routes.join(", ") || "None");
+      set("volumes", app ? "Defined by the app" : compose ? "Defined by compose file" : (data.volumes || []).map((v) => `${v.source} → ${v.target}`).join(", ") || "None");
     };
     form.addEventListener("input", update);
     form.addEventListener("change", update);
     update();
   }
 
-  // ------------------------------------- conditional fields: data-show-when="field=value"
+  // ------------------------------------------ app instances: the form reads the branch's slipway.yml
+  function wireAppForm(box) {
+    const form = box.closest("form");
+    const repo = $(box.dataset.repoSelect), branch = $(box.dataset.branchSelect);
+    const file = $('[name="manifest_file"]', box);
+    const status = $("[data-app-status]", box), settingsBox = $("[data-app-settings]", box);
+    const servicesField = $("[data-app-services-field]", box), servicesBox = $("[data-app-services]", box);
+    const summary = $("[data-app-summary]", box);
+    const settingsInput = $('[name="app_settings"]', box), servicesInput = $('[name="app_services"]', box);
+    const parse = (v) => { try { return JSON.parse(v); } catch (e) { return null; } };
+    const saved = parse(box.dataset.settings) || {};
+    let chosen = parse(box.dataset.services);  // null: each optional service's default
+    const fallback = parse(box.dataset.fallback);
+    let manifest = null, seq = 0;
+
+    // The hidden inputs carry what is sent; empty (not sent) while no manifest is shown.
+    const sync = () => {
+      if (!manifest) { settingsInput.value = ""; servicesInput.value = ""; return; }
+      const values = {};
+      $$("[data-app-setting]", settingsBox).forEach((i) => {
+        const v = i.value.trim();
+        if (v) { values[i.dataset.appSetting] = v; saved[i.dataset.appSetting] = v; } else delete saved[i.dataset.appSetting];
+      });
+      settingsInput.value = JSON.stringify(values);
+      if (manifest.services.some((s) => s.optional)) {
+        chosen = $$("[data-app-service]", servicesBox).filter((c) => c.checked).map((c) => c.dataset.appService);
+        servicesInput.value = JSON.stringify(chosen);
+      } else servicesInput.value = "";
+    };
+
+    const show = (m, note) => {
+      manifest = m;
+      settingsBox.innerHTML = m.settings.map((s) => `
+        <div class="field"><label for="app-${esc(s.key)}">${esc(s.label)}${s.required ? "" : ' <span class="subtle">(optional)</span>'}</label>
+          <input class="input" id="app-${esc(s.key)}" data-app-setting="${esc(s.key)}" value="${esc(saved[s.key] || "")}"
+                 placeholder="${esc(s.example || s.default || "")}" autocomplete="off" spellcheck="false">
+          <span class="help"><code>${esc(s.key)}</code>${s.help ? " · " + esc(s.help) : ""}${s.default ? ` · default <code>${esc(s.default)}</code>` : ""}</span></div>`).join("");
+      const optional = m.services.filter((s) => s.optional);
+      servicesField.hidden = !optional.length;
+      servicesBox.innerHTML = optional.map((s) => {
+        const on = chosen ? chosen.includes(s.name) : s.default;
+        return `<label class="check"><input type="checkbox" data-app-service="${esc(s.name)}" ${on ? "checked" : ""}><span><strong>${esc(s.name)}</strong></span></label>`;
+      }).join("");
+      const services = m.services.map((s) => `<span class="chip mono">${esc(s.name)}${s.port ? " " + s.port : ""}${s.hostname ? " · " + esc(s.hostname) : ""}</span>`).join(" ");
+      const secrets = m.secrets.map((s) => `<code>${esc(s.key)}</code>`).join(", ");
+      status.innerHTML = `<p style="margin: 0"><strong>${esc(m.name)}</strong>${note ? ` <span class="subtle">· ${esc(note)}</span>` : ""}</p>`;
+      summary.innerHTML = `<dl class="kv">
+        <dt>Services</dt><dd>${services || '<span class="muted">None</span>'}</dd>
+        ${secrets ? `<dt>Secrets</dt><dd>${secrets} <span class="subtle">· generated on the first deploy and kept with the instance</span></dd>` : ""}
+        ${m.env_file ? `<dt>Defaults</dt><dd class="mono">${esc(m.env_file)}</dd>` : ""}</dl>`;
+      sync();
+      form.dispatchEvent(new Event("change"));
+    };
+
+    const clear = (html) => {
+      manifest = null;
+      settingsBox.innerHTML = ""; servicesBox.innerHTML = ""; servicesField.hidden = true; summary.innerHTML = "";
+      status.innerHTML = html;
+      sync();
+    };
+
+    const load = async () => {
+      const source = $('[name="build_source"]:checked', form);
+      if (!source || source.value !== "app") return;
+      if (!repo || !repo.value || !branch || !branch.value) {
+        clear('<p class="muted">Choose a repository and branch to read its slipway.yml.</p>');
+        return;
+      }
+      const mine = ++seq;
+      status.innerHTML = '<p class="muted">Reading slipway.yml…</p>';
+      const path = (file && file.value.trim()) || "slipway.yml";
+      try {
+        const d = await api("GET", `/api/v1/repositories/${repo.value}/manifest?branch=${encodeURIComponent(branch.value)}&path=${encodeURIComponent(path)}`);
+        if (mine !== seq) return;
+        if (d.manifest) show(d.manifest, `${path} on ${branch.value}`);
+        else if (d.error) clear(`<div class="callout error">${esc(d.error)}</div>`);
+        else clear(`<div class="callout warning">There is no ${esc(path)} on ${esc(branch.value)}. Add one to the repository, or choose Dockerfile or docker compose.</div>`);
+      } catch (err) {
+        if (mine !== seq) return;
+        if (fallback) show(fallback, `as of the last deploy (GitHub: ${err.message})`);
+        else clear(`<div class="callout error">${esc(err.message)}</div>`);
+      }
+    };
+
+    box.addEventListener("input", (ev) => { if (ev.target.dataset.appSetting !== undefined) sync(); });
+    box.addEventListener("change", (ev) => { if (ev.target.dataset.appService !== undefined) sync(); });
+    if (file) file.addEventListener("change", load);
+    if (branch) branch.addEventListener("change", load);
+    $$('[name="build_source"]', form).forEach((r) => r.addEventListener("change", load));
+    load();
+  }
+
+  // ------------------------------------- conditional fields: data-show-when="field=value" (or value|value)
   function wireShowWhen(form) {
     const targets = $$("[data-show-when]", form);
     if (!targets.length) return;
     const update = () => {
       targets.forEach((el) => {
-        const [name, value] = el.dataset.showWhen.split("=");
+        const [name, values] = el.dataset.showWhen.split("=");
         const checked = $(`[name="${name}"]:checked`, form);
         const field = checked || $(`[name="${name}"]:not([type=radio])`, form);
-        el.hidden = !field || field.value !== value;
+        el.hidden = !field || !values.split("|").includes(field.value);
       });
     };
     form.addEventListener("change", update);
@@ -611,6 +719,7 @@
     $$("select[data-fill]").forEach(wireFill);
     $$("select[data-branches]").forEach(wireBranches);
     $$("form").forEach(wireShowWhen);
+    $$("[data-app-form]").forEach(wireAppForm);
     $$("form[data-preview-form]").forEach(wirePreview);
     const params = new URLSearchParams(location.search);
     $$("dialog[data-open-on]").forEach((dlg) => { if (params.get(dlg.dataset.openOn)) dlg.showModal(); });

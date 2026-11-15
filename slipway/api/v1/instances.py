@@ -16,7 +16,7 @@ from slipway.api.deps import DB, Auth, not_found, require
 from slipway.core.permissions import Perm
 from slipway.models import Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
 from slipway.schemas import BRANCH_MAX, ActionOut, DeploymentOut, InstanceCreate, InstanceOut, InstanceUpdate
-from slipway.services import audit, deployer, ssh, switchyard
+from slipway.services import audit, deployer, manifest, ssh, switchyard
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/instances", tags=["instances"])
@@ -28,7 +28,7 @@ Deployer = Annotated[AuthContext, require(Perm.DEPLOYMENTS_CREATE)]
 LogReader = Annotated[AuthContext, require(Perm.INSTANCES_READ, Perm.LOGS_READ)]
 
 # Settings that decide where and how an instance runs; fixed once anything was deployed.
-_PLACEMENT_FIELDS = ("host_id", "build_source", "compose_file", "dockerfile_path", "build_context")
+_PLACEMENT_FIELDS = ("host_id", "build_source", "compose_file", "dockerfile_path", "build_context", "manifest_file")
 # A claimed instance runs on its host from the start, but its paths in the repository can still be
 # corrected until Slipway first deploys it.
 CLAIM_EDITABLE_FIELDS = frozenset({"compose_file", "dockerfile_path", "build_context"})
@@ -127,7 +127,7 @@ async def claim_paths_editable(db: AsyncSession, instance: Instance) -> bool:
     return instance.claim_pending and not await deployment_started(db, instance)
 
 
-async def queue_deployment(db: DB, instance: Instance, user: User) -> Deployment:
+async def queue_deployment(db: DB, instance: Instance, user: User, *, retry_of: Deployment | None = None) -> Deployment:
     if deployer.runner.is_deleting(instance.id):
         raise HTTPException(status.HTTP_409_CONFLICT, "This instance is being deleted")
     if await _active_deployment(db, instance.id) is not None:
@@ -137,7 +137,10 @@ async def queue_deployment(db: DB, instance: Instance, user: User) -> Deployment
             status.HTTP_400_BAD_REQUEST,
             f"Host {instance.host.name} has not been verified yet; run a connection check first",
         )
-    dep = Deployment(instance_id=instance.id, branch=instance.branch, triggered_by_id=user.id, log="")
+    dep = Deployment(
+        instance_id=instance.id, branch=retry_of.branch if retry_of else instance.branch, triggered_by_id=user.id, log="",
+        retry_of_id=retry_of.id if retry_of else None, steps=deployer.new_steps(instance),
+    )
     db.add(dep)
     await db.flush()
     return dep
@@ -193,6 +196,9 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         build_context=body.build_context or ".",
         compose_file=body.compose_file or repo.compose_file or "docker-compose.yml",
         deploy_dir=body.deploy_dir or None,
+        manifest_file=body.manifest_file or manifest.DEFAULT_FILE,
+        app_settings=body.app_settings or {},
+        app_services=body.app_services,
         env=body.env or {},
         ports=[p.model_dump() for p in body.ports or []],
         volumes=[v.model_dump() for v in body.volumes or []],
@@ -310,9 +316,13 @@ async def _apply_update(
         instance.host = host
     if body.deploy_dir is not None:
         instance.deploy_dir = body.deploy_dir or None
-    for field in ("name", "branch", "build_source", "dockerfile_path", "build_context", "compose_file"):
+    for field in ("name", "branch", "build_source", "dockerfile_path", "build_context", "compose_file", "manifest_file"):
         if data.get(field) is not None:
             setattr(instance, field, data[field])
+    if body.app_settings is not None:
+        instance.app_settings = body.app_settings
+    if "app_services" in data:
+        instance.app_services = body.app_services
     if body.ports is not None:
         instance.ports = [p.model_dump() for p in body.ports]
     if body.volumes is not None:

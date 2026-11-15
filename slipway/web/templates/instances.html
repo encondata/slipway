@@ -27,7 +27,7 @@
         <td class="muted">{{ i.repository.full_name }}</td>
         <td><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span></td>
         <td>{% if can_hosts %}<a href="/hosts/{{ i.host.id }}">{{ i.host.name }}</a>{% else %}{{ i.host.name }}{% endif %}</td>
-        <td class="muted">{{ "Compose" if i.build_source == "compose" else "Dockerfile" }}</td>
+        <td class="muted">{{ {"compose": "Compose", "app": "App"}.get(i.build_source, "Dockerfile") }}</td>
         <td>{{ badge("instance", i.status) }}</td>
         <td class="muted nowrap">{{ i.last_deployed_at|timeago }}{% if i.current_commit_sha %}<div class="subtle mono">{{ i.current_commit_sha[:7] }}</div>{% endif %}</td>
         <td class="actions-cell">

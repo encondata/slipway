@@ -599,3 +599,10 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
   .repeater-row.route [data-f="hostname"] { grid-column: 1 / -1; }
   .repeater-row .arrow { display: none; }
 }
+
+/* Deployment steps */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; counter-reset: step; }
+.steps li { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; counter-increment: step; }
+.steps li::before { content: counter(step); min-width: 1.6em; color: var(--text-subtle, inherit); font-variant-numeric: tabular-nums; text-align: right; }
+.steps .badge { min-width: 88px; justify-content: center; }
+.steps .step-pending strong, .steps .step-skipped strong { opacity: .65; }

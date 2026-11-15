@@ -22,7 +22,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Permissions | Role-based: built-in `admin`, `maintainer`, `developer`, `viewer` + custom roles; users can hold several roles; no privilege escalation (you can only grant, remove or manage what you hold: `users:write` only reaches users whose every permission you also have); last-admin protection; the UI only shows what your roles allow |
 | Repositories | Sync from GitHub (owner, collaborator, org repos), detect `Dockerfile` / compose file, README preview, branch picker. Repositories are addressed by their GitHub id, so renames and transfers are followed and a repository re-created under an old name is never deployed |
 | Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
-| Instances | Repo + branch + host + Dockerfile *or* docker compose; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
+| Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
 | UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
@@ -205,6 +205,38 @@ deleted, are removed from Switchyard. A hostname is unique across instances.
   Switchyard stay. A hostname another Switchyard host already uses is left alone and reported.
 - A Switchyard problem never fails a deploy: the containers are running, and the problem is in the deploy log
   and on the instance page.
+
+### Apps (slipway.yml)
+
+A repository can describe how it is deployed in a `slipway.yml` at its root (or another path set on the
+instance). Choose **App (slipway.yml)** as the build source: the form reads the manifest from the chosen branch
+and asks for the settings it names, and shows its optional services. The manifest gives:
+
+- an **`env_file`** template (the app's own `.env.example`) that Slipway fills in and writes to
+  `<instance folder>/shared/.env` (mode 600), refusing to deploy while a value is still the manifest's
+  `placeholder`, such as `CHANGEME`;
+- **settings** asked for on the instance, and **vars** Slipway sets itself (`{slipway.slug}`,
+  `{slipway.release}`, `{slipway.sha12}`, `{slipway.env_dir}`…);
+- **secrets** Slipway generates on the first deploy (`hex`, `fernet` or `token`) and keeps, encrypted, with the
+  instance. Their names are listed on the instance page; their values are never shown. Changing one can lock an
+  app out of its own data, so Slipway never regenerates them; an environment variable of the same name
+  replaces one;
+- **services** with their default port, the variable that sets the host port and a hostname. Taken ports move to
+  the next free one and reach the app through that variable, and the hostnames are published in Switchyard like
+  any instance's;
+- the **Compose projects** the app runs (for status, logs, start/stop and delete), the **images** each release
+  builds (removed with the release unless something still uses them), and the **commands** that build, start
+  and stop it, run from the release on the host.
+
+An app's commands run on the host as trusted code, like a compose file. See
+[docs/examples/serversherpa.slipway.yml](docs/examples/serversherpa.slipway.yml) for a full manifest, and
+`slipway/services/manifest.py` for the format.
+
+Every deployment, whatever its build source, runs as numbered **steps** shown on the deployment page, each
+starting a section of the log. **Retry** runs a failed deployment's commit again (`POST
+/api/v1/deployments/{id}/retry`, needs `deployments:create`): the downloaded release and the build are reused
+when they are still on the host (a release that failed after its build is kept for that), and the settings,
+ports and start run again.
 
 ### Claiming containers Slipway did not deploy
 

@@ -11,7 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, fie
 
 from slipway.core.permissions import validate_permissions
 from slipway.models import Deployment, Host, Instance, Repository, User
-from slipway.services import deployer, ports, switchyard
+from slipway.services import deployer, manifest, ports, switchyard
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -342,10 +342,15 @@ class VolumeMapping(BaseModel):
 
 class _InstanceFields(BaseModel):
     branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
-    build_source: Literal["dockerfile", "compose"] | None = None
+    build_source: Literal["dockerfile", "compose", "app"] | None = None
     dockerfile_path: Annotated[str, Field(max_length=255), NoNul] | None = None
     build_context: Annotated[str, Field(max_length=255), NoNul] | None = None
     compose_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    # App mode: the manifest in the repository, its settings' values and the optional services that run
+    # (None leaves them as they are; on create, each optional service's default).
+    manifest_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    app_settings: dict[EnvKey, Annotated[str, Field(max_length=4096), NoNul]] | None = Field(None, max_length=100)
+    app_services: list[Annotated[str, Field(max_length=63, pattern=manifest.SERVICE_RE.pattern)]] | None = Field(None, max_length=50)
     # The instance's own folder on the host; "" goes back to <host deploy root>/<slug>.
     deploy_dir: Annotated[str, Field(max_length=255), NoNul] | None = None
     env: dict[EnvKey, EnvValue] | None = Field(None, max_length=500)
@@ -381,7 +386,17 @@ class _InstanceFields(BaseModel):
             seen.add(key)
         return v
 
-    @field_validator("dockerfile_path", "compose_file")
+    @field_validator("app_settings")
+    @classmethod
+    def _app_settings(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return None if v is None else deployer.clean_env(v)
+
+    @field_validator("app_services")
+    @classmethod
+    def _app_services(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else sorted(set(v))
+
+    @field_validator("dockerfile_path", "compose_file", "manifest_file")
     @classmethod
     def _rel(cls, v: str | None) -> str | None:
         return None if v is None else deployer.clean_relative_path(v)
@@ -401,7 +416,7 @@ class InstanceCreate(_InstanceFields):
     name: Str = Field(min_length=1, max_length=100)
     repository_id: uuid.UUID
     host_id: uuid.UUID
-    build_source: Literal["dockerfile", "compose"] = "dockerfile"
+    build_source: Literal["dockerfile", "compose", "app"] = "dockerfile"
     deploy: bool = True
 
 
@@ -433,6 +448,13 @@ class InstanceOut(Out):
     dockerfile_path: str
     build_context: str
     compose_file: str
+    manifest_file: str = manifest.DEFAULT_FILE
+    app_settings: dict[str, str] = {}
+    app_services: list[str] | None = None
+    # Names of the secrets Slipway generated for the app (never their values).
+    app_secret_keys: list[str] = []
+    # What the last deploy read from slipway.yml and rendered: {manifest, routes, projects, ...}.
+    app_state: dict[str, Any] | None = None
     env_keys: list[str]
     # Variables are stored but can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY.
     env_unreadable: bool = False
@@ -471,6 +493,11 @@ class InstanceOut(Out):
             dockerfile_path=i.dockerfile_path,
             build_context=i.build_context,
             compose_file=i.compose_file,
+            manifest_file=i.manifest_file or manifest.DEFAULT_FILE,
+            app_settings=i.app_settings or {},
+            app_services=i.app_services,
+            app_secret_keys=sorted((i.app_secrets or {}).keys()) if i.build_source == "app" else [],
+            app_state=i.app_state,
             env_keys=sorted((i.env or {}).keys()),
             env_unreadable=env_unreadable,
             ports=i.ports,
@@ -573,6 +600,9 @@ class DeploymentOut(BaseModel):
     finished_at: datetime | None
     error: str | None
     created_at: datetime
+    # [{key, name, status, started_at?, finished_at?, offset?, note?}]
+    steps: list[dict[str, Any]] = []
+    retry_of_id: uuid.UUID | None = None
 
     @classmethod
     def of(cls, d: Deployment) -> DeploymentOut:
@@ -590,6 +620,8 @@ class DeploymentOut(BaseModel):
             finished_at=d.finished_at,
             error=d.error,
             created_at=d.created_at,
+            steps=d.steps or [],
+            retry_of_id=d.retry_of_id,
         )
 
 

@@ -47,7 +47,7 @@ async def _host(db: DB, host_id: uuid.UUID) -> Host:
 async def _claimed(db: DB, host: Host) -> tuple[set[str], set[str]]:
     """Compose project names and standalone container ids the host's instances already stand for."""
     instances = (await db.scalars(select(Instance).where(Instance.host_id == host.id))).all()
-    projects = {i.compose_project for i in instances}
+    projects = {i.compose_project for i in instances} | {p for i in instances for p in deployer.app_known_projects(i)}
     containers = {i.claimed_container for i in instances if i.claimed_container}
     return projects, containers
 

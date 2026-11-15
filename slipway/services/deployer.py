@@ -37,6 +37,7 @@ command run for a claimed instance removes a volume.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import posixpath
 import re
@@ -58,7 +59,7 @@ from sqlalchemy import func, select, update
 from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
 from slipway.models import BuildSource, Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
-from slipway.services import ports, ssh, switchyard
+from slipway.services import manifest, ports, ssh, switchyard
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 
@@ -526,6 +527,8 @@ def control_command(instance: Instance, action: str) -> str:
         raise ValueError(f"Unknown action {action}")
     if instance.claimed_container:
         return f"docker {action} {_claimed_id(instance)}"
+    if instance.build_source == BuildSource.APP:
+        return _app_projects_command(instance, action)
     if instance.build_source == BuildSource.COMPOSE:
         if instance.claim_pending:  # no release yet: Compose finds the project's containers by name
             return f"cd / && docker compose -p {q(instance.compose_project)} {action}"
@@ -542,7 +545,27 @@ CONTAINER_FIELDS = ("Names", "Image", "State", "Status", "Ports", "RunningFor")
 _CONTAINER_FORMAT = "{" + ",".join(f'"{k}":{{{{json .{k}}}}}' for k in CONTAINER_FIELDS) + "}"
 
 
+def _project_filter(project: str) -> str:
+    return q(f"label=com.docker.compose.project={project}")
+
+
+def _app_projects_command(instance: Instance, action: str) -> str:
+    """start / restart the app's projects in order, stop them in reverse; a project with no containers is skipped."""
+    projects = app_projects(instance)
+    if action == "stop":
+        projects = projects[::-1]
+    if not projects:
+        return "echo 'Nothing to do: this app has not been deployed yet'"
+    parts = [f'ids=$(docker ps -aq --filter {_project_filter(p)}); [ -z "$ids" ] || docker compose -p {q(p)} {action} || rc=1'
+             for p in projects]
+    return "cd / && rc=0; " + "; ".join(parts) + "; exit $rc"
+
+
 def status_command(instance: Instance) -> str:
+    if instance.build_source == BuildSource.APP:
+        projects = app_projects(instance)
+        return "; ".join(f"docker ps -a --filter {_project_filter(p)} --format {q(_CONTAINER_FORMAT)}"
+                         for p in projects) or "true"
     if instance.build_source == BuildSource.COMPOSE:
         flt = f"label=com.docker.compose.project={instance.compose_project}"
     else:
@@ -555,6 +578,12 @@ def status_command(instance: Instance) -> str:
 
 def logs_command(instance: Instance, tail: int = 200) -> str:
     tail = max(1, min(int(tail), 5000))
+    if instance.build_source == BuildSource.APP:
+        projects = app_projects(instance)
+        if not projects:
+            return "echo 'This app has not been deployed yet'"
+        return "cd / && { " + "; ".join(
+            f"docker compose -p {q(p)} logs --tail {tail} --timestamps --no-color" for p in projects) + "; } 2>&1"
     if instance.claimed_container:
         return f"docker logs --tail {tail} --timestamps {_claimed_id(instance)} 2>&1"
     if instance.build_source == BuildSource.COMPOSE and instance.claim_pending:
@@ -580,7 +609,18 @@ def teardown_command(instance: Instance) -> str:
         f"docker image ls -aq --filter {q('label=com.docker.compose.project=' + instance.compose_project)}; }} "
         f"| sort -u | xargs -r docker image rm -f >/dev/null 2>&1"
     )
+    app: list[str] = []
+    if instance.build_source == BuildSource.APP:
+        state = instance.app_state or {}
+        stop = state.get("commands", {}).get("stop")
+        if stop:
+            app.append(f"({app_command(paths.current, list(stop))}) >/dev/null 2>&1")
+        app += [f"(cd / && docker compose -p {q(p)} down --remove-orphans) >/dev/null 2>&1" for p in app_known_projects(instance)]
+        refs = sorted({r for refs in (state.get("releases") or {}).values() for r in refs if manifest.IMAGE_RE.match(r)})
+        if refs:  # without -f: one another instance's container still uses stays
+            app.append(f"docker image rm {' '.join(q(r) for r in refs)} >/dev/null 2>&1")
     return "; ".join([
+        *app,
         *([claimed_remove_command(instance)] if instance.claimed_container else []),
         _remove_containers(instance),
         _compose_project_down(instance),
@@ -593,10 +633,11 @@ def teardown_command(instance: Instance) -> str:
 def leftovers_command(instance: Instance) -> str:
     """Prints the ids of any container still belonging to the instance (stderr is mixed in)."""
     claimed = f" && docker ps -aq --filter id={_claimed_id(instance)}" if instance.claimed_container else ""
+    app = "".join(f" && docker ps -aq --filter {_project_filter(p)}" for p in app_known_projects(instance))
     return (
         f"docker ps -aq --filter {q('label=' + _label(instance))} && "
         f"docker ps -aq --filter {q('label=com.docker.compose.project=' + instance.compose_project)}"
-        f"{claimed}"
+        f"{claimed}{app}"
     )
 
 
@@ -612,8 +653,12 @@ def release_users_command(instance: Instance) -> str:
     """
     fmt = '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
     flt = q("label=com.docker.compose.project=" + instance.compose_project)
+    more = "".join(
+        f"more=$(docker ps -aq --filter {_project_filter(p)}) && ids=$(printf '%s\\n%s' \"$ids\" \"$more\" | sed '/^$/d') && "
+        for p in app_known_projects(instance)
+    )
     return (
-        f"ids=$(docker ps -aq --filter {flt}) && "
+        f"ids=$(docker ps -aq --filter {flt}) && {more}"
         f"{{ [ -z \"$ids\" ] || printf '%s\\n' \"$ids\" | xargs docker container inspect -f {q(fmt)}; }}"
     )
 
@@ -770,6 +815,7 @@ def bind_sources_command(instance: Instance) -> str:
     ]
     if instance.claimed_container:
         lists.append(f"docker ps -aq --filter id={_claimed_id(instance)}")
+    lists += [f"docker ps -aq --filter {_project_filter(p)}" for p in app_known_projects(instance)]
     return (
         f"ids=$({' && '.join(lists)}) && "
         f"{{ [ -z \"$ids\" ] || printf '%s\\n' \"$ids\" | sort -u | xargs docker container inspect -f {q(fmt)}; }}"
@@ -934,6 +980,8 @@ def guarded_paths(instance: Instance) -> dict[str, tuple[bool, str]]:
     """
     if instance.build_source == BuildSource.COMPOSE:
         settings = [("compose file", instance.compose_file, False)]
+    elif instance.build_source == BuildSource.APP:
+        settings = [("manifest", instance.manifest_file, False)]
     else:
         settings = [("build context", instance.build_context, True), ("Dockerfile", instance.dockerfile_path, False)]
     guarded: dict[str, tuple[bool, str]] = {}
@@ -1101,12 +1149,128 @@ async def _finish(
             await asyncio.sleep(delays[attempt])
 
 
+# ------------------------------------------------------------------------- steps
+
+STEP_NAMES = {
+    "resolve": "Resolve the commit",
+    "source": "Download the source",
+    "upload": "Upload the release",
+    "manifest": "Read slipway.yml",
+    "settings": "Write the settings",
+    "ports": "Check host ports",
+    "build": "Build",
+    "start": "Start",
+    "finish": "Switch to the new release",
+    "proxy": "Update Switchyard",
+}
+STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped", "warning")
+# The header line each step starts with in the log; the deployment page splits the log on it.
+STEP_MARK = "── Step "
+
+
+def step_keys(instance: Instance) -> list[str]:
+    if instance.build_source == BuildSource.APP:
+        return ["resolve", "source", "upload", "manifest", "ports", "settings", "build", "start", "finish", "proxy"]
+    return ["resolve", "source", "upload", "settings", "ports", "build", "start", "finish", "proxy"]
+
+
+def new_steps(instance: Instance) -> list[dict[str, Any]]:
+    return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in step_keys(instance)]
+
+
+class Steps:
+    """The deployment's numbered steps: their state is saved on the deployment, and each starts a log section.
+
+    Saving never raises (a failed save is retried with the next change).
+    """
+
+    def __init__(self, deployment_id: uuid.UUID, rows: list[dict[str, Any]], sink: LogSink) -> None:
+        self.deployment_id = deployment_id
+        self.rows = [dict(r) for r in rows]
+        self.sink = sink
+        self._current: dict[str, Any] | None = None
+
+    def _row(self, key: str) -> tuple[int, dict[str, Any]]:
+        for i, row in enumerate(self.rows):
+            if row["key"] == key:
+                return i, row
+        row = {"key": key, "name": STEP_NAMES.get(key, key), "status": "pending"}
+        self.rows.append(row)
+        return len(self.rows) - 1, row
+
+    def status(self, key: str) -> str | None:
+        return next((r["status"] for r in self.rows if r["key"] == key), None)
+
+    async def _save(self) -> None:
+        try:
+            async with session_scope() as db:
+                await db.execute(update(Deployment).where(Deployment.id == self.deployment_id)
+                                 .values(steps=[dict(r) for r in self.rows]))
+        except Exception as exc:
+            log.warning("Could not save the steps of deployment %s: %s", self.deployment_id, exc)
+
+    async def begin(self, key: str) -> None:
+        i, row = self._row(key)
+        row.update(status="running", started_at=utcnow().isoformat())
+        row.pop("note", None)
+        self._current = row
+        await self.sink.line(f"{STEP_MARK}{i + 1}/{len(self.rows)}: {row['name']}")
+        await self._save()
+
+    async def end(self, status: str, *, note: str | None = None) -> None:
+        row = self._current
+        if row is None:
+            return
+        row.update(status=status, finished_at=utcnow().isoformat())
+        if note:
+            row["note"] = clean_text(note)[:300]
+        self._current = None
+        await self._save()
+
+    async def skip(self, key: str, note: str) -> None:
+        i, row = self._row(key)
+        row.update(status="skipped", note=clean_text(note)[:300])
+        await self.sink.line(f"{STEP_MARK}{i + 1}/{len(self.rows)}: {row['name']}: skipped. {note}")
+        await self._save()
+
+    @asynccontextmanager
+    async def step(self, key: str) -> AsyncIterator[None]:
+        await self.begin(key)
+        try:
+            yield
+        except BaseException as exc:
+            await self.end("failed", note=str(exc) or type(exc).__name__)
+            raise
+        await self.end("succeeded")
+
+    async def close(self) -> None:
+        """At the end: a step still running failed (it was interrupted)."""
+        if self._current is not None:
+            await self.end("failed", note="Interrupted")
+        await self._save()
+
+
+# A release folder's name: <sha12>-<deployment id8> (see InstancePaths.release).
+_RELEASE_NAME = re.compile(r"[0-9a-f]{12}-[0-9a-f]{8}")
+
+
+@dataclass
+class _Retry:
+    id: uuid.UUID  # the deployment being retried
+    sha: str
+    release: str | None
+    reusable: bool  # its release and build can be used again
+
+
 @dataclass
 class _Job:
     instance: Instance
     branch: str
     user: User | None
     env: dict[str, str] | None  # None when the stored values cannot be decrypted
+    secrets: dict[str, str] | None  # the app's generated secrets; None when they cannot be decrypted
+    steps: list[dict[str, Any]]
+    retry: _Retry | None = None
 
 
 async def _start(deployment_id: uuid.UUID) -> _Job | None:
@@ -1119,10 +1283,24 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
         if env is None:
             stored = await db.scalar(select(Instance.env.is_not(None)).where(Instance.id == instance.id))
             env = None if stored else {}
+        secrets = instance.app_secrets
+        if secrets is None:
+            stored = await db.scalar(select(Instance.app_secrets.is_not(None)).where(Instance.id == instance.id))
+            secrets = None if stored else {}
+        retry = None
+        if dep.retry_of_id is not None:
+            first = await db.get(Deployment, dep.retry_of_id)
+            if first is not None and first.commit_sha:
+                built = any(r.get("key") == "build" and r.get("status") in ("succeeded", "skipped") for r in first.steps or [])
+                named = bool(first.release) and _RELEASE_NAME.fullmatch(posixpath.basename(first.release)) is not None
+                retry = _Retry(id=first.id, sha=first.commit_sha, release=first.release,
+                               reusable=built and named and first.instance_id == instance.id)
         dep.status = DeploymentStatus.RUNNING
         dep.started_at = utcnow()
+        dep.steps = new_steps(instance)
         instance.status = InstanceStatus.DEPLOYING
-        return _Job(instance=instance, branch=dep.branch, user=dep.triggered_by, env=env)
+        return _Job(instance=instance, branch=dep.branch, user=dep.triggered_by, env=env, secrets=secrets,
+                    steps=dep.steps, retry=retry)
 
 
 async def _check_repository(gh: GitHubClient, repo: Repository, sink: LogSink) -> None:
@@ -1209,13 +1387,15 @@ async def _reserved_ports(instance: Instance) -> list[tuple[int, str, str]]:
 
 async def _plan_ports(
     remote: ssh.RemoteSession, instance: Instance, declared: list[ports.Binding], sink: LogSink,
+    *, projects: frozenset[str] = frozenset(),
 ) -> ports.PortPlan:
     """Check ``declared`` against the host, move clashes if allowed, and store the result.
 
     Raises DeployError on a clash the instance does not allow Slipway to move.
     """
     overrides: dict[tuple[str | None, int, str], int] = {}
-    if instance.build_source == BuildSource.COMPOSE:
+    by_service = instance.build_source in (BuildSource.COMPOSE, BuildSource.APP)
+    if by_service:
         for o in instance.port_overrides or []:
             overrides[(o["service"], int(o["container"]), o.get("protocol") or "tcp")] = int(o["host"])
     async with _host_port_locks[instance.host_id]:
@@ -1223,6 +1403,7 @@ async def _plan_ports(
         own_names = {instance.running_container_name} if instance.claimed_container else set()
         host_ports = ports.parse_scan(
             output, instance_id=str(instance.id), compose_project=instance.compose_project, own_names=own_names,
+            projects=projects,
         )
         for port, protocol, name in await _reserved_ports(instance):
             host_ports.reserve(port, protocol, f"Slipway instance {name}")
@@ -1233,7 +1414,7 @@ async def _plan_ports(
         for wanted, given, why in plan.moved:
             await sink.line(f"Host port {wanted.describe()} is {why}; using {given.host} instead")
         fields: dict[str, Any] = {"published_ports": ports.binding_rows(plan)}
-        if instance.build_source == BuildSource.COMPOSE:
+        if by_service:
             fields["port_overrides"] = _merge_overrides(instance.port_overrides or [], plan)
         else:
             fields["ports"] = [
@@ -1299,9 +1480,11 @@ async def _port_variables_source(
         return await _compose_config(remote, instance, release, interpolate=False)
     except (DeployError, ssh.SSHError):
         pass
-    if tarball is None:
-        return None
-    text = await asyncio.to_thread(read_source_file, tarball, posixpath.normpath(instance.compose_file))
+    path = posixpath.normpath(instance.compose_file)
+    if tarball is not None:
+        text = await asyncio.to_thread(read_source_file, tarball, path)
+    else:  # a retry reusing its release: read it there
+        text = await _read_release_file(remote, release, path)
     return ports.load_compose_yaml(text) if text is not None else None
 
 
@@ -1398,15 +1581,20 @@ async def _replace_claimed(remote: ssh.RemoteSession, instance: Instance, sink: 
     instance.claim = claim
 
 
-async def _install(
-    remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, tarball: Path,
-    env: dict[str, str], sink: LogSink,
-) -> None:
+@dataclass
+class _Run:
+    """What one deployment has done so far on the host (for cleaning up after a failure)."""
+
+    release: str
+    upload: str
+    tarball: Path | None
+    built: bool = False  # the build step succeeded: keep the release so a retry can reuse it
+    claimed_running: bool = False  # the claimed container ran before this deploy
+    stopped_claimed: bool = False  # this deploy stopped it
+
+
+async def _take_dir(remote: ssh.RemoteSession, instance: Instance, sink: LogSink) -> None:
     paths = paths_for(instance)
-    release = paths.release(sha, deployment_id)
-    upload = f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz"
-    compose = instance.build_source == BuildSource.COMPOSE
-    claimed_running = stopped_claimed = False  # the claimed container ran / this deploy stopped it
     status, output = await remote.run(take_dir_command(instance), check=False, timeout=60)
     if status:
         raise take_dir_error(instance, output)
@@ -1415,84 +1603,401 @@ async def _install(
             f"Warning: {instance.host.name} runs Unraid, which clears {paths.base} when it restarts. Set the instance's "
             "folder (or the host's deploy root) to a path under /mnt/user, such as /mnt/user/appdata; Slipway moves the files."
         )
-    await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
-    try:
-        await remote.put(tarball, upload)
-        await remote.run(unpack_command(release, upload))
-        await sink.line(f"Unpacked release into {release}")
-        if compose:
-            env_path, content = paths.slipway_env_file, render_compose_env(env)
-        else:
-            env_path, content = paths.env_file, render_env(env)
-        await remote.write_text(env_path, content)
-        await sink.line(f"Wrote {len(env)} environment variable(s) to {env_path}")
 
-        if instance.claimed_container:
-            _, state = await remote.run(claimed_state_command(instance), check=False, timeout=60)
-            claimed_running = state.strip().splitlines()[-1:] == ["true"]
-        commands = build_commands(instance, release, sha)
-        if compose:
-            await sink.line(f"$ {commands[0]}")
-            await remote.run(commands[0], on_line=sink.line, timeout=3600)
-            files = await _prepare_compose_ports(remote, instance, release, env, sink, tarball)
-            commands = build_commands(instance, release, sha, **files)[1:]
-        elif instance.ports:
-            await _plan_ports(remote, instance, ports.dockerfile_bindings(instance.ports), sink)
-            commands = build_commands(instance, release, sha)
-        stop_claimed = _stop_claimed(instance) if instance.claimed_container else None
-        for command in commands:
-            await sink.line(f"$ {command}")
-            if stop_claimed and stop_claimed in command:
-                stopped_claimed = claimed_running
-            await remote.run(command, on_line=sink.line, timeout=3600)
+
+async def _record_release(deployment_id: uuid.UUID, release: str) -> None:
+    async with session_scope() as db:
+        await db.execute(update(Deployment).where(Deployment.id == deployment_id).values(release=release))
+
+
+def read_hex_output(output: str) -> bytes:
+    """Bytes from ``od -An -v -tx1`` output (other lines, such as warnings, are skipped)."""
+    hex_lines = [line for line in output.splitlines() if ports._HEX_LINE.match(line)]
+    return bytes.fromhex("".join(hex_lines).replace(" ", ""))
+
+
+async def _read_release_file(remote: ssh.RemoteSession, release: str, path: str, limit: int = 2 * 1024 * 1024) -> str | None:
+    """The text of ``path`` in a release on the host (None if missing, a link or too big)."""
+    full = q(posixpath.join(release, path))
+    status, output = await remote.run(
+        f"[ -f {full} ] && [ ! -L {full} ] && [ $(wc -c < {full}) -le {limit} ] && od -An -v -tx1 {full}",
+        check=False, timeout=120,
+    )
+    if status:
+        return None
+    return read_hex_output(output).decode("utf-8", "replace")
+
+
+async def _source_file(remote: ssh.RemoteSession, run: _Run, path: str) -> str | None:
+    if run.tarball is not None:
+        return await asyncio.to_thread(read_source_file, run.tarball, path)
+    return await _read_release_file(remote, run.release, path)
+
+
+async def _install(
+    remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, tarball: Path | None,
+    job: _Job, sink: LogSink, steps: Steps,
+) -> None:
+    paths = paths_for(instance)
+    reuse = job.retry is not None and job.retry.reusable and bool(job.retry.release)
+    # The reused release by its name in the instance's folder now: a move since then copied it there.
+    release = (posixpath.join(paths.releases, posixpath.basename(job.retry.release)) if reuse
+               else paths.release(sha, deployment_id))
+    run = _Run(release=release, upload=f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz", tarball=tarball)
+    await _record_release(deployment_id, release)
+    if reuse:
+        await _take_dir(remote, instance, sink)
+        status, _ = await remote.run(f"[ -d {q(release)} ]", check=False, timeout=60)
+        if status:
+            raise DeployError(f"The release {release} is no longer on {instance.host.name}; deploy again instead of retrying")
+        await steps.skip("upload", f"Reusing {release} from deployment {job.retry.id.hex[:8]}")
+    else:
+        async with steps.step("upload"):
+            await _take_dir(remote, instance, sink)
+            await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
+            try:
+                assert tarball is not None
+                await remote.put(tarball, run.upload)
+                await remote.run(unpack_command(release, run.upload))
+            except Exception:
+                await _discard_release(remote, instance, release, run.upload, sink)
+                raise
+            await sink.line(f"Unpacked release into {release}")
+    try:
+        if instance.build_source == BuildSource.APP:
+            state = await _install_app(remote, instance, deployment_id, sha, job, run, sink, steps)
+        elif instance.build_source == BuildSource.COMPOSE:
+            state = await _install_compose(remote, instance, sha, job, run, sink, steps)
+        else:
+            state = await _install_dockerfile(remote, instance, sha, job, run, sink, steps)
     except Exception:
-        if stopped_claimed:
+        if run.stopped_claimed:
             await _restart_claimed(remote, instance, sink)
-        await _discard_release(remote, instance, release, upload, sink)
+        if run.built or reuse:  # a reused release was kept by the deployment it came from: never remove it
+            with contextlib.suppress(Exception):
+                await remote.run(f"rm -f -- {q(run.upload)}", check=False, timeout=60)
+            await sink.line(f"Kept {release} so a retry can start from it")
+        else:
+            await _discard_release(remote, instance, release, run.upload, sink)
         raise
-    if instance.claim_pending:
-        await _replace_claimed(remote, instance, sink)
-    await remote.run(f"ln -sfn {q(release)} {q(paths.current)}")
-    await sink.line(f"Switched {paths.current} to {release}")
-    status, output = await remote.run(prune_command(instance, release), check=False, timeout=600)
-    if status != 0:
-        detail = " ".join(output.strip().splitlines()[-3:])
-        await sink.line(f"Warning: some old releases could not be removed. {detail}".strip())
+    async with steps.step("finish"):
+        if instance.claim_pending:
+            await _replace_claimed(remote, instance, sink)
+        await remote.run(f"ln -sfn {q(release)} {q(paths.current)}")
+        await sink.line(f"Switched {paths.current} to {release}")
+        if state is not None:  # what the app runs now: status, logs, stop and Switchyard follow it from here
+            await _save_instance(instance, app_state=state)
+        status, output = await remote.run(prune_command(instance, release), check=False, timeout=600)
+        if status != 0:
+            detail = " ".join(output.strip().splitlines()[-3:])
+            await sink.line(f"Warning: some old releases could not be removed. {detail}".strip())
+        if state is not None:
+            await _prune_app_images(remote, instance, state, sink)
+
+
+async def _claimed_state(remote: ssh.RemoteSession, instance: Instance, run: _Run) -> None:
+    if instance.claimed_container:
+        _, state = await remote.run(claimed_state_command(instance), check=False, timeout=60)
+        run.claimed_running = state.strip().splitlines()[-1:] == ["true"]
+
+
+async def _run_commands(
+    remote: ssh.RemoteSession, instance: Instance, commands: list[str], run: _Run, sink: LogSink,
+) -> None:
+    stop_claimed = _stop_claimed(instance) if instance.claimed_container else None
+    for command in commands:
+        await sink.line(f"$ {command}")
+        if stop_claimed and stop_claimed in command:
+            run.stopped_claimed = run.claimed_running
+        await remote.run(command, on_line=sink.line, timeout=3600)
+
+
+async def _install_dockerfile(
+    remote: ssh.RemoteSession, instance: Instance, sha: str, job: _Job, run: _Run, sink: LogSink, steps: Steps,
+) -> None:
+    paths = paths_for(instance)
+    env = job.env or {}
+    async with steps.step("settings"):
+        await remote.write_text(paths.env_file, render_env(env))
+        await sink.line(f"Wrote {len(env)} environment variable(s) to {paths.env_file}")
+        await _claimed_state(remote, instance, run)
+    if instance.ports:
+        async with steps.step("ports"):
+            await _plan_ports(remote, instance, ports.dockerfile_bindings(instance.ports), sink)
+    else:
+        await steps.skip("ports", "No port mappings")
+    build, *start = build_commands(instance, run.release, sha)
+    image = f"slipway/{instance.slug}:{sha[:12]}"
+    if job.retry is not None and job.retry.reusable and await _images_exist(remote, [image]):
+        await steps.skip("build", f"Reusing the image {image} from deployment {job.retry.id.hex[:8]}")
+    else:
+        async with steps.step("build"):
+            await _run_commands(remote, instance, [build], run, sink)
+    run.built = True
+    async with steps.step("start"):
+        await _run_commands(remote, instance, start, run, sink)
+    return None
+
+
+async def _install_compose(
+    remote: ssh.RemoteSession, instance: Instance, sha: str, job: _Job, run: _Run, sink: LogSink, steps: Steps,
+) -> None:
+    paths = paths_for(instance)
+    env = job.env or {}
+    async with steps.step("settings"):
+        await remote.write_text(paths.slipway_env_file, render_compose_env(env))
+        await sink.line(f"Wrote {len(env)} environment variable(s) to {paths.slipway_env_file}")
+        await _claimed_state(remote, instance, run)
+        command = compose_env_command(instance, run.release)
+        await sink.line(f"$ {command}")
+        await remote.run(command, on_line=sink.line, timeout=3600)
+    async with steps.step("ports"):
+        files = await _prepare_compose_ports(remote, instance, run.release, env, sink, run.tarball)
+    _, *start = build_commands(instance, run.release, sha, **files)
+    async with steps.step("build"):
+        await _run_commands(remote, instance, [compose_build_command(instance, run.release, **files)], run, sink)
+    run.built = True
+    async with steps.step("start"):
+        await _run_commands(remote, instance, start, run, sink)
+    return None
+
+
+def compose_build_command(instance: Instance, release_dir: str, *, override: str | None = None,
+                          resolved: str | None = None) -> str:
+    """Build the compose file's images (Start's ``up --build`` then finds them in the cache)."""
+    return f"cd {q(release_dir)} && {_compose(instance, override, resolved=resolved, release_dir=release_dir)} build"
+
+
+async def _images_exist(remote: ssh.RemoteSession, images: list[str]) -> bool:
+    if not images:
+        return False
+    status, _ = await remote.run(f"docker image inspect --format . {' '.join(q(i) for i in images)} >/dev/null 2>&1",
+                                 check=False, timeout=120)
+    return status == 0
+
+
+# ------------------------------------------------------------------- app mode
+
+
+def app_builtins(instance: Instance, release: str, sha: str, deployment_id: uuid.UUID) -> dict[str, str]:
+    return {
+        "slug": instance.slug, "name": instance.name, "release": release, "env_dir": paths_for(instance).shared,
+        "sha": sha, "sha12": sha[:12], "host": instance.host.address, "deployment": deployment_id.hex[:8],
+    }
+
+
+def app_command(release: str, argv: list[str]) -> str:
+    """Run one of slipway.yml's commands from the release: a program in the repository, or one on the PATH."""
+    program = argv[0]
+    if "/" in program:
+        program = "./" + manifest.clean_repo_path(program, "the command")
+    return f"cd {q(release)} && {' '.join(q(a) for a in [program, *argv[1:]])}"
+
+
+async def _save_instance(instance: Instance, **fields: Any) -> None:
+    async with session_scope() as db:
+        await db.execute(update(Instance).where(Instance.id == instance.id).values(**fields))
+    for key, value in fields.items():
+        setattr(instance, key, value)
+
+
+async def _install_app(
+    remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, job: _Job, run: _Run,
+    sink: LogSink, steps: Steps,
+) -> dict[str, Any]:
+    paths = paths_for(instance)
+    builtins = app_builtins(instance, run.release, sha, deployment_id)
+    env = job.env or {}
+
+    def plan_with(host_ports: dict[str, int]) -> manifest.AppPlan:
+        try:
+            return manifest.plan(
+                man, template=template, builtins=builtins, settings=instance.app_settings or {},
+                chosen=instance.app_services, host_ports=host_ports, secrets=secrets, env=env,
+            )
+        except manifest.ManifestError as exc:
+            raise DeployError(str(exc)) from exc
+
+    async with steps.step("manifest"):
+        text = await _source_file(remote, run, instance.manifest_file)
+        if text is None:
+            raise DeployError(f"{instance.manifest_file} was not found in {instance.repository.full_name} at {sha[:7]} "
+                              "(or it is a link, or larger than 2 MB)")
+        try:
+            man = manifest.parse(text)
+        except manifest.ManifestError as exc:
+            raise DeployError(str(exc)) from exc
+        template = None
+        if man.env_file:
+            template = await _source_file(remote, run, man.env_file)
+            if template is None:
+                raise DeployError(f"slipway.yml: env_file {man.env_file} was not found in the repository (or it is a link)")
+        if job.secrets is None:
+            raise DeployError("The app's stored secrets can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY; "
+                              "restore the old key (see slipway rotate-encryption-key) before deploying")
+        secrets = dict(job.secrets)
+        fresh = manifest.new_secrets(man, secrets)
+        if fresh:
+            secrets.update(fresh)
+            await _save_instance(instance, app_secrets=secrets)
+            await sink.line(f"Generated {len(fresh)} secret(s) and kept them with the instance: {', '.join(sorted(fresh))}")
+        first = plan_with({})
+        await _check_projects_free(instance, first.projects)
+        await sink.line(f"{man.name}: running {', '.join(s.name for s in first.services) or 'no services'}")
+
+    planned = [s for s in first.services if s.port_var]
+    fixed = [s for s in first.services if s.port is not None and not s.port_var]
+    host_ports: dict[str, int] = {}
+    if planned:
+        async with steps.step("ports"):
+            declared = [ports.Binding(service=s.name, container=s.port, protocol=s.protocol, host=s.port) for s in planned]
+            port_plan = await _plan_ports(remote, instance, declared, sink, projects=frozenset(first.projects))
+            host_ports = {b.service: b.host for b in port_plan.bindings if b.service}
+            if fixed:
+                rows = list(instance.published_ports) + [
+                    {"service": s.name, "container": s.port, "protocol": s.protocol, "host": s.port} for s in fixed
+                ]
+                await _save_instance(instance, published_ports=rows)
+    else:
+        await steps.skip("ports", "slipway.yml sets no port variables")
+        await _save_instance(instance, published_ports=[
+            {"service": s.name, "container": s.port, "protocol": s.protocol, "host": s.port} for s in fixed
+        ])
+
+    async with steps.step("settings"):
+        final = plan_with(host_ports)
+        lines, _ = manifest.parse_env_template(template or "")
+        try:
+            content = manifest.render_env(lines, final.env, final.written)
+        except manifest.ManifestError as exc:
+            raise DeployError(str(exc)) from exc
+        await remote.write_text(paths.env_file, content)
+        await sink.line(f"Wrote {len(final.written)} value(s) to {paths.env_file} ({len(man.secrets)} of them secret)")
+        old = dict(instance.app_state or {})
+        name = posixpath.basename(run.release)
+        releases = dict(old.get("releases") or {})
+        releases[name] = sorted(set(releases.get(name) or []) | set(final.images))
+        known = list(dict.fromkeys([*app_known_projects(instance), *final.projects]))
+        # Only what cleanup needs is saved now (the images this release builds, every project the app may
+        # have containers in); the rest once the release is live, in the finish step.
+        await _save_instance(instance, app_state={**old, "releases": releases, "known_projects": known})
+        state = {
+            "manifest": man.to_json(), "routes": final.routes, "projects": final.projects,
+            "commands": final.commands, "images": final.images, "releases": releases, "known_projects": known,
+        }
+
+    if job.retry is not None and job.retry.reusable and await _images_exist(remote, final.images):
+        await steps.skip("build", f"Reusing the images from deployment {job.retry.id.hex[:8]}")
+    elif "build" in final.commands:
+        async with steps.step("build"):
+            await _run_commands(remote, instance, [app_command(run.release, final.commands["build"])], run, sink)
+    else:
+        await steps.skip("build", "slipway.yml has no build command")
+    run.built = True
+    async with steps.step("start"):
+        await _run_commands(remote, instance, [app_command(run.release, final.commands["start"])], run, sink)
+    return state
+
+
+def _image_list_command(releases: str) -> str:
+    return f"ls -1 {q(releases)} 2>/dev/null"
+
+
+async def _prune_app_images(remote: ssh.RemoteSession, instance: Instance, state: dict[str, Any], sink: LogSink) -> None:
+    """Remove the images of releases that are gone (never one a kept release also uses, nor one in use)."""
+    releases: dict[str, list[str]] = dict(state.get("releases") or {})
+    _, output = await remote.run(_image_list_command(paths_for(instance).releases), check=False, timeout=60)
+    present = {line.strip() for line in output.splitlines() if line.strip()}
+    kept = {name: refs for name, refs in releases.items() if name in present}
+    gone = sorted({ref for name, refs in releases.items() if name not in present for ref in refs}
+                  - {ref for refs in kept.values() for ref in refs})
+    gone = [ref for ref in gone if manifest.IMAGE_RE.match(ref)]
+    if gone:
+        # Without -f: an image a container still uses (another instance's, say) stays.
+        await remote.run(f"docker image rm {' '.join(q(r) for r in gone)} >/dev/null 2>&1; true", check=False, timeout=600)
+        await sink.line(f"Removed the images of old releases: {', '.join(gone)}")
+    if kept != releases:
+        state = {**state, "releases": kept}
+        await _save_instance(instance, app_state=state)
+
+
+def app_projects(instance: Instance) -> list[str]:
+    """The Compose projects the app's live release runs (status, logs, start and stop)."""
+    return [p for p in ((instance.app_state or {}).get("projects") or []) if manifest.PROJECT_RE.match(str(p))]
+
+
+def app_known_projects(instance: Instance) -> list[str]:
+    """Every Compose project the app's deploys used, failed ones included (teardown, leftovers, moves)."""
+    state = instance.app_state or {}
+    names = [*(state.get("projects") or []), *(state.get("known_projects") or [])]
+    return [p for p in dict.fromkeys(str(n) for n in names) if manifest.PROJECT_RE.match(p)]
+
+
+async def _check_projects_free(instance: Instance, projects: list[str]) -> None:
+    """Refuse project names another instance on the host uses: stop and delete would act on its containers."""
+    async with session_scope() as db:
+        others = (await db.scalars(select(Instance).where(
+            Instance.host_id == instance.host_id, Instance.id != instance.id))).all()
+    for other in others:
+        theirs = {other.compose_project, *app_known_projects(other)}
+        clash = sorted(set(projects) & theirs)
+        if clash:
+            raise DeployError(f"slipway.yml: the Compose project {', '.join(clash)} is also instance {other.name}'s on "
+                              f"{instance.host.name}; make the project names in slipway.yml include {{slipway.slug}}")
+
+
+def has_routes(instance: Instance) -> bool:
+    return bool(instance.routes or instance.proxy_entries or
+                (instance.build_source == BuildSource.APP and (instance.app_state or {}).get("routes")))
+
+
+# ------------------------------------------------------------------------ pipeline
 
 
 async def _pipeline(
-    deployment_id: uuid.UUID, job: _Job, sink: LogSink, connect: ConnectFactory, github: GitHubFactory
+    deployment_id: uuid.UUID, job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory, github: GitHubFactory
 ) -> CommitInfo:
     instance, branch = job.instance, job.branch
     repo, host = instance.repository, instance.host
     if job.env is None:
         raise DeployError(ENV_UNREADABLE)
     token, source = github_token_for(job.user)
-    await sink.line(f"Resolving {repo.full_name}@{branch} using {source}")
-    async with github(token) as gh:
-        await _check_repository(gh, repo, sink)
-        commit = await gh.get_commit(repo.github_id, branch)
-        if not _SHA_RE.match(commit.sha or ""):
-            raise DeployError(f"GitHub returned an invalid commit id for {branch}")
-        message = _fit(Deployment, "commit_message", commit.message or "")
-        author = _fit(Deployment, "commit_author", commit.author or "")
-        async with session_scope() as db:
-            await db.execute(
-                update(Deployment)
-                .where(Deployment.id == deployment_id)
-                .values(commit_sha=commit.sha, commit_message=message, commit_author=author or None)
-            )
-        await sink.line(f"Commit {commit.sha[:7]} — {message} ({author})")
+    reuse = job.retry is not None and job.retry.reusable
+    with tempfile.TemporaryDirectory(prefix="slipway-") as tmp:
+        tarball: Path | None = None
+        async with github(token) as gh:
+            async with steps.step("resolve"):
+                ref = job.retry.sha if job.retry is not None else branch
+                what = f"{repo.full_name}@{ref[:12] if job.retry is not None else ref}"
+                await sink.line(f"Resolving {what} using {source}"
+                                + (f" (the commit of deployment {job.retry.id.hex[:8]})" if job.retry else ""))
+                await _check_repository(gh, repo, sink)
+                commit = await gh.get_commit(repo.github_id, ref)
+                if not _SHA_RE.match(commit.sha or ""):
+                    raise DeployError(f"GitHub returned an invalid commit id for {ref}")
+                if job.retry is not None and commit.sha != job.retry.sha:
+                    raise DeployError("GitHub returned another commit than the one being retried")
+                message = _fit(Deployment, "commit_message", commit.message or "")
+                author = _fit(Deployment, "commit_author", commit.author or "")
+                async with session_scope() as db:
+                    await db.execute(
+                        update(Deployment)
+                        .where(Deployment.id == deployment_id)
+                        .values(commit_sha=commit.sha, commit_message=message, commit_author=author or None)
+                    )
+                await sink.line(f"Commit {commit.sha[:7]} — {message} ({author})")
+            if reuse:
+                await steps.skip("source", f"Reusing the release of deployment {job.retry.id.hex[:8]}")
+            else:
+                async with steps.step("source"):
+                    tarball = Path(tmp) / "source.tar.gz"
+                    size = await gh.download_tarball(repo.github_id, commit.sha, tarball)
+                    await sink.line(f"Downloaded source archive ({size / 1024:.0f} KiB)")
+                    await asyncio.to_thread(check_source_archive, tarball, guarded_paths(instance))
 
-        with tempfile.TemporaryDirectory(prefix="slipway-") as tmp:
-            tarball = Path(tmp) / "source.tar.gz"
-            size = await gh.download_tarball(repo.github_id, commit.sha, tarball)
-            await sink.line(f"Downloaded source archive ({size / 1024:.0f} KiB)")
-            await asyncio.to_thread(check_source_archive, tarball, guarded_paths(instance))
-
-            await sink.line(f"Connecting to {host.username}@{host.address}")
-            async with connect(ssh.SSHTarget.from_host(host)) as remote:
-                await _install(remote, instance, deployment_id, commit.sha, tarball, job.env, sink)
+        await sink.line(f"Connecting to {host.username}@{host.address}")
+        async with connect(ssh.SSHTarget.from_host(host)) as remote:
+            await _install(remote, instance, deployment_id, commit.sha, tarball, job, sink, steps)
     return commit
 
 
@@ -1512,26 +2017,36 @@ async def run_deployment(
         return
 
     sink = LogSink(deployment_id)
+    steps = Steps(deployment_id, job.steps, sink)
     try:
-        commit = await _pipeline(deployment_id, job, sink, connect, github)
+        commit = await _pipeline(deployment_id, job, sink, steps, connect, github)
     except asyncio.CancelledError:
         await sink.line("Deployment interrupted: Slipway is shutting down")
+        await steps.close()
         await sink.close()
         await _finish(deployment_id, DeploymentStatus.CANCELLED, error="Interrupted", short=True, status=InstanceStatus.FAILED)
         raise
     except Exception as exc:
         log.info("Deployment %s failed: %s", deployment_id, exc)
         await sink.line(f"Deployment failed: {exc}")
+        await steps.close()
         await sink.close()
         await _finish(deployment_id, DeploymentStatus.FAILED, error=str(exc), status=InstanceStatus.FAILED)
         return
-    if job.instance.routes or job.instance.proxy_entries:
+    if has_routes(job.instance):
+        await steps.begin("proxy")
         try:
             await switchyard.sync_and_store(job.instance, say=sink.line)
         except Exception as exc:  # the containers are running: a proxy problem never fails the deploy
             log.warning("Proxy sync after deployment %s failed: %s", deployment_id, exc)
             await sink.line(f"Proxy: could not update Switchyard: {exc}")
+            await steps.end("warning", note=str(exc)[:300])
+        else:
+            await steps.end("succeeded")
+    else:
+        await steps.skip("proxy", "No hostnames")
     await sink.line("Deployment succeeded")
+    await steps.close()
     await sink.close()
     await _finish(
         deployment_id,
@@ -1608,6 +2123,8 @@ class DeployRunner:
             ).all()
             for dep in stale:
                 dep.status = DeploymentStatus.FAILED
+                dep.steps = [{**r, "status": "failed", "note": "Interrupted"} if r.get("status") == "running" else r
+                             for r in dep.steps or []]
                 dep.error = "Interrupted by a Slipway restart"
                 dep.finished_at = utcnow()
                 if dep.instance.status == InstanceStatus.DEPLOYING:

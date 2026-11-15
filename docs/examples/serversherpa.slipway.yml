@@ -1,0 +1,69 @@
+# slipway.yml for ServerSherpa (BaseCampV3): copy to the root of the repository.
+#
+# One ServerSherpa environment on one Docker host, with its own PostgreSQL and
+# SeaweedFS (the db and storage stacks). deploy/stack/ss-stack does the work;
+# Slipway writes <instance folder>/shared/.env from deploy/stack/env.example and
+# runs ss-stack from the release.
+version: 1
+name: ServerSherpa
+env_file: deploy/stack/env.example
+placeholder: CHANGEME
+
+settings:
+  STACK_DOMAIN:
+    label: Base domain
+    help: The public names are <service>.<base domain>, such as portal.uat.serversherpa.com.
+    example: uat.serversherpa.com
+    required: true
+  STACK_PROXY_IP:
+    label: Proxy address
+    help: The LAN address of Switchyard. Containers reach the public names through it, and the API trusts X-Forwarded-For only from it.
+    example: 10.10.48.20
+    required: true
+  SS_LOG_LEVEL:
+    label: Log level
+    default: INFO
+
+vars:
+  STACK_ENV: "{slipway.slug}"
+  STACK_REPO_DIR: "{slipway.release}"
+  STACK_IMAGE_TAG: "{slipway.sha12}"
+
+secrets:
+  POSTGRES_PASSWORD: hex
+  SPACES_SECRET_KEY: hex
+  SS_JWT_SECRET: hex
+  SS_TOTP_ENCRYPTION_KEY: fernet
+  SS_PASSWORD_PEPPER: hex
+  SS_WIKI_SERVICE_TOKEN: hex
+
+services:
+  api:     {port: 8000, port_var: STACK_API_PORT,     hostname: "api.{STACK_DOMAIN}"}
+  portal:  {port: 8091, port_var: STACK_PORTAL_PORT,  hostname: "portal.{STACK_DOMAIN}"}
+  spaces:  {port: 9000, port_var: STACK_SPACES_PORT,  hostname: "spaces.{STACK_DOMAIN}"}
+  kiosk:   {port: 8090, port_var: STACK_KIOSK_PORT,   hostname: "kiosk.{STACK_DOMAIN}", optional: true}
+  wiki:    {port: 8096, port_var: STACK_WIKI_PORT,    hostname: "wiki.{STACK_DOMAIN}", optional: true}
+  status:  {port: 8095, port_var: STACK_STATUS_PORT,  hostname: "status.{STACK_DOMAIN}", optional: true}
+  mailpit: {port: 8025, port_var: STACK_MAILPIT_PORT, optional: true}
+
+optional_services: {var: STACK_APPS, none: none}
+
+projects:
+  - "ss-{STACK_ENV}-db"
+  - "ss-{STACK_ENV}-storage"
+  - "ss-{STACK_ENV}-api"
+  - "ss-{STACK_ENV}-web"
+  - "ss-{STACK_ENV}-status"
+
+# What ss-stack build makes for a release; Slipway removes them with the release.
+images:
+  - "serversherpa-api:{STACK_IMAGE_TAG}"
+  - "serversherpa-portal:{STACK_IMAGE_TAG}"
+  - "serversherpa-kiosk:{STACK_IMAGE_TAG}"
+  - "serversherpa-wiki:{STACK_IMAGE_TAG}"
+  - "serversherpa-status:{STACK_IMAGE_TAG}"
+
+commands:
+  build: [deploy/stack/ss-stack, build, "{slipway.env_dir}"]
+  start: [deploy/stack/ss-stack, up, "{slipway.env_dir}"]
+  stop:  [deploy/stack/ss-stack, down, "{slipway.env_dir}"]
