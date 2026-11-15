@@ -90,7 +90,7 @@ def _plan(man: manifest.Manifest, **kw) -> manifest.AppPlan:
 def test_the_serversherpa_example_parses():
     man = manifest.parse(EXAMPLE)
     assert man.name == "ServerSherpa" and man.env_file == "deploy/stack/env.example"
-    assert [s.name for s in man.optional_services] == ["kiosk", "wiki", "status", "mailpit"]
+    assert [s.name for s in man.optional_services] == ["kiosk", "wiki", "learn", "status", "mailpit"]
     assert {s.key: s.kind for s in man.secrets}["SS_TOTP_ENCRYPTION_KEY"] == "fernet"
     assert man.commands["start"] == ("deploy/stack/ss-stack", "up", "{slipway.env_dir}")
 
