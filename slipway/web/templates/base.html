@@ -6,11 +6,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Slipway{% endblock %} · Slipway</title>
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/css/slipway.css?v={{ version }}">
-  <script src="/static/js/theme.js?v={{ version }}"></script>
-  <script src="/static/js/slipway.js?v={{ version }}" defer></script>
+  <link rel="icon" href="/static/img/favicon.svg?v={{ asset_version() }}" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png?v={{ asset_version() }}">
+  <link rel="stylesheet" href="/static/css/slipway.css?v={{ asset_version() }}">
+  <script src="/static/js/theme.js?v={{ asset_version() }}"></script>
+  <script src="/static/js/slipway.js?v={{ asset_version() }}" defer></script>
 </head>
 <body>
 {% block body %}
