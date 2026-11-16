@@ -16,7 +16,7 @@ from slipway.api.deps import DB, Auth, not_found, require
 from slipway.core.permissions import Perm
 from slipway.models import Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
 from slipway.schemas import BRANCH_MAX, ActionOut, DeploymentOut, InstanceCreate, InstanceOut, InstanceUpdate
-from slipway.services import audit, deployer, ssh
+from slipway.services import audit, deployer, ssh, switchyard
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/instances", tags=["instances"])
@@ -38,6 +38,18 @@ ENV_UNREADABLE = (
     "Add the old key after the new one (comma-separated) and run `slipway rotate-encryption-key` to recover them, "
     "or re-enter them on the instance, or clear them"
 )
+
+
+async def _check_hostnames(db: AsyncSession, routes: list[Any] | None, instance_id: uuid.UUID | None) -> None:
+    """Answer 409 when another instance already has one of these hostnames."""
+    wanted = {r.hostname for r in routes or []}
+    if not wanted:
+        return
+    others = (await db.execute(select(Instance.name, Instance.routes).where(Instance.id != instance_id))).all()
+    for name, other_routes in others:
+        taken = wanted & {r.get("hostname") for r in other_routes or []}
+        if taken:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{sorted(taken)[0]} is already a hostname of instance {name}")
 
 
 async def _get(db: DB, instance_id: uuid.UUID) -> Instance:
@@ -145,6 +157,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     if await db.scalar(select(Instance).where(Instance.slug == slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"An instance named '{slug}' already exists")
+    await _check_hostnames(db, body.routes, None)
     if not body.branch and not repo.default_branch_usable:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -167,6 +180,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         volumes=[v.model_dump() for v in body.volumes or []],
         auto_ports=True if body.auto_ports is None else body.auto_ports,
         port_overrides=[o.model_dump() for o in body.port_overrides or []],
+        routes=[r.model_dump() for r in body.routes or []],
         status=InstanceStatus.CREATED,
         created_by_id=ctx.user.id,
     )
@@ -245,6 +259,9 @@ async def _apply_update(
         instance.auto_ports = body.auto_ports
     if body.port_overrides is not None:
         instance.port_overrides = [o.model_dump() for o in body.port_overrides]
+    if body.routes is not None:
+        await _check_hostnames(db, body.routes, instance.id)
+        instance.routes = [r.model_dump() for r in body.routes]
     changed = sorted(k for k in data if k not in ("env", "clear_env"))
     # Stored values that can't be decrypted are kept, since the old key may still recover them, and the
     # deploy guard keeps refusing to run without them. Only re-entered variables (a non-empty env) or
@@ -284,6 +301,8 @@ async def delete_instance(instance_id: uuid.UUID, ctx: Writer, request: Request,
                     raise HTTPException(
                         status.HTTP_502_BAD_GATEWAY, f"{exc}. Retry, or delete with purge=false to keep the host untouched."
                     ) from exc
+            if instance.proxy_entries:
+                warning = " ".join(filter(None, [warning, await _remove_proxy_entries(instance)])) or None
             summary = f"Deleted instance {instance.name}" + (f". {warning}" if warning else "")
             audit.record(
                 db, "instance.delete", actor=ctx.user, target=instance, summary=summary,
@@ -296,6 +315,47 @@ async def delete_instance(instance_id: uuid.UUID, ctx: Writer, request: Request,
     if warning:
         return JSONResponse({"ok": True, "warning": warning})
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def _remove_proxy_entries(instance: Instance) -> str | None:
+    """Remove the instance's hostnames from Switchyard; a warning when that did not fully work."""
+    problems: list[str] = []
+
+    async def say(line: str) -> None:
+        if "removed" not in line and "applied" not in line:
+            problems.append(line.removeprefix("Proxy: "))
+
+    try:
+        left = await switchyard.sync(instance, say=say, remove_all=True)
+    except Exception as exc:  # never block deleting the instance on the proxy
+        return f"Its hostnames could not be removed from Switchyard ({exc}); remove them there"
+    problems += [f"{e['hostname']}: {e['message']}" for e in left if e.get("state") == "error"]
+    if not problems:
+        return None
+    return "Switchyard: " + "; ".join(dict.fromkeys(problems))
+
+
+@router.post("/{instance_id}/proxy/sync")
+async def sync_proxy(instance_id: uuid.UUID, ctx: Writer, request: Request, db: DB) -> dict[str, Any]:
+    """Publish the instance's hostnames in Switchyard now, as a deploy does at its end."""
+    instance = await _get(db, instance_id)
+    if instance.status == InstanceStatus.CREATED and not instance.proxy_entries:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Deploy the instance first: its ports are not published yet")
+    await db.commit()  # release the DB connection during the HTTP calls
+    lines: list[str] = []
+
+    async def say(line: str) -> None:
+        lines.append(line)
+
+    entries = await switchyard.sync_and_store(instance, say=say)
+    audit.record(db, "instance.proxy_sync", actor=ctx.user, target=instance,
+                 summary=f"Synced hostnames of {instance.name} with Switchyard", details={"log": lines[:50]}, request=request)
+    await db.commit()
+    out: dict[str, Any] = {"ok": all(e["state"] != "error" for e in entries), "entries": entries, "log": lines}
+    problems = [f"{e['hostname']}: {e['message']}" for e in entries if e["state"] != "live"]
+    if problems:
+        out["warning"] = "; ".join(problems)
+    return out
 
 
 @router.post("/{instance_id}/deploy", status_code=202)

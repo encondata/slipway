@@ -45,7 +45,7 @@ import time
 import uuid
 import zlib
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,8 +55,8 @@ from sqlalchemy import func, select, update
 
 from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
-from slipway.models import BuildSource, Deployment, DeploymentStatus, Instance, InstanceStatus, Repository, User
-from slipway.services import ports, ssh
+from slipway.models import BuildSource, Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
+from slipway.services import ports, ssh, switchyard
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 
@@ -546,11 +546,7 @@ def discard_command(instance: Instance, release_dir: str, upload: str) -> str:
 
 
 def remove_dir_command(instance: Instance) -> str:
-    paths = paths_for(instance)
-    return (
-        f"rm -rf -- {q(paths.base)} 2>/dev/null || {_root_rm(q(paths.root), q(instance.slug))}; "
-        f"test ! -e {q(paths.base)}"
-    )
+    return _remove_base_command(paths_for(instance))
 
 
 def _claim_dir_inside(instance: Instance, directory: str) -> bool:
@@ -579,6 +575,197 @@ async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_sess
         return None
     detail = clean_text(output.strip().splitlines()[-1])[:200] if output.strip() else ""
     return f"Could not remove {paths.base} on {instance.host.name}; delete it by hand" + (f" ({detail})" if detail else "")
+
+
+# ------------------------------------------------------------ moving the deploy root
+#
+# A host's deploy root can change while instances are deployed on it. Slipway copies each
+# instance's directory to the new root, points the symbolic links it made there (``current``
+# and each release's ``.env``) at the copy, saves the new root, then removes the old directory
+# unless a container still bind-mounts files from it. Containers keep running throughout:
+# Compose finds them by project name, the environment was read when they were created, and
+# named volumes are not touched.
+
+MOVE_MARK = "slipway-move:"
+
+
+def _inside(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + "/")
+
+
+def check_move(instances: list[Instance], old_root: str, new_root: str) -> None:
+    """Raise DeployError when the instances' directories can't move from ``old_root`` to ``new_root``."""
+    for inst in instances:
+        old, new = InstancePaths(old_root, inst.slug).base, InstancePaths(new_root, inst.slug).base
+        if _inside(new, old) or _inside(old, new):
+            raise DeployError(f"{new_root} overlaps {old}, which holds {inst.name}; choose a folder outside it")
+        if _claim_dir_inside(inst, old) or _claim_dir_inside(inst, new):
+            raise DeployError(
+                f"The directory {inst.name} was claimed from overlaps {old} or {new}; choose another folder"
+            )
+
+
+def _moving(paths: InstancePaths) -> str:
+    """Where an instance's directory is copied before it gets its final name."""
+    return f"{paths.root}/.{paths.slug}.moving"
+
+
+def move_prepare_command(new_root: str, slugs: list[str]) -> str:
+    """Create the new root and check nothing is in the way; on failure prints a MOVE_MARK line."""
+    r = q(new_root)
+    parts = [f"mkdir -p -- {r} 2>/dev/null; [ -d {r} ] && [ -w {r} ] || {{ echo {q(MOVE_MARK + ' not-writable')}; exit 1; }}"]
+    for slug in slugs:
+        base = f"{new_root}/{slug}"
+        parts.append(f"if [ -e {q(base)} ] || [ -L {q(base)} ]; then echo {q(f'{MOVE_MARK} exists {base}')}; exit 1; fi")
+    return "; ".join(parts)
+
+
+def move_copy_command(old: InstancePaths, new: InstancePaths) -> str:
+    """Copy the instance's directory next to its new place and re-point the links into it.
+
+    Prints ``slipway-move: absent`` when there is nothing to copy (Unraid, for one, clears /opt
+    when it restarts). Files containers wrote as root are copied through a throwaway container.
+    """
+    name = posixpath.basename(_moving(new))
+    in_docker = (
+        f"docker run --rm --network none -v {q(old.root)}:/o:ro -v {q(new.root)}:/n {CLEANUP_IMAGE} "
+        f"sh -c {q(f'rm -rf /n/{name} && cp -a /o/{old.slug} /n/{name}')}"
+    )
+    return (
+        f"old={q(old.base)}; new={q(new.base)}; tmp={q(_moving(new))}; "
+        f'if [ ! -e "$old" ]; then echo {q(MOVE_MARK + " absent")}; exit 0; fi; '
+        f'rm -rf -- "$tmp" 2>/dev/null; '
+        f'{{ {{ [ ! -e "$tmp" ] && cp -a -- "$old" "$tmp" 2>/dev/null; }} || {in_docker}; }} && '
+        f'find "$tmp" -type l | {{ ok=0; while IFS= read -r l; do '
+        f'lt=$(readlink "$l") || {{ ok=1; continue; }}; '
+        f'case "$lt" in "$old"|"$old"/*) ln -sfn -- "$new${{lt#"$old"}}" "$l" || ok=1;; esac; '
+        f"done; exit $ok; }}"
+    )
+
+
+def move_discard_command(new: InstancePaths) -> str:
+    """Remove a copy (finished or not) made by a move that did not go through."""
+    root, tmp = q(new.root), posixpath.basename(_moving(new))
+    return (
+        f"rm -rf -- {q(_moving(new))} {q(new.base)} 2>/dev/null || "
+        f"{{ {_root_rm(root, q(tmp))}; {_root_rm(root, q(new.slug))}; }}"
+    )
+
+
+def bind_sources_command(instance: Instance) -> str:
+    """Prints the host path of each bind mount of the instance's containers. Fails when docker can't list them."""
+    fmt = '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}'
+    lists = [
+        f"docker ps -aq --filter {q('label=' + _label(instance))}",
+        f"docker ps -aq --filter {q('label=com.docker.compose.project=' + instance.compose_project)}",
+    ]
+    if instance.claimed_container:
+        lists.append(f"docker ps -aq --filter id={_claimed_id(instance)}")
+    return (
+        f"ids=$({' && '.join(lists)}) && "
+        f"{{ [ -z \"$ids\" ] || printf '%s\\n' \"$ids\" | sort -u | xargs docker container inspect -f {q(fmt)}; }}"
+    )
+
+
+def _remove_base_command(paths: InstancePaths) -> str:
+    return (
+        f"rm -rf -- {q(paths.base)} 2>/dev/null || {_root_rm(q(paths.root), q(paths.slug))}; "
+        f"test ! -e {q(paths.base)}"
+    )
+
+
+def _last_line(output: str) -> str:
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    return clean_text(lines[-1].strip())[:200] if lines else ""
+
+
+async def move_deploy_root(
+    host: Host,
+    instances: list[Instance],
+    new_root: str,
+    *,
+    save: Callable[[], Awaitable[None]],
+    connect: ConnectFactory = ssh.open_session,
+) -> list[str]:
+    """Move the instances' directories from the host's deploy root to ``new_root``.
+
+    ``save`` stores the new root; it runs once every copy is in place. If anything fails before
+    that, the copies are removed again and nothing changed. Returns notes for the user: old
+    directories that had to stay, or instances that had no files to move.
+    """
+    old_root, new_root = clean_deploy_root(host.deploy_root), clean_deploy_root(new_root)
+    check_move(instances, old_root, new_root)
+    moves = [(inst, InstancePaths(old_root, inst.slug), InstancePaths(new_root, inst.slug)) for inst in instances]
+    notes: list[str] = []
+    async with connect(ssh.SSHTarget.from_host(host)) as remote:
+        status, output = await remote.run(
+            move_prepare_command(new_root, [inst.slug for inst in instances]), check=False, timeout=60
+        )
+        if status:
+            if f"{MOVE_MARK} not-writable" in output:
+                raise DeployError(
+                    f"Slipway can't create or write to {new_root} on {host.name} as {host.username}. On the host, run: "
+                    f"sudo mkdir -p {q(new_root)} && sudo chown {q(host.username)} {q(new_root)}"
+                )
+            taken = next((line.split(" exists ", 1)[1] for line in output.splitlines() if f"{MOVE_MARK} exists " in line), "")
+            raise DeployError(
+                f"{taken or 'A folder Slipway needs'} already exists on {host.name}; remove it or choose another folder"
+            )
+
+        async def discard() -> None:
+            for _, _, new in moves:
+                try:
+                    await remote.run(move_discard_command(new), check=False, timeout=600)
+                except Exception as exc:  # best effort: the move already failed
+                    log.warning("Could not remove %s after a failed move: %s", new.base, exc)
+
+        copied: list[tuple[Instance, InstancePaths, InstancePaths]] = []
+        try:
+            for inst, old, new in moves:
+                status, output = await remote.run(move_copy_command(old, new), check=False, timeout=3600)
+                if status:
+                    detail = _last_line(output)
+                    raise DeployError(
+                        f"Could not copy {old.base} to {new_root} on {host.name}"
+                        + (f" ({detail})" if detail else "") + ". Nothing was changed."
+                    )
+                if f"{MOVE_MARK} absent" in output:
+                    notes.append(f"{old.base} was not on {host.name}, so {inst.name} had no files to move; "
+                                 "its next deployment creates them.")
+                else:
+                    copied.append((inst, old, new))
+            if copied:
+                command = " && ".join(f"mv -- {q(_moving(new))} {q(new.base)}" for _, _, new in copied)
+                status, output = await remote.run(command, check=False, timeout=120)
+                if status:
+                    detail = _last_line(output)
+                    raise DeployError(f"Could not move the copies into {new_root}" + (f" ({detail})" if detail else "")
+                                      + ". Nothing was changed.")
+            await save()
+        except BaseException:
+            await discard()
+            raise
+
+        # The new root is saved: from here on, failures only leave old files behind.
+        for inst, old, _ in copied:
+            try:
+                status, output = await remote.run(bind_sources_command(inst), check=False, timeout=60)
+                if status:
+                    notes.append(f"Kept {old.base}: Docker could not say whether {inst.name}'s containers use it. "
+                                 f"Delete it once {inst.name} is redeployed.")
+                    continue
+                if any(_inside(line.strip(), old.base) for line in output.splitlines() if line.strip()):
+                    notes.append(f"Kept {old.base}: {inst.name}'s containers mount files from it. "
+                                 f"Redeploy {inst.name}, then delete {old.base}.")
+                    continue
+                status, output = await remote.run(_remove_base_command(old), check=False, timeout=600)
+            except (ssh.SSHError, DeployError) as exc:
+                notes.append(f"Could not remove {old.base} ({exc}); delete it by hand.")
+                continue
+            if status:
+                detail = _last_line(output)
+                notes.append(f"Could not remove {old.base}; delete it by hand" + (f" ({detail})." if detail else "."))
+    return notes
 
 
 # ------------------------------------------------------------------ source archive
@@ -1176,6 +1363,12 @@ async def run_deployment(
         await sink.close()
         await _finish(deployment_id, DeploymentStatus.FAILED, error=str(exc), status=InstanceStatus.FAILED)
         return
+    if job.instance.routes or job.instance.proxy_entries:
+        try:
+            await switchyard.sync_and_store(job.instance, say=sink.line)
+        except Exception as exc:  # the containers are running: a proxy problem never fails the deploy
+            log.warning("Proxy sync after deployment %s failed: %s", deployment_id, exc)
+            await sink.line(f"Proxy: could not update Switchyard: {exc}")
     await sink.line("Deployment succeeded")
     await sink.close()
     await _finish(

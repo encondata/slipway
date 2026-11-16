@@ -413,20 +413,13 @@ async def test_public_key_comment_is_safe_for_the_setup_snippet(admin_client, co
 # ------------------------------------------------------------------ host edits
 
 
-async def test_deploy_root_change_refused_once_an_instance_was_deployed(admin_client):
+async def test_deploy_root_change_is_a_plain_setting_before_any_deploy(admin_client):
     repo_id = await _seed_repo()
     host = (await admin_client.post("/api/v1/hosts", json={"name": "a", "hostname": "10.0.0.5", "username": "deploy"})).json()
     r = await admin_client.post("/api/v1/instances", json={"name": "web", "repository_id": repo_id, "host_id": host["id"], "deploy": False})
     assert r.status_code == 201, r.text
     url = f"/api/v1/hosts/{host['id']}"
     assert (await admin_client.patch(url, json={"deploy_root": "/srv/slipway"})).json()["deploy_root"] == "/srv/slipway"
-
-    async with get_sessionmaker()() as db:
-        await db.execute(update(Instance).values(status="failed"))  # a deploy ran and may have left files behind
-        await db.commit()
-    r = await admin_client.patch(url, json={"deploy_root": "/opt/slipway"})
-    assert r.status_code == 400 and "deploy root" in r.json()["detail"]
-    assert (await admin_client.get(url)).json()["deploy_root"] == "/srv/slipway"
     assert (await admin_client.patch(url, json={"deploy_root": "/srv/slipway/", "description": "x"})).status_code == 200
 
 

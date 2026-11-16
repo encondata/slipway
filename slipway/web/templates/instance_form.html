@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, meter, empty %}
-{% from "_instance_rows.html" import port_row, volume_row %}
+{% from "_instance_rows.html" import port_row, volume_row, route_row %}
 {% set editing = instance is not none %}
 {% set paths_locked = paths_locked if paths_locked is defined else locked %}
 {% block title %}{{ "Edit " ~ instance.name if editing else "Create Instance" }}{% endblock %}
@@ -188,6 +188,19 @@
           <input type="checkbox" name="auto_ports" {{ 'checked' if not editing or instance.auto_ports }}>
           <span><strong>Use the next free port when a host port is taken</strong><br><span class="subtle">Before starting anything, Slipway checks the host's ports in use, including ports of other Slipway instances. A taken port moves to the next free one, and Slipway keeps using it on later deploys. When this is off, the deploy stops before it changes anything.</span></span>
         </label>
+        <div class="field">
+          <span class="label-text">Hostnames <span class="subtle">(published in Switchyard)</span></span>
+          {% if not switchyard_configured %}
+          <div class="callout warning">{{ icon("alert") }}<span>Switchyard is not set up yet{% if auth.can(Perm.SETTINGS_WRITE) %} (<a href="/settings/integrations">Settings → Integrations</a>){% else %}; ask an administrator to connect it under Settings → Integrations{% endif %}. Hostnames are saved and published once it is.</span></div>
+          {% endif %}
+          <div class="repeater" id="route-rep" data-repeater="routes" data-min-keys="2">
+            {% for r in (instance.routes if editing else []) %}{{ route_row(r, default_tls) }}{% endfor %}
+            <template>{{ route_row(None, default_tls) }}</template>
+          </div>
+          <datalist id="route-services">{% for s in ((instance.published_ports if editing else [])|map(attribute="service")|reject("none")|unique) %}<option>{{ s }}</option>{% endfor %}</datalist>
+          <div><button class="btn btn-sm" type="button" data-add-row="#route-rep">{{ icon("plus", "i-sm") }} Add hostname</button></div>
+          <span class="help">Each hostname gets a proxy host in Switchyard that sends traffic to this host's address on the port the container port is published on, and follows that port if Slipway moves it. For compose, name the service; for a Dockerfile instance leave it empty. Slipway updates Switchyard at the end of every successful deploy{% if editing %}, or now with <strong>Sync proxy</strong> on the instance page{% endif %}.</span>
+        </div>
       </div>
     </section>
   </div>
@@ -204,6 +217,7 @@
         <dt>{{ icon("key", "i-sm") }} Environment</dt><dd data-preview="env">—</dd>
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd data-preview="ports">—</dd>
         <dt>{{ icon("database", "i-sm") }} Volumes</dt><dd data-preview="volumes">—</dd>
+        <dt>{{ icon("globe", "i-sm") }} Hostnames</dt><dd data-preview="hostnames">—</dd>
       </dl>
       {% if editing %}
       <button class="btn btn-primary btn-lg btn-block" type="submit">{{ icon("check") }} Save changes</button>

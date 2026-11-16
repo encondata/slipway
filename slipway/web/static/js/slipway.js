@@ -107,6 +107,7 @@
       if (btn.dataset.success) {
         btn.dataset.then === "reload" ? flashAfterReload(btn.dataset.success) : toast(btn.dataset.success);
       }
+      if (btn.dataset.successField && data && data[btn.dataset.successField]) toast(data[btn.dataset.successField]);
       // e.g. DELETE /instances/{id} returns {ok, warning} when files had to be left on the host.
       if (data && data.warning) {
         btn.dataset.then ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
@@ -193,6 +194,7 @@
     omitUnchanged(form, body);
     if (submit && submit.name) body[submit.name] = submit.value === "true" ? true : submit.value === "false" ? false : submit.value;
     setLoading(submit, true);
+    formError(form, "");
     try {
       const data = await api(method, url, body);
       form.dispatchEvent(new CustomEvent("slipway:success", { detail: data, bubbles: true }));
@@ -210,11 +212,35 @@
       if (data && data.warning) leaving ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
       then(form.dataset.then, data);
     } catch (err) {
-      toast(err.message, "error");
+      if (!formError(form, err.message)) toast(err.message, "error");
     } finally {
       setLoading(submit, false);
     }
   });
+
+  // A modal dialog covers the toasts, so a form in one shows its error inside the dialog.
+  // Returns whether it did.
+  function formError(form, message) {
+    const dlg = form.closest("dialog");
+    let box = $("[data-form-error]", form);
+    if (!message) {
+      if (box) box.remove();
+      return false;
+    }
+    if (!dlg || !dlg.open) return false;
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "callout error";
+      box.setAttribute("role", "alert");
+      box.dataset.formError = "";
+      const body = $(".modal-body", form) || form;
+      body.prepend(box);
+    }
+    box.textContent = message;
+    box.style.whiteSpace = "pre-line";
+    box.scrollIntoView({ block: "nearest" });
+    return true;
+  }
 
   // --------------------------------------------------------- repeaters
   document.addEventListener("click", (ev) => {
@@ -247,7 +273,7 @@
     const opener = ev.target.closest("[data-open]");
     if (opener) {
       const dlg = document.getElementById(opener.dataset.open);
-      if (dlg) { dlg.showModal(); const f = $("input:not([type=hidden]), textarea, select", dlg); if (f) f.focus(); }
+      if (dlg) { $$("[data-form-error]", dlg).forEach((el) => el.remove()); dlg.showModal(); const f = $("input:not([type=hidden]), textarea, select", dlg); if (f) f.focus(); }
     }
     const closer = ev.target.closest("[data-close]");
     if (closer) closer.closest("dialog").close();
@@ -530,6 +556,7 @@
       set("env", Object.keys(data.env || {}).length + " variable(s)");
       const overrides = (data.port_overrides || []).map((o) => `${o.service} ${o.host} → ${o.container}`);
       set("ports", compose ? (overrides.length ? `Compose file, with ${overrides.join(", ")}` : "Defined by compose file") : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");
+      set("hostnames", (data.routes || []).map((r) => `${r.hostname} → ${r.service ? r.service + ":" : ""}${r.container || "?"}`).join(", ") || "None");
       set("volumes", compose ? "Defined by compose file" : (data.volumes || []).map((v) => `${v.source} → ${v.target}`).join(", ") || "None");
     };
     form.addEventListener("input", update);

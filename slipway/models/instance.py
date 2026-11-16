@@ -75,6 +75,13 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     # first successful deploy (``replaced``), a claimed standalone container is reached by its id.
     claim: Mapped[dict[str, Any] | None] = mapped_column()
 
+    # Hostnames the reverse proxy (Switchyard) sends to this instance:
+    # [{hostname, service (compose; None in Dockerfile mode), container, tls_mode}].
+    routes: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+    # What the last proxy sync left in Switchyard, one per hostname:
+    # [{hostname, switchyard_id, upstream, state: "live" | "staged" | "error", message, synced_at}].
+    proxy_entries: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+
     status: Mapped[str] = mapped_column(String(16), default=InstanceStatus.CREATED)
     current_commit_sha: Mapped[str | None] = mapped_column(String(40))
     last_deployed_at: Mapped[datetime | None]

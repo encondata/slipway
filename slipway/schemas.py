@@ -11,7 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, fie
 
 from slipway.core.permissions import validate_permissions
 from slipway.models import Deployment, Host, Instance, Repository, User
-from slipway.services import deployer, ports
+from slipway.services import deployer, ports, switchyard
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -193,6 +193,7 @@ class HostOut(Out):
     environment: str
     description: str
     deploy_root: str
+    proxy_address: str | None = None
     auth_method: str
     public_key: str | None
     host_key_fingerprint: str | None
@@ -212,6 +213,8 @@ class _HostFields(BaseModel):
     environment: Annotated[str, Field(max_length=32), NoNul] | None = None
     description: Annotated[str, Field(max_length=255), NoNul] | None = None
     deploy_root: Annotated[str, Field(max_length=255), NoNul] | None = None
+    # Address the reverse proxy uses for this host's ports; "" clears it (then the hostname is used).
+    proxy_address: Annotated[str, Field(max_length=255, pattern=r"^$|^[A-Za-z0-9.\-]+$|^\[[0-9A-Fa-f:.]+\]$"), NoNul] | None = None
     private_key: Annotated[str, Field(max_length=20000), NoNul] | None = None
     key_passphrase: str | None = Field(None, max_length=500)
     password: str | None = Field(None, max_length=500)
@@ -297,6 +300,25 @@ class PortOverride(BaseModel):
     auto: bool = False  # chosen by Slipway because the port was taken
 
 
+class Route(BaseModel):
+    """A hostname the reverse proxy sends to one of the instance's published ports."""
+
+    hostname: Str = Field(min_length=1, max_length=253)
+    service: Annotated[str, Field(max_length=128, pattern=r"^$|" + ports.SERVICE_RE.pattern), NoNul] | None = None
+    container: int = Field(ge=1, le=65535)
+    tls_mode: Literal["auto", "dns", "internal", "off"] = "auto"
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str) -> str:
+        return switchyard.clean_hostname(v)
+
+    @field_validator("service")
+    @classmethod
+    def _service(cls, v: str | None) -> str | None:
+        return v or None
+
+
 class VolumeMapping(BaseModel):
     source: Str = Field(min_length=1, max_length=255)
     target: Str = Field(min_length=1, max_length=255)
@@ -329,6 +351,17 @@ class _InstanceFields(BaseModel):
     volumes: list[VolumeMapping] | None = Field(None, max_length=100)
     auto_ports: bool | None = None
     port_overrides: list[PortOverride] | None = Field(None, max_length=100)
+    routes: list[Route] | None = Field(None, max_length=20)
+
+    @field_validator("routes")
+    @classmethod
+    def _one_route_per_hostname(cls, v: list[Route] | None) -> list[Route] | None:
+        seen = set()
+        for r in v or []:
+            if r.hostname in seen:
+                raise ValueError(f"{r.hostname} is listed twice")
+            seen.add(r.hostname)
+        return v
 
     @field_validator("port_overrides")
     @classmethod
@@ -397,6 +430,8 @@ class InstanceOut(Out):
     published_ports: list[dict[str, Any]]
     # The compose project name Slipway uses (a claimed project keeps its own).
     compose_project: str
+    routes: list[dict[str, Any]] = []
+    proxy_entries: list[dict[str, Any]] = []
     # What the instance was claimed from, when it was claimed (see POST /hosts/{id}/claim).
     claim: dict[str, Any] | None = None
     status: str
@@ -428,6 +463,8 @@ class InstanceOut(Out):
             port_overrides=i.port_overrides or [],
             published_ports=i.published_ports or [],
             compose_project=i.compose_project,
+            routes=i.routes or [],
+            proxy_entries=i.proxy_entries or [],
             claim=i.claim,
             status=i.status,
             current_commit_sha=i.current_commit_sha,

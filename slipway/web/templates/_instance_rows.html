@@ -21,3 +21,17 @@
   <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
 </div>
 {%- endmacro %}
+
+{% macro route_row(r=None, default_tls="auto") -%}
+{% set tls = r.tls_mode if r else default_tls %}
+<div class="repeater-row route">
+  <input class="input mono" data-f="hostname" value="{{ r.hostname if r else '' }}" placeholder="app.example.com" aria-label="Hostname" autocapitalize="off" spellcheck="false">
+  <span class="arrow">→</span>
+  <input class="input mono" data-f="service" value="{{ r.service if r and r.service else '' }}" placeholder="service (compose)" aria-label="Compose service" list="route-services">
+  <input class="input" data-f="container" type="number" min="1" max="65535" value="{{ r.container if r else '' }}" placeholder="Container port" aria-label="Container port">
+  <select class="input" data-f="tls_mode" aria-label="Certificate">
+    {% for value, label in [("auto", "Let's Encrypt"), ("dns", "DNS challenge"), ("internal", "Internal CA"), ("off", "No TLS")] %}<option value="{{ value }}" {{ 'selected' if tls == value }}>{{ label }}</option>{% endfor %}
+  </select>
+  <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+</div>
+{%- endmacro %}
