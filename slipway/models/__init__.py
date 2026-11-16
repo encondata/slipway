@@ -1,8 +1,27 @@
 """Import every model so ``Base.metadata`` is complete (Alembic and create_all rely on this)."""
 
 from slipway.models.audit import AuditEvent
+from slipway.models.data import (
+    Backup,
+    BackupReason,
+    BackupStatus,
+    FirstAdmin,
+    FirstAdminMode,
+    FirstAdminStatus,
+    Snapshot,
+    SnapshotOrigin,
+    SnapshotStatus,
+)
 from slipway.models.host import Host, HostAuthMethod, HostStatus
-from slipway.models.instance import BuildSource, Deployment, DeploymentStatus, Instance, InstanceStatus
+from slipway.models.instance import (
+    BuildSource,
+    Deployment,
+    DeploymentKind,
+    DeploymentStatus,
+    FreshData,
+    Instance,
+    InstanceStatus,
+)
 from slipway.models.repository import Repository
 from slipway.models.setting import AppSetting
 from slipway.models.user import ApiToken, OAuthAccount, Role, User, UserSession, user_roles
@@ -11,9 +30,17 @@ __all__ = [
     "ApiToken",
     "AppSetting",
     "AuditEvent",
+    "Backup",
+    "BackupReason",
+    "BackupStatus",
     "BuildSource",
     "Deployment",
+    "DeploymentKind",
     "DeploymentStatus",
+    "FirstAdmin",
+    "FirstAdminMode",
+    "FirstAdminStatus",
+    "FreshData",
     "Host",
     "HostAuthMethod",
     "HostStatus",
@@ -22,6 +49,9 @@ __all__ = [
     "OAuthAccount",
     "Repository",
     "Role",
+    "Snapshot",
+    "SnapshotOrigin",
+    "SnapshotStatus",
     "User",
     "UserSession",
     "user_roles",

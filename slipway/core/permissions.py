@@ -28,6 +28,12 @@ class Perm(StrEnum):
     LOGS_READ = "logs:read"
     AUDIT_READ = "audit:read"
     SETTINGS_WRITE = "settings:write"
+    DATA_READ = "data:read"
+    DATA_BACKUP = "data:backup"
+    DATA_RESTORE = "data:restore"
+    DATA_RESET = "data:reset"
+    SNAPSHOTS_UPLOAD = "snapshots:upload"
+    SNAPSHOTS_DOWNLOAD = "snapshots:download"
 
 
 PERMISSION_DESCRIPTIONS: dict[str, str] = {
@@ -54,6 +60,24 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
     Perm.LOGS_READ: "View platform and application logs",
     Perm.AUDIT_READ: "View the audit log",
     Perm.SETTINGS_WRITE: "Change Slipway-wide settings",
+    Perm.DATA_READ: "View backups and snapshots (names, sizes, dates; never their contents)",
+    Perm.DATA_BACKUP: "Back up instances now; take, rename and keep snapshots",
+    Perm.DATA_RESTORE: (
+        "Restore a backup made with the same keys, and roll back a failed deploy "
+        "(replaces an instance's data; the name must be typed)"
+    ),
+    Perm.DATA_RESET: (
+        "Reset or start over an instance's data, start instances from a snapshot, restore old identity keys, "
+        "delete backups and snapshots, override a data hold or a host lock, skip a backup, "
+        "create a first admin in a live app"
+    ),
+    Perm.SNAPSHOTS_UPLOAD: (
+        "Upload snapshot files (privileged: a snapshot's database runs as SQL inside the app it seeds)"
+    ),
+    Perm.SNAPSHOTS_DOWNLOAD: (
+        "Download snapshots as passphrase-encrypted files, and seed instances of another repository from them "
+        "(privileged: a snapshot holds a whole database and its identity keys)"
+    ),
 }
 
 ALL_PERMISSIONS: list[str] = [p.value for p in Perm]
@@ -65,6 +89,7 @@ _READ_ALL = [
     Perm.DEPLOYMENTS_READ,
     Perm.ANALYTICS_READ,
     Perm.LOGS_READ,
+    Perm.DATA_READ,
 ]
 
 SYSTEM_ROLES: dict[str, dict[str, object]] = {
@@ -73,7 +98,9 @@ SYSTEM_ROLES: dict[str, dict[str, object]] = {
         "permissions": ["*"],
     },
     "maintainer": {
-        "description": "Manages hosts, instances and deployments. Cannot manage users or roles.",
+        "description": (
+            "Manages hosts, instances, deployments and their data. Cannot manage users or roles, or download snapshots."
+        ),
         "permissions": [
             *_READ_ALL,
             Perm.HOSTS_WRITE,
@@ -81,22 +108,28 @@ SYSTEM_ROLES: dict[str, dict[str, object]] = {
             Perm.INSTANCES_WRITE,
             Perm.INSTANCES_OPERATE,
             Perm.DEPLOYMENTS_CREATE,
+            Perm.DATA_BACKUP,
+            Perm.DATA_RESTORE,
+            Perm.DATA_RESET,
+            Perm.SNAPSHOTS_UPLOAD,
             Perm.USERS_READ,
             Perm.ROLES_READ,
             Perm.AUDIT_READ,
         ],
     },
     "developer": {
-        "description": "Deploys and operates existing instances.",
+        "description": "Deploys and operates existing instances, and backs up and restores their data.",
         "permissions": [
             *_READ_ALL,
             Perm.REPOS_SYNC,
             Perm.INSTANCES_OPERATE,
             Perm.DEPLOYMENTS_CREATE,
+            Perm.DATA_BACKUP,
+            Perm.DATA_RESTORE,
         ],
     },
     "viewer": {
-        "description": "Read-only access to repositories, hosts, instances and deployments.",
+        "description": "Read-only access to repositories, hosts, instances, deployments, backups and snapshots.",
         "permissions": list(_READ_ALL),
     },
 }

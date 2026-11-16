@@ -1,0 +1,356 @@
+{# Dialogs of the data features (§15.2): restore, reset, start over, back up, snapshots, first admin, roll back and
+   retry. Import with context. Each form posts JSON through slipway.js; the typed-name field keeps the danger button
+   disabled until it matches (data-must-equal), and [data-open][data-fill] fills [name=k], [data-slot=k] and
+   [data-show-if=k] before the dialog opens. #}
+{% from "_macros.html" import icon %}
+
+{% macro then_job() -%}
+{%- if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Job queued"{% endif -%}
+{%- endmacro %}
+
+{% macro confirm_field(instance, id) -%}
+<div class="field confirm-field">
+  <label for="{{ id }}">Type <strong class="mono">{{ instance.name }}</strong> to confirm</label>
+  <input class="input mono" id="{{ id }}" name="confirm" data-must-equal="{{ instance.name }}" autocomplete="off" spellcheck="false" maxlength="100">
+</div>
+{%- endmacro %}
+
+{% macro head(title) -%}
+<div class="modal-head"><h2>{{ title }}</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+{%- endmacro %}
+
+{% macro foot(label, danger=True) -%}
+<div class="modal-foot">
+  <button class="btn" type="button" data-close>Cancel</button>
+  <button class="btn {{ 'btn-danger solid' if danger else 'btn-primary' }}" type="submit" {{ 'disabled' if danger }}>{{ label }}</button>
+</div>
+{%- endmacro %}
+
+{# The first admin's inputs, from the live release's first_admin (Manifest.to_json). ``prefix`` is "first_admin."
+   inside a reset body, "" for PUT /first-admin. #}
+{% macro admin_fields(fa, prefix, id, values={}, required=True, required_when=None, password_optional=False) -%}
+{%- set req = ('data-required-when="' ~ required_when ~ '"')|safe if required_when else ('required' if required else '') -%}
+{% if fa.help %}<p class="help" style="margin: 0">{{ fa.help }}</p>{% endif %}
+<div class="form-grid">
+  {% for f in fa.fields %}
+  <div class="field">
+    <label for="{{ id }}-{{ f.name }}">{{ f.label }}</label>
+    <input class="input" id="{{ id }}-{{ f.name }}" name="{{ prefix }}fields.{{ f.name }}" type="{{ 'email' if f.kind == 'email' else 'text' }}"
+           maxlength="{{ f.max }}" value="{{ values.get(f.name, '') }}" autocomplete="off" spellcheck="false" {{ req }}>
+    {% if f.help %}<span class="help">{{ f.help }}</span>{% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% if fa.password and fa.invite %}
+<div class="row wrap" style="gap: 8px 20px">
+  <label class="check"><input type="radio" name="{{ prefix }}mode" value="password" checked><span>Set a password</span></label>
+  <label class="check"><input type="radio" name="{{ prefix }}mode" value="invite"><span>{{ fa.invite.label }}</span></label>
+</div>
+{% else %}
+<input type="hidden" name="{{ prefix }}mode" value="{{ 'password' if fa.password else 'invite' }}">
+{% endif %}
+{% if fa.password %}
+{%- set min = [8, fa.password.min_length or 8]|max -%}
+<div class="form-grid" data-show-when="{{ prefix }}mode=password">
+  <div class="field">
+    <label for="{{ id }}-password">Password</label>
+    <input class="input" id="{{ id }}-password" name="{{ prefix }}password" type="password" minlength="{{ min }}" maxlength="1024"
+           autocomplete="new-password" {{ '' if password_optional else req }}>
+  </div>
+  <div class="field">
+    <label for="{{ id }}-repeat">Repeat it</label>
+    <input class="input" id="{{ id }}-repeat" type="password" data-repeat-of="{{ prefix }}password" maxlength="1024" autocomplete="new-password">
+  </div>
+  <span class="help span-2">At least {{ min }} characters. It is passed to the app once and then forgotten.{% if password_optional %} Leave it empty to keep the one Slipway holds.{% endif %}</span>
+</div>
+{% endif %}
+{%- endmacro %}
+
+{# ------------------------------------------------------------------ restore (also Undo on a job's page) #}
+{% macro restore_dialog(instance, d) -%}
+{%- set L = d.labels -%}
+<dialog class="modal" id="restore-backup">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/data/restore" {{ then_job() }}>
+    {{ head("Restore a backup") }}
+    <div class="modal-body">
+      <input type="hidden" name="backup_id">
+      <dl class="kv">
+        <dt>Backup</dt><dd class="mono" data-slot="name"></dd>
+        <dt>Taken</dt><dd data-slot="taken"></dd>
+        <dt>Why</dt><dd data-slot="why"></dd>
+        <dt>Release</dt><dd class="mono" data-slot="release"></dd>
+        <dt>Revision</dt><dd class="mono" data-slot="revision"></dd>
+        <dt>Size</dt><dd data-slot="size"></dd>
+      </dl>
+      <label class="check" data-show-if="has_files"><input type="checkbox" name="files"><span>Also put back the {{ L.files|lower }}</span></label>
+      <div class="callout warning" data-show-if="identity_note">{{ icon("key") }}<span data-slot="identity_note"></span></div>
+      {% if auth.can(Perm.DATA_RESET) %}
+      <label class="check" data-show-if="needs_identity"><input type="checkbox" name="restore_identity" required><span>Put back its {{ L.identity }}</span></label>
+      {% endif %}
+      {% if d.rebuild_note %}<p class="help" style="margin: 0">{{ d.rebuild_note }}</p>{% endif %}
+      <p class="help" style="margin: 0" data-show-if="dirty_note" data-slot="dirty_note"></p>
+      <p class="help" style="margin: 0" data-show-if="no_revision_check">Slipway can't check this backup's revision against the release.</p>
+      <p style="margin: 0">Puts {{ instance.name }}'s database back to this backup, then starts release <span class="mono">{{ d.sha7 }}</span> again (it migrates the data forward). Slipway first backs up the database as it is now, so you can undo this from the job's page. Everything written since <span data-slot="taken"></span> is lost. The app is down while it runs.</p>
+      {{ confirm_field(instance, "restore-confirm") }}
+    </div>
+    {{ foot("Restore backup") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------------ back up now #}
+{% macro backup_dialog(instance, d) -%}
+<dialog class="modal" id="backup-now">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/backups" {{ then_job() }}>
+    {{ head("Back up " ~ instance.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">Dumps {{ instance.name }}'s database on {{ instance.host.name }} now, while the app keeps running. Slipway keeps it until you delete it (up to {{ d.manual_max }} you take yourself).</p>
+      {% if "files" in d.caps %}
+      <label class="check"><input type="checkbox" name="files"><span>Include the {{ d.labels.files|lower }}</span></label>
+      {% endif %}
+      <div class="field">
+        <label for="backup-note">Note <span class="subtle">(optional)</span></label>
+        <input class="input" id="backup-note" name="note" maxlength="200" placeholder="Before the data import" autocomplete="off">
+      </div>
+    </div>
+    {{ foot("Back up now", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ---------------------------------------------------------------------------------------- take snapshot #}
+{% macro snapshot_dialog(instance, d) -%}
+<dialog class="modal" id="take-snapshot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/snapshots"
+        {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{deployment.id}"{% else %}data-then="reload" data-success="Snapshot started"{% endif %}>
+    {{ head("Take a snapshot of " ~ instance.name) }}
+    <div class="modal-body">
+      <div class="field">
+        <label for="snapshot-name">Name</label>
+        <input class="input mono" id="snapshot-name" name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}"
+               value="{{ d.default_snapshot_name }}" autocomplete="off" spellcheck="false" title="1-64 letters, digits, '.', '_' or '-', starting with a letter or digit">
+      </div>
+      <div class="field">
+        <label for="snapshot-notes">Notes <span class="subtle">(optional)</span></label>
+        <textarea class="input" id="snapshot-notes" name="notes" rows="2" maxlength="2000"></textarea>
+      </div>
+      {% if auth.can(Perm.INSTANCES_OPERATE) and instance.status == "running" %}
+      <label class="check"><input type="checkbox" name="stop_app"><span>Stop the app while copying <span class="subtle">(consistent; the app is down while the data is exported on the host)</span></span></label>
+      {% endif %}
+      <p style="margin: 0">Copies {{ instance.name }}'s database{% if "files" in d.caps %}, its {{ d.labels.files|lower }}{% endif %} and its {{ d.labels.identity }} into a snapshot kept, encrypted, on this Slipway server.</p>
+    </div>
+    {{ foot("Take snapshot", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------------- reset data #}
+{% macro reset_dialog(instance, d) -%}
+{%- set L = d.labels -%}
+{%- set fa = d.man.first_admin -%}
+{%- set pending = d.first_admin and d.first_admin.status == "pending" -%}
+<dialog class="modal" id="reset-data" style="width: min(640px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/data/reset" {{ then_job() }}>
+    {{ head("Reset " ~ instance.name ~ "'s data") }}
+    <div class="modal-body">
+      <div class="row wrap" style="gap: 8px 20px">
+        <label class="check"><input type="radio" name="start_from" value="empty" data-no-send checked><span>Start empty</span></label>
+        {#- Only when one snapshot is usable: a select of disabled options sends nothing, and the reset would start empty. #}
+        <label class="check"><input type="radio" name="start_from" value="snapshot" data-no-send {{ 'disabled' if not d.usable_snapshots }}><span>From a snapshot
+          {%- if not d.ready_snapshots %} <span class="subtle">(none of this app is ready)</span>
+          {%- elif not d.usable_snapshots %} <span class="subtle">(each needs snapshots:download)</span>{% endif %}</span></label>
+      </div>
+      <div class="field" data-show-when="start_from=snapshot">
+        <label for="reset-snapshot">Snapshot</label>
+        <select class="input" id="reset-snapshot" name="snapshot_id" data-required-when="start_from=snapshot">
+          {% for s in d.ready_snapshots %}
+          {%- set off = s.off %}
+          <option value="{{ s.snap.id }}" {{ 'disabled' if off }}>{{ s.snap.name }} · {{ s.snap.source or s.snap.origin }} · {{ s.snap.created_at|dt }}{% if off %} (another repository: needs snapshots:download){% endif %}</option>
+          {% endfor %}
+        </select>
+        <span class="help">Its {{ L.identity }} replace this instance's.{% if L.identity_help %} {{ L.identity_help }}{% endif %} A snapshot's database runs as SQL inside the app's database: only use snapshots you trust.</span>
+      </div>
+      {% if fa %}
+      <fieldset class="fieldset">
+        <legend>First admin <span class="subtle" data-show-when="start_from=snapshot">(optional: only needed if the snapshot has no account you can sign in with)</span></legend>
+        {% if pending %}<p class="help" style="margin: 0">{{ d.admin_email or "A first admin" }} is waiting to be created; leave these empty to keep them.</p>{% endif %}
+        <div data-optional-group="first_admin" class="stack" style="gap: 12px">
+          {{ admin_fields(fa, "first_admin.", "reset-admin", required=False, required_when=None if pending else "start_from=empty") }}
+        </div>
+      </fieldset>
+      {% endif %}
+      {% if "starter_content" in d.caps %}
+      <label class="check" data-show-when="start_from=empty"><input type="checkbox" name="seed" {{ 'checked' if instance.seed_content }}><span>Add starter content</span></label>
+      {% endif %}
+      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }} and starts {{ instance.name }} again <span data-show-when="start_from=empty">empty</span><span data-show-when="start_from=snapshot">from the snapshot</span>. Slipway first backs up the database{% if "files" in d.caps %} and the {{ L.files|lower }}{% endif %}.</p>
+      {% if d.unbacked %}<p style="margin: 0"><strong>Deleted and in no backup: {{ d.unbacked|join(", ") }}.</strong></p>{% endif %}
+      {{ confirm_field(instance, "reset-confirm") }}
+    </div>
+    {{ foot("Reset data") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------------- start over #}
+{% macro start_over_dialog(instance, d) -%}
+<dialog class="modal" id="start-over">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/data/start-over" {{ then_job() }}>
+    {{ head("Start " ~ instance.name ~ " over") }}
+    <div class="modal-body">
+      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }}, which {{ instance.name }}'s failed first deploys created, after backing them up. The next deploy starts empty{% if d.seed_snapshot %}, or from snapshot {{ d.seed_snapshot.name }}{% endif %}.</p>
+      {{ confirm_field(instance, "start-over-confirm") }}
+    </div>
+    {{ foot("Start over") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------------ first admin #}
+{# ``another``: a live app with no first admin waiting (data:reset and the typed name). #}
+{% macro first_admin_dialog(instance, d, another=False) -%}
+{%- set fa = d.man.first_admin -%}
+{%- set row = d.first_admin -%}
+{%- set keep_password = row and row.status == "pending" and row.mode == "password" and row.password is not none -%}
+<dialog class="modal" id="first-admin" style="width: min(640px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="PUT /api/v1/instances/{{ instance.id }}/first-admin" data-then="reload" data-success="First admin saved">
+    {{ head("Create another first admin" if another else "Change the first admin") }}
+    <div class="modal-body">
+      {% if another %}<p style="margin: 0">{{ instance.name }} is live: Slipway runs the app's first-admin command again with these details when you choose Create it now. Use it to get back in after the last admin account was lost.</p>{% endif %}
+      {{ admin_fields(fa, "", "fa", values=(row.fields if row and not another else {}), password_optional=keep_password and not another) }}
+      {% if another %}{{ confirm_field(instance, "first-admin-confirm") }}{% endif %}
+    </div>
+    {{ foot("Save", danger=another) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# --------------------------------------------------------------------------- roll back (deployment page) #}
+{% macro rollback_dialog(dep, instance, d) -%}
+{%- set st = d.rollback.state -%}
+<dialog class="modal" id="roll-back">
+  <form method="post" action="/js-required" data-form="POST /api/v1/deployments/{{ dep.id }}/rollback" {{ then_job() }}>
+    {{ head("Roll back " ~ instance.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">Puts the database back as it was before deployment {{ dep.id.hex[:8] }} (backup <span class="mono">{{ st.backup.name }}</span>, taken {{ st.backup.taken_at|dt }}) and starts <span class="mono">{{ d.sha7 }}</span> again, the release that was running.{% if st.also_undoes %} {{ st.also_undoes }}{% endif %} Slipway first backs up the database as it is now, for diagnosis. Everything written since {{ st.backup.taken_at|dt }} is lost. {{ d.labels.files }} aren't rolled back.</p>
+      {% if d.rollback.by_hand %}<p style="margin: 0"><strong>{{ instance.name }} was started by hand on {{ d.rollback.by_hand|dt }}: what was written since is lost too.</strong></p>{% endif %}
+      {% if d.rebuild_note %}<p class="help" style="margin: 0">{{ d.rebuild_note }}</p>{% endif %}
+      {{ confirm_field(instance, "rollback-confirm") }}
+    </div>
+    {{ foot("Roll back") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------- retry (gated kinds) #}
+{% macro retry_dialog(dep, instance, d, skip_only=False) -%}
+{%- set r = d.actions.retry -%}
+<dialog class="modal" id="retry-job">
+  <form method="post" action="/js-required" data-form="POST /api/v1/deployments/{{ dep.id }}/retry" {{ then_job() }}>
+    {{ head(("Retry without the backup" if skip_only else "Retry " ~ (d.kind|kind_noun))) }}
+    <div class="modal-body">
+      {% if skip_only %}
+      <input type="hidden" name="skip_backup" data-type="json" value="true">
+      <p style="margin: 0">Runs deployment {{ dep.id.hex[:8] }} again without backing up the data first. Only do this when the data can't be backed up: if the deploy goes wrong, there is no copy to go back to.</p>
+      {% else %}
+      <p style="margin: 0">Runs the same {{ d.kind|kind_noun }} of {{ instance.name }} again{% if r.inherits %}, keeping the backup from before the first attempt{% endif %}. Steps the first attempt finished aren't repeated.</p>
+      {% if r.offers_skip_backup and auth.can(Perm.DATA_RESET) %}
+      <label class="check"><input type="checkbox" name="skip_backup"><span>Retry without the backup <span class="subtle">(the data is changed with no copy to go back to)</span></span></label>
+      {% endif %}
+      {% endif %}
+      {{ confirm_field(instance, "retry-confirm") }}
+    </div>
+    {{ foot("Retry") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ---------------------------------------------------------------------------- snapshots page dialogs #}
+{% macro upload_dialog(max_bytes, locked_days) -%}
+<dialog class="modal" id="upload-snapshot">
+  <form method="post" action="/js-required" data-upload="/api/v1/snapshots/upload">
+    {{ head("Upload a snapshot") }}
+    <div class="modal-body">
+      <div class="field">
+        <label for="upload-file">File</label>
+        <input class="input" id="upload-file" type="file" accept=".slipway-snapshot,.tar,.tar.gz,.tgz" required data-upload-file>
+        <span class="help">A <code>.slipway-snapshot</code> file downloaded from a Slipway, or a <code>.tar</code> / <code>.tar.gz</code> made with <code>slipway snapshot pack</code>. At most {{ max_bytes|bytes }}.</span>
+      </div>
+      <p class="help" style="margin: 0" data-upload-encrypted hidden>This file is encrypted: Slipway asks for its passphrase once it has arrived (within {{ locked_days }} days).</p>
+      <div class="field">
+        <label for="upload-name">Name</label>
+        <input class="input mono" id="upload-name" name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="upload-notes">Notes <span class="subtle">(optional)</span></label>
+        <textarea class="input" id="upload-notes" name="notes" rows="2" maxlength="2000"></textarea>
+      </div>
+      <div class="field" data-upload-progress hidden>
+        <progress max="100" value="0"></progress>
+        <span class="help" data-upload-status></span>
+      </div>
+      <p class="help" style="margin: 0">A snapshot's database runs as SQL inside the app it seeds: only upload files you trust.</p>
+    </div>
+    {{ foot("Upload", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro unlock_dialog() -%}
+<dialog class="modal" id="unlock-snapshot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/snapshots/-/unlock" data-then="reload" data-success="Unlocked: Slipway is checking the snapshot">
+    {{ head("Unlock snapshot") }}
+    <div class="modal-body">
+      <p style="margin: 0">Enter the passphrase <span class="mono" data-slot="name"></span> was downloaded with. Slipway uses it once to open the file and doesn't keep it.</p>
+      <div class="field">
+        <label for="unlock-passphrase">Passphrase</label>
+        <input class="input mono" id="unlock-passphrase" name="passphrase" type="password" required maxlength="1024" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    {{ foot("Unlock", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro download_dialog() -%}
+<dialog class="modal" id="download-snapshot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/snapshots/-/exports" data-then="download">
+    {{ head("Download snapshot") }}
+    <div class="modal-body">
+      <p style="margin: 0">The file holds the whole database<span data-slot="files"></span> of <span data-slot="source"></span> and its <span data-slot="identity"></span>. Slipway encrypts it with a passphrase you choose: anyone with the file and the passphrase can read everything in it. Slipway doesn't keep the passphrase; without it the file can't be opened.</p>
+      <div class="field">
+        <label for="download-passphrase">Passphrase</label>
+        <div class="copy-row">
+          <input class="input mono" id="download-passphrase" name="passphrase" type="text" required minlength="12" maxlength="1024" autocomplete="off" spellcheck="false">
+          <button class="btn btn-sm" type="button" data-generate-passphrase="#download-passphrase, #download-repeat">{{ icon("key", "i-sm") }} Generate</button>
+          <button class="btn btn-sm" type="button" data-copy-target="#download-passphrase" data-passphrase-copy hidden>{{ icon("copy", "i-sm") }} Copy</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="download-repeat">Repeat it</label>
+        <input class="input mono" id="download-repeat" type="text" data-repeat-of="passphrase" maxlength="1024" autocomplete="off" spellcheck="false">
+      </div>
+      <label class="check"><input type="checkbox" data-no-send required><span>I've stored the passphrase somewhere safe</span></label>
+    </div>
+    {{ foot("Download", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro rename_dialog() -%}
+<dialog class="modal" id="rename-snapshot">
+  <form method="post" action="/js-required" data-form="PATCH /api/v1/snapshots/-" data-then="reload" data-success="Snapshot saved">
+    {{ head("Rename snapshot") }}
+    <div class="modal-body">
+      <div class="field">
+        <label for="rename-name">Name</label>
+        <input class="input mono" id="rename-name" name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="rename-notes">Notes</label>
+        <textarea class="input" id="rename-notes" name="notes" rows="3" maxlength="2000" data-keep-empty></textarea>
+      </div>
+    </div>
+    {{ foot("Save", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}

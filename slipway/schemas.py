@@ -8,10 +8,12 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from slipway.core.permissions import validate_permissions
-from slipway.models import Deployment, Host, Instance, Repository, User
-from slipway.services import deployer, manifest, ports, switchyard
+from slipway.models import Backup, Deployment, FirstAdmin, Host, Instance, Repository, Snapshot, User
+from slipway.services import data, deployer, manifest, ports, switchyard
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -340,6 +342,18 @@ class VolumeMapping(BaseModel):
         return v
 
 
+class FirstAdminIn(BaseModel):
+    """The first admin an app's ``first_admin`` command creates: the manifest's fields, and a password or an
+    invite. It is checked against the release's slipway.yml (§11.1). ``confirm`` (the instance's name) is
+    needed only to set one on a live app that has none pending."""
+
+    fields: dict[Annotated[str, Field(max_length=64), NoNul], Annotated[str, Field(max_length=1024), NoNul]] = Field(
+        max_length=20)
+    mode: Literal["password", "invite"]
+    password: str | None = Field(None, max_length=1024)
+    confirm: Annotated[str, Field(max_length=100), NoNul] | None = None
+
+
 class _InstanceFields(BaseModel):
     branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
     build_source: Literal["dockerfile", "compose", "app"] | None = None
@@ -359,6 +373,11 @@ class _InstanceFields(BaseModel):
     auto_ports: bool | None = None
     port_overrides: list[PortOverride] | None = Field(None, max_length=100)
     routes: list[Route] | None = Field(None, max_length=20)
+    # Data (app instances): how many automatic backups to keep, starter content on an empty first deploy,
+    # and a snapshot the first deploy restores (needs data:reset, §10.7).
+    keep_backups: int | None = Field(None, ge=1, le=100)
+    seed_content: bool | None = None
+    seed_snapshot_id: uuid.UUID | None = None
 
     @field_validator("routes")
     @classmethod
@@ -423,6 +442,7 @@ class InstanceCreate(_InstanceFields):
     host_id: uuid.UUID
     build_source: Literal["dockerfile", "compose", "app"] = "dockerfile"
     deploy: bool = True
+    first_admin: FirstAdminIn | None = None
 
 
 class InstanceUpdate(_InstanceFields):
@@ -431,6 +451,23 @@ class InstanceUpdate(_InstanceFields):
     # Erase the stored variables on purpose, including ones that can no longer be decrypted.
     # (An empty ``env`` never replaces variables that can't be decrypted.)
     clear_env: bool = False
+
+
+class FirstAdminOut(BaseModel):
+    """The first admin as stored: its fields and state, never the password."""
+
+    fields: dict[str, Any]
+    mode: str
+    status: str
+    existed: bool
+    done_at: datetime | None
+    last_error: str | None
+    has_password: bool  # a password is stored (it is needed again after a key change, §6.7)
+
+    @classmethod
+    def of(cls, row: FirstAdmin) -> FirstAdminOut:
+        return cls(fields=dict(row.fields or {}), mode=row.mode, status=row.status, existed=bool(row.existed),
+                   done_at=row.done_at, last_error=row.last_error, has_password=row.password is not None)
 
 
 def _folder(i: Instance) -> str:
@@ -481,10 +518,22 @@ class InstanceOut(Out):
     current_commit_sha: str | None
     last_deployed_at: datetime | None
     created_at: datetime
+    # Data safety (app instances).
+    keep_backups: int = 5
+    seed_content: bool = True
+    content_pending: bool = False
+    seed_snapshot: dict[str, Any] | None = None  # {id, name, status}: the snapshot the first deploy restores
+    first_admin: FirstAdminOut | None = None  # never the password
+    # The first failed job that began changing the data, and whether Start, Restart and Deploy are held (§8.4).
+    data_dirty: dict[str, Any] | None = None
+    identity_changed_at: datetime | None = None
+    identity_source: str | None = None
 
     @classmethod
-    def of(cls, i: Instance, *, env_unreadable: bool = False) -> InstanceOut:
-        """``env_unreadable`` needs a query (see ``api.v1.instances.env_unreadable``), so callers pass it."""
+    def of(cls, i: Instance, *, env_unreadable: bool = False, seed_snapshot: Snapshot | None = None,
+           first_admin: FirstAdmin | None = None) -> InstanceOut:
+        """``env_unreadable``, the seed snapshot and the first admin need queries (see ``instance_out``), so
+        callers pass them."""
         return cls(
             id=i.id,
             name=i.name,
@@ -520,7 +569,33 @@ class InstanceOut(Out):
             current_commit_sha=i.current_commit_sha,
             last_deployed_at=i.last_deployed_at,
             created_at=i.created_at,
+            keep_backups=i.keep_backups if i.keep_backups is not None else 5,
+            seed_content=True if i.seed_content is None else i.seed_content,
+            content_pending=bool(i.content_pending),
+            seed_snapshot=({"id": seed_snapshot.id, "name": seed_snapshot.name, "status": seed_snapshot.status}
+                           if seed_snapshot is not None else None),
+            first_admin=FirstAdminOut.of(first_admin) if first_admin is not None else None,
+            data_dirty=i.data_dirty or None,
+            identity_changed_at=i.identity_changed_at,
+            identity_source=i.identity_source,
         )
+
+
+async def instance_outs(db: AsyncSession, instances: list[Instance], *,
+                        unreadable: set[uuid.UUID] | None = None) -> list[InstanceOut]:
+    """``InstanceOut`` for many instances, with their seed snapshots and first admins in two queries."""
+    ids = [i.id for i in instances]
+    seeds = {i.seed_snapshot_id for i in instances if i.seed_snapshot_id is not None}
+    snaps: dict[uuid.UUID, Snapshot] = {}
+    if seeds:
+        snaps = {s.id: s for s in (await db.scalars(select(Snapshot).where(Snapshot.id.in_(seeds)))).all()}
+    admins: dict[uuid.UUID, FirstAdmin] = {}
+    if ids:
+        admins = {a.instance_id: a for a in (await db.scalars(select(FirstAdmin).where(FirstAdmin.instance_id.in_(ids)))).all()}
+    unreadable = unreadable or set()
+    return [InstanceOut.of(i, env_unreadable=i.id in unreadable,
+                           seed_snapshot=snaps.get(i.seed_snapshot_id) if i.seed_snapshot_id else None,
+                           first_admin=admins.get(i.id)) for i in instances]
 
 
 class ClaimGroup(BaseModel):
@@ -591,6 +666,17 @@ class ActionOut(BaseModel):
 # --------------------------------------------------------------------- deployments
 
 
+# Options of a job the API shows. Every option is a plain flag or id (none is secret); ``confirm`` is never
+# stored, and is left out here in case an older row carries it.
+_HIDDEN_OPTIONS = frozenset({"confirm"})
+
+
+def _backup_ref(row: Backup | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {"id": row.id, "name": row.name, "taken_at": row.taken_at, "status": row.status}
+
+
 class DeploymentOut(BaseModel):
     id: uuid.UUID
     instance_id: uuid.UUID
@@ -608,9 +694,21 @@ class DeploymentOut(BaseModel):
     # [{key, name, status, started_at?, finished_at?, offset?, note?}]
     steps: list[dict[str, Any]] = []
     retry_of_id: uuid.UUID | None = None
+    # What the job does (deploy, restore, rollback, reset, backup, snapshot, admin, content) and with what.
+    kind: str = "deploy"
+    previous_sha: str | None = None  # the instance's live commit when the job was queued
+    options: dict[str, Any] = {}
+    backup: dict[str, Any] | None = None  # {id, name, taken_at, status}: the backup taken (or kept) first
+    restore_backup: dict[str, Any] | None = None  # the backup a restore or roll back puts back
+    snapshot: dict[str, Any] | None = None  # {id, name, status}: the snapshot restored or taken
 
     @classmethod
-    def of(cls, d: Deployment) -> DeploymentOut:
+    def of(cls, d: Deployment, *, backups: dict[uuid.UUID, Backup] | None = None,
+           snapshots: dict[uuid.UUID, Snapshot] | None = None) -> DeploymentOut:
+        """``backups`` and ``snapshots`` hold the rows the job points at (see ``deployment_outs``); without
+        them the references are left out."""
+        backups, snapshots = backups or {}, snapshots or {}
+        snap = snapshots.get(d.snapshot_id) if d.snapshot_id else None
         return cls(
             id=d.id,
             instance_id=d.instance_id,
@@ -627,12 +725,200 @@ class DeploymentOut(BaseModel):
             created_at=d.created_at,
             steps=d.steps or [],
             retry_of_id=d.retry_of_id,
+            kind=d.kind or "deploy",
+            previous_sha=d.previous_sha,
+            options={k: v for k, v in (d.options or {}).items() if k not in _HIDDEN_OPTIONS},
+            backup=_backup_ref(backups.get(d.backup_id)) if d.backup_id else None,
+            restore_backup=_backup_ref(backups.get(d.restore_backup_id)) if d.restore_backup_id else None,
+            snapshot={"id": snap.id, "name": snap.name, "status": snap.status} if snap is not None else None,
         )
+
+
+async def deployment_outs(db: AsyncSession, deps: list[Deployment]) -> list[DeploymentOut]:
+    """``DeploymentOut`` for many jobs, with the backups and snapshots they point at in two queries."""
+    bids = {b for d in deps for b in (d.backup_id, d.restore_backup_id) if b is not None}
+    sids = {d.snapshot_id for d in deps if d.snapshot_id is not None}
+    backups: dict[uuid.UUID, Backup] = {}
+    snapshots: dict[uuid.UUID, Snapshot] = {}
+    if bids:
+        backups = {b.id: b for b in (await db.scalars(select(Backup).where(Backup.id.in_(bids)))).all()}
+    if sids:
+        snapshots = {s.id: s for s in (await db.scalars(select(Snapshot).where(Snapshot.id.in_(sids)))).all()}
+    return [DeploymentOut.of(d, backups=backups, snapshots=snapshots) for d in deps]
+
+
+async def deployment_out(db: AsyncSession, dep: Deployment) -> DeploymentOut:
+    return (await deployment_outs(db, [dep]))[0]
 
 
 class DeploymentDetail(DeploymentOut):
     log: str
     log_offset: int
+    # What the deployment page offers (data.job_actions): {retry: {available, reason, needs_confirm,
+    # offers_skip_backup, ...}, rollback: {available, reason, also_undoes, ...}, undo: {available, backup_id, files}}
+    actions: dict[str, Any] = {}
+
+
+# Typed confirmation (§13): the instance's name, exactly. Checked by the endpoint before anything else.
+Confirm = Annotated[str, Field(max_length=100), NoNul]
+
+
+class DeployIn(BaseModel):
+    """Optional flags of ``POST /instances/{id}/deploy``; each needs its permission and the typed name."""
+
+    override_hold: bool = False  # data:reset
+    take_over_lock: bool = False  # data:reset
+    skip_revision_check: bool = False  # data:restore
+    confirm: Confirm | None = None
+
+
+class ControlIn(BaseModel):
+    override_hold: bool = False  # data:reset and the typed name: start or restart while a data hold stands
+    confirm: Confirm | None = None
+
+
+class RetryIn(BaseModel):
+    confirm: Confirm | None = None
+    skip_backup: bool = False  # data:reset: only for a job whose backup failed
+    take_over_lock: bool = False  # data:reset
+
+
+class ConfirmIn(BaseModel):
+    confirm: Confirm | None = None
+
+
+# --------------------------------------------------------------------------- data
+
+
+class BackupCreate(BaseModel):
+    files: bool = False  # include the app's files (slipway.yml export_files)
+    note: Annotated[str, Field(max_length=200), NoNul] | None = None
+
+
+class RestoreIn(BaseModel):
+    backup_id: uuid.UUID
+    confirm: Confirm | None = None
+    files: bool = False  # put the files back too
+    restore_identity: bool = False  # put back the identity keys the backup was made with (data:reset)
+
+
+class ResetIn(BaseModel):
+    confirm: Confirm | None = None
+    snapshot_id: uuid.UUID | None = None  # start from this snapshot instead of empty
+    seed: bool | None = None  # add starter content after an empty start (default: the instance's setting)
+    first_admin: FirstAdminIn | None = None
+
+
+class SnapshotTake(BaseModel):
+    name: Annotated[str, Field(max_length=64), NoNul]
+    notes: Annotated[str, Field(max_length=2000), NoNul] | None = None
+    stop_app: bool = False  # stop the app while copying (instances:operate)
+
+
+class SnapshotUpdate(BaseModel):
+    name: Annotated[str, Field(max_length=64), NoNul] | None = None
+    notes: Annotated[str, Field(max_length=2000), NoNul] | None = None
+
+
+class PassphraseIn(BaseModel):
+    # Checked by snapfile (12-1024 characters, no control characters); never stored, logged or audited.
+    passphrase: str = Field(max_length=1024)
+
+
+class BackupOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    reason: str
+    status: str
+    taken_at: datetime
+    db_bytes: int | None
+    has_files: bool
+    files_bytes: int | None
+    format: str
+    revision_short: str | None
+    commit_sha: str | None
+    release: str | None
+    deployment_id: uuid.UUID | None
+    dirty_of: uuid.UUID | None
+    created_by: str | None
+    note: str | None
+    checked_at: datetime | None
+    pinned: bool
+    pinned_reason: str | None
+    restorable: bool
+    reason_text: str | None  # why it can't be restored (shown instead of the Restore button)
+    identity_note: str | None
+    needs_reset_perm: bool  # restoring it puts back other identity keys: data:reset
+    dirty_note: str | None = None
+
+    @classmethod
+    def of(cls, view: data.BackupView, *, created_by: str | None = None, note: str | None = None) -> BackupOut:
+        row = view.row
+        return cls(
+            id=row.id, name=row.name, reason=row.reason, status=row.status, taken_at=row.taken_at,
+            db_bytes=row.db_bytes, has_files=bool(row.has_files), files_bytes=row.files_bytes, format=row.format,
+            revision_short=view.revision_short, commit_sha=row.commit_sha, release=row.release,
+            deployment_id=row.deployment_id, dirty_of=row.dirty_of, created_by=created_by,
+            note=row.note if row.note is not None else note, checked_at=row.checked_at, pinned=view.pinned,
+            pinned_reason=view.pinned_reason, restorable=view.restorable, reason_text=view.reason_text,
+            identity_note=view.identity_note, needs_reset_perm=view.needs_reset_perm, dirty_note=view.dirty_note,
+        )
+
+
+class SnapshotOut(BaseModel):
+    """A stored snapshot: what it holds and where it came from, never its key material."""
+
+    id: uuid.UUID
+    name: str
+    notes: str
+    status: str
+    origin: str
+    app: str | None
+    app_name: str | None
+    repository: str | None
+    source: str | None
+    source_instance_id: uuid.UUID | None
+    commit_sha: str | None
+    source_created_at: datetime | None
+    db_format: str | None
+    db_revision: str | None
+    revision_short: str | None
+    db_bytes: int | None
+    db_sha256: str | None
+    has_files: bool
+    files_format: str | None
+    files_bytes: int | None
+    files_sha256: str | None
+    identity_keys: list[str]  # names only
+    expires_at: datetime | None  # a locked import is deleted after this
+    file_bytes: int | None
+    file_sha256: str | None
+    deployment_id: uuid.UUID | None
+    created_by_id: uuid.UUID | None
+    error: str | None
+    created_at: datetime
+    # Only with ``?instance_id=``: seeding that instance from it needs snapshots:download (another repository).
+    seeding_needs_download: bool | None = None
+
+    @classmethod
+    def of(cls, s: Snapshot, *, seeding_needs_download: bool | None = None) -> SnapshotOut:
+        return cls(
+            id=s.id, name=s.name, notes=s.notes or "", status=s.status, origin=s.origin, app=s.app,
+            app_name=s.app_name, repository=s.repository, source=s.source, source_instance_id=s.source_instance_id,
+            commit_sha=s.commit_sha, source_created_at=s.source_created_at, db_format=s.db_format,
+            db_revision=s.db_revision, revision_short=data.revision_short(s.db_revision), db_bytes=s.db_bytes,
+            db_sha256=s.db_sha256, has_files=s.files_format is not None or s.files_bytes is not None,
+            files_format=s.files_format, files_bytes=s.files_bytes, files_sha256=s.files_sha256,
+            identity_keys=list(s.identity_keys or []), expires_at=s.expires_at, file_bytes=s.file_bytes,
+            file_sha256=s.file_sha256, deployment_id=s.deployment_id, created_by_id=s.created_by_id, error=s.error,
+            created_at=s.created_at, seeding_needs_download=seeding_needs_download,
+        )
+
+
+def seeding_needs_download(snapshot: Snapshot, repository: str | None) -> bool:
+    """Seeding an instance of ``repository`` from ``snapshot`` needs snapshots:download (D16): the snapshot is
+    of another repository, or of one nobody recorded."""
+    return not snapshot.repository or snapshot.repository != repository
 
 
 # --------------------------------------------------------------------------- audit

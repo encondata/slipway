@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 
 import pytest
 from sqlalchemy import event, select, text
@@ -61,24 +62,46 @@ def fake_docker(tmp_path):
     return env, log
 
 
-def _sh(command: str, env: dict[str, str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
+def _sh(command: str, env: dict[str, str], input: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True, input=input)
 
 
 class LocalRemote:
-    """Runs commands with /bin/sh on this machine."""
+    """Runs commands with /bin/sh on this machine (stdin from ``input``, lines scrubbed as RemoteSession does)."""
 
     def __init__(self, env: dict[str, str]) -> None:
         self.env = env
         self.commands: list[str] = []
 
-    async def run(self, command, *, check=True, on_line=None, timeout=None):
+    async def run(self, command, *, check=True, on_line=None, timeout=None, input=None, scrub=None):
         self.commands.append(command)
-        result = await asyncio.to_thread(_sh, command, self.env)
+        result = await asyncio.to_thread(_sh, command, self.env, input)
         output = result.stdout + result.stderr
+        if scrub is not None:
+            output = "\n".join(scrub(line) for line in output.splitlines())
+        if on_line is not None:
+            for line in output.splitlines():
+                await on_line(line)
         if check and result.returncode:
             raise ssh.CommandFailed(command, result.returncode, output)
         return result.returncode, output
+
+    async def write_text(self, remote, content, mode=0o600):
+        Path(remote).write_text(content)
+        os.chmod(remote, mode)
+
+    async def read_stream(self, path, chunk=None):
+        with open(path, "rb") as fh:
+            while block := fh.read(chunk or 1024 * 1024):
+                yield block
+
+    async def write_stream(self, path, chunks, mode=0o600):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "wb") as fh:
+            async for block in chunks:
+                fh.write(block)
+        os.chmod(path, mode)
+        return os.path.getsize(path)
 
 
 def _local(remote):
@@ -484,11 +507,11 @@ async def test_failed_compose_up_keeps_a_release_its_containers_use():
     release, upload = _release_and_upload(dep_id)
 
     class HalfUp(FakeRemote):
-        async def run(self, command, *, check=True, on_line=None, timeout=None):
+        async def run(self, command, *, check=True, on_line=None, timeout=None, **kw):
             if "com.docker.compose.project.working_dir" in command:
                 self.commands.append(command)
                 return 0, f"{DOCKER_WARNING}\n/opt/slipway/web-prod/releases/older/docker\n{release}/docker\n"
-            return await super().run(command, check=check, on_line=on_line, timeout=timeout)
+            return await super().run(command, check=check, on_line=on_line, timeout=timeout, **kw)
 
     remote = HalfUp(fail_on=" up -d")
     await deployer.run_deployment(dep_id, connect=_connect(remote), github=FakeGitHub)
@@ -756,7 +779,7 @@ def _rejects_nul(conn, cursor, statement, parameters, context, executemany):
 
 
 class NulRemote(FakeRemote):
-    async def run(self, command, *, check=True, on_line=None, timeout=None):
+    async def run(self, command, *, check=True, on_line=None, timeout=None, **kw):
         self.commands.append(command)
         if "docker build" in command:
             await on_line("#7 0.21 PK\x03\x04\x00\x00binary")
@@ -779,10 +802,10 @@ async def test_db_outage_during_failure_is_retried(fast_retries):
     outage = {"left": 0}
 
     class OutageRemote(FakeRemote):
-        async def run(self, command, *, check=True, on_line=None, timeout=None):
+        async def run(self, command, *, check=True, on_line=None, timeout=None, **kw):
             if "docker build" in command:
                 outage["left"] = 5
-            return await super().run(command, check=check, on_line=on_line, timeout=timeout)
+            return await super().run(command, check=check, on_line=on_line, timeout=timeout, **kw)
 
     def hook(conn, cursor, statement, parameters, context, executemany):
         if outage["left"] > 0:
@@ -806,11 +829,11 @@ async def test_failed_log_write_does_not_fail_a_working_deploy(fast_retries):
             raise sqlite3.OperationalError("database is locked")
 
     class ChattyRemote(FakeRemote):
-        async def run(self, command, *, check=True, on_line=None, timeout=None):
+        async def run(self, command, *, check=True, on_line=None, timeout=None, **kw):
             if on_line and "docker build" in command:
                 for n in range(250):  # forces a flush in the middle of the build
                     await on_line(f"build line {n}")
-            return await super().run(command, check=check, on_line=on_line, timeout=timeout)
+            return await super().run(command, check=check, on_line=on_line, timeout=timeout, **kw)
 
     with _db_hook(hook):
         await deployer.run_deployment(dep_id, connect=_connect(ChattyRemote()), github=FakeGitHub)
@@ -865,11 +888,11 @@ async def test_build_log_is_capped_keeping_head_and_tail(monkeypatch):
     dep_id = await _seed({})
 
     class LoudRemote(FakeRemote):
-        async def run(self, command, *, check=True, on_line=None, timeout=None):
+        async def run(self, command, *, check=True, on_line=None, timeout=None, **kw):
             if on_line and "docker build" in command:
                 for n in range(3000):
                     await on_line(f"line {n:05d} " + "x" * 80)
-            return await super().run(command, check=check, on_line=on_line, timeout=timeout)
+            return await super().run(command, check=check, on_line=on_line, timeout=timeout, **kw)
 
     await deployer.run_deployment(dep_id, connect=_connect(LoudRemote()), github=FakeGitHub)
     dep = await _get(Deployment, dep_id)

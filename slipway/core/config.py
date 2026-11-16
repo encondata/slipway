@@ -73,6 +73,22 @@ class Settings(BaseSettings):
     default_deploy_root: str = "/opt/slipway"
     ssh_connect_timeout: int = 15
 
+    # Data safety. Snapshot bundles live in this folder on the Slipway server (the image sets
+    # /var/lib/slipway, mounted from data/files); every file in it is encrypted.
+    storage_dir: str = "data/files"
+    # Largest snapshot accepted (the members added up; also the upload limit), and all stored snapshots together.
+    snapshot_max_bytes: int = Field(default=20 * 1024**3, ge=1)
+    snapshot_total_bytes: int = Field(default=100 * 1024**3, ge=1)
+    # Snapshot transfers (takes, uploads, checks, downloads) and passphrase key derivations run at once.
+    snapshot_transfers: int = Field(default=2, ge=1, le=8)
+    snapshot_kdf_slots: int = Field(default=2, ge=1, le=4)
+    # An uploaded encrypted snapshot nobody unlocks is deleted after this many days.
+    snapshot_locked_days: int = Field(default=7, ge=1)
+    # Free space a host must keep beyond the expected size of a backup, in MB.
+    backup_free_margin_mb: int = Field(default=1024, ge=0)
+    # Backups taken by hand ("Back up now") that one instance may keep.
+    manual_backups_max: int = Field(default=10, ge=1)
+
     @field_validator("github_allowed_users", "github_allowed_orgs", mode="before")
     @classmethod
     def _split_commas(cls, value: object) -> object:

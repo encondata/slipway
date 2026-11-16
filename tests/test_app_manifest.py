@@ -93,6 +93,13 @@ def test_the_serversherpa_example_parses():
     assert [s.name for s in man.optional_services] == ["kiosk", "wiki", "learn", "status", "mailpit"]
     assert {s.key: s.kind for s in man.secrets}["SS_TOTP_ENCRYPTION_KEY"] == "fernet"
     assert man.commands["start"] == ("deploy/stack/ss-stack", "up", "{slipway.env_dir}")
+    # Phase 2: its data (tests/test_manifest_data.py plans it).
+    assert man.identity_keys() == ["SS_TOTP_ENCRYPTION_KEY", "SS_PASSWORD_PEPPER"]
+    assert man.data.app == "serversherpa" and man.data.format == "pg-custom"
+    assert [v.holds for v in man.data.volumes] == ["database", "files", "other"]
+    assert man.commands["dump"] == ("deploy/stack/ss-stack", "pgdump", "{slipway.env_dir}", "{slipway.out}")
+    assert "has_data" in man.commands and man.first_admin is not None and man.first_admin.exists_codes == (10,)
+    assert man.capabilities() == manifest.CAPABILITIES  # it can do everything
 
 
 @pytest.mark.parametrize(("text", "message"), [
@@ -140,7 +147,7 @@ def test_plan_fills_in_the_env_routes_projects_and_commands():
     assert plan.routes == [{"hostname": "www.uat.example.com", "service": "web", "container": 8080},
                            {"hostname": "admin.uat.example.com", "service": "admin", "container": 8081}]
     assert plan.projects == ["demo-uat-web", "demo-uat-db"] and plan.images == [f"demo-web:{SHA[:12]}"]
-    assert plan.commands["start"] == ["sh", "deploy/app", "up", "/srv/x/shared"]
+    assert plan.commands["start"] == {"argv": ["sh", "deploy/app", "up", "/srv/x/shared"], "stream": None}
     assert "APP_SECRET" not in plan.public_env
     assert _plan(man, chosen=[]).env["APP_EXTRAS"] == "none"
     assert _plan(man).env["APP_EXTRAS"] == "admin"  # each optional service's default
@@ -231,10 +238,10 @@ async def test_an_app_deploys_from_its_manifest(tmp_path, docker_shim):  # noqa:
     assert {(p["service"], p["host"]) for p in inst.published_ports} == {("web", 8080), ("admin", 8081)}
     assert [(s["key"], s["status"]) for s in dep.steps] == [
         ("resolve", "succeeded"), ("source", "succeeded"), ("upload", "succeeded"), ("manifest", "succeeded"),
-        ("ports", "succeeded"), ("settings", "succeeded"), ("build", "succeeded"), ("start", "succeeded"),
-        ("finish", "succeeded"), ("proxy", "succeeded"),
-    ]
-    assert f"{deployer.STEP_MARK}8/10: Start" in dep.log
+        ("ports", "succeeded"), ("settings", "succeeded"), ("build", "succeeded"), ("backup", "skipped"),
+        ("start", "succeeded"), ("finish", "succeeded"), ("proxy", "succeeded"),
+    ]  # an app without data gets exactly one more step than before phase 2: backup, skipped (I7)
+    assert f"{deployer.STEP_MARK}9/11: Start" in dep.log
 
     # A second deploy keeps the secrets, and the routes point at the published ports.
     first = dict(inst.app_secrets)
@@ -274,7 +281,7 @@ async def test_a_failed_start_is_retried_without_rebuilding(tmp_path, docker_shi
     assert retry.retry_of_id == dep_id and retry.release == dep.release and retry.commit_sha == SHA
     assert {s["key"]: s["status"] for s in retry.steps} | {} == {
         "resolve": "succeeded", "source": "skipped", "upload": "skipped", "manifest": "succeeded",
-        "ports": "succeeded", "settings": "succeeded", "build": "skipped", "start": "succeeded",
+        "ports": "succeeded", "settings": "succeeded", "build": "skipped", "backup": "skipped", "start": "succeeded",
         "finish": "succeeded", "proxy": "succeeded",
     }
     assert app_log.read_text().splitlines() == [f"up {root / 'web-prod' / 'shared'}"]  # no second build
@@ -359,6 +366,20 @@ def test_app_teardown_stops_it_removes_its_projects_and_images_but_never_volumes
     assert "docker image rm demo-web:aaa demo-web:bbb" in command
     app_part = command.split("docker ps -aq --filter label=slipway.instance")[0]  # before the generic cleanup
     assert "--volumes" not in app_part and " -v" not in app_part
+
+
+def test_app_teardown_reads_the_stop_command_in_both_stored_forms():
+    # Phase 2 stores commands as {"argv", "stream"}; app_state saved before it holds plain lists.
+    new = deployer.teardown_command(_app(commands={"stop": {"argv": ["sh", "deploy/app", "down", "/d"], "stream": None}}))
+    assert "cd /opt/slipway/web-prod/current && sh deploy/app down /d" in new
+    assert "argv" not in new and "stream" not in new
+
+
+def test_app_commands_fill_slots_and_refuse_a_missing_one():
+    cmd = {"argv": ["deploy/dump", "--out", {"slot": "out"}], "stream": None}
+    assert deployer.app_command("/r", cmd, slots={"out": "/b/x y"}) == "cd /r && ./deploy/dump --out '/b/x y'"
+    with pytest.raises(deployer.DeployError, match=r"no value for \{slipway.out\}"):
+        deployer.app_command("/r", cmd)
 
 
 def test_app_commands_run_from_the_release():
@@ -473,7 +494,7 @@ def test_instance_variables_never_reach_templates():
                                          'start: [sh, deploy/app, up, "{APP_COLOR}"]'))
     with pytest.raises(manifest.ManifestError, match="APP_COLOR} is set in the instance's environment variables"):
         _plan(man, env={"APP_COLOR": "hunter2"})
-    assert _plan(man).commands["start"][-1] == "blue"  # the env_file default is fine
+    assert _plan(man).commands["start"]["argv"][-1] == "blue"  # the env_file default is fine
 
 
 def test_bare_yaml_numbers_are_not_taken_as_text():

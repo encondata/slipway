@@ -608,3 +608,22 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
 .steps li::before { content: counter(step); min-width: 1.6em; color: var(--text-subtle, inherit); font-variant-numeric: tabular-nums; text-align: right; }
 .steps .badge { min-width: 88px; justify-content: center; }
 .steps .step-pending strong, .steps .step-skipped strong { opacity: .65; }
+
+/* Data safety: dialogs, the Data fieldset, the Backups card and the snapshot upload */
+.fieldset { border: 1px solid var(--border); border-radius: var(--radius-button); padding: 14px 16px 16px; margin: 0;
+  display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.fieldset legend { padding: 0 6px; font-weight: 650; font-size: 13.5px; }
+.confirm-field { padding-top: 12px; border-top: 1px solid var(--border); }
+.confirm-field label strong { color: var(--error-text); }
+.table.backups .chip { font-size: 12px; padding: 1px 8px; }
+.table.backups td.actions-cell .subtle { white-space: normal; display: inline-block; max-width: 320px; text-align: right; }
+.backups-foot { flex-direction: column; align-items: flex-start; gap: 4px; justify-content: flex-start; }
+progress { width: 100%; height: 8px; border: 0; border-radius: 9px; overflow: hidden; background: var(--neutral-soft); accent-color: var(--primary); }
+progress::-webkit-progress-bar { background: var(--neutral-soft); }
+progress::-webkit-progress-value { background: var(--primary); border-radius: 9px; }
+progress::-moz-progress-bar { background: var(--primary); border-radius: 9px; }
+dialog.modal .kv { font-size: 13px; }
+a.badge:hover { text-decoration: none; }
+@media (max-width: 560px) {
+  .table.backups td.actions-cell .subtle { max-width: 200px; }
+}

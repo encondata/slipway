@@ -27,6 +27,7 @@ from slipway.core.config import get_settings
 from slipway.core.crypto import DecryptionError, decrypt, encrypted_columns
 from slipway.db.base import Base
 from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
+from slipway.services import snapshots
 from slipway.services.deployer import runner
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
@@ -89,15 +90,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await bootstrap(db)
         await check_encryption_key(db)
     await runner.recover_interrupted()
+    # Snapshot storage: create and check the folders, drop unfinished files, check the rows left "checking".
+    # A folder Slipway can't write is logged and answers 503 on the snapshot endpoints; deploys are unaffected.
+    await snapshots.prepare_storage()
     poller = asyncio.create_task(poll_hosts_forever(), name="host-poller")
+    sweeper = asyncio.create_task(snapshots.sweep_forever(), name="snapshot-sweeper")  # expired locked imports
     log.info("Slipway %s started (%s)", __version__, get_settings().env)
     try:
         yield
     finally:
-        poller.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await poller
+        for task in (poller, sweeper):
+            task.cancel()
+        for task in (poller, sweeper):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await runner.shutdown()
+        await snapshots.shutdown()
         await dispose_engine()
 
 

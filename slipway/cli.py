@@ -1,5 +1,5 @@
 """Command-line helpers: ``slipway serve``, ``slipway migrate``, ``slipway create-admin``, ``slipway generate-secrets``,
-``slipway rotate-encryption-key``."""
+``slipway rotate-encryption-key``, ``slipway snapshot pack``."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import argparse
 import asyncio
 import getpass
 import os
+import re
 import secrets
+import socket
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -174,7 +176,7 @@ def create_admin(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
-_REENTER_COLUMNS = {("instances", "env"), ("instances", "app_secrets")}
+_REENTER_COLUMNS = {("instances", "env"), ("instances", "app_secrets"), ("instances", "live_identity")}
 
 
 async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -> tuple[int, list[str]]:
@@ -210,19 +212,69 @@ async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -
     return rotated, unreadable
 
 
+_SNAPSHOT_KEY_LOST = "Its key was lost with an old SLIPWAY_ENCRYPTION_KEY; delete it"
+_FIRST_ADMIN_PASSWORD_LOST = "Set the password again"
+
+
+async def _fix_up_cleared(db: AsyncSession) -> list[str]:
+    """After --clear-unreadable, mark rows whose erased secret they can't work without. Returns what was done.
+
+    Raw SQL by table name, like the column loop: the ORM types would turn unreadable values into None.
+    """
+    from sqlalchemy import text
+
+    import slipway.models  # noqa: F401  (registers every table on Base.metadata)
+    from slipway.db.base import Base
+
+    lines: list[str] = []
+    tables = Base.metadata.tables
+    if "snapshots" in tables:
+        # A ready snapshot without its data key can never be opened again: its .sbx is ciphertext only.
+        lost = (await db.execute(text(
+            "SELECT name FROM snapshots WHERE status = 'ready' AND data_key IS NULL ORDER BY name"
+        ))).scalars().all()
+        if lost:
+            await db.execute(
+                text("UPDATE snapshots SET status = 'failed', error = :error WHERE status = 'ready' AND data_key IS NULL"),
+                {"error": _SNAPSHOT_KEY_LOST},
+            )
+            lines.append(f"Marked {len(lost)} snapshot(s) failed; their key was lost, so delete them on the Snapshots page:")
+            lines.extend(f"  {name}" for name in lost)
+    if "first_admins" in tables:
+        where = "status = 'pending' AND mode = 'password' AND password IS NULL"
+        waiting = (await db.execute(text(f"SELECT instance_id FROM first_admins WHERE {where}"))).scalars().all()
+        if waiting:
+            await db.execute(text(f"UPDATE first_admins SET last_error = :error WHERE {where}"),
+                             {"error": _FIRST_ADMIN_PASSWORD_LOST})
+            lines.append(
+                f"{len(waiting)} first admin(s) waiting to be created lost their password; "
+                "set it again on the instance's page:"
+            )
+            lines.extend(f"  first_admins (instance {instance_id})" for instance_id in waiting)
+    return lines
+
+
+async def _rotate_all(db: AsyncSession, args: argparse.Namespace) -> tuple[int, list[str], list[str]]:
+    rotated, unreadable = await _rotate_secrets(db, clear_unreadable=args.clear_unreadable)
+    fixed = await _fix_up_cleared(db) if args.clear_unreadable else []
+    return rotated, unreadable, fixed
+
+
 def rotate_encryption_key(args: argparse.Namespace) -> None:
-    rotated, unreadable = asyncio.run(
-        _with_db(lambda db, a: _rotate_secrets(db, clear_unreadable=a.clear_unreadable), args)
-    )
+    rotated, unreadable, fixed = asyncio.run(_with_db(_rotate_all, args))
     print(f"Re-encrypted {rotated} secret(s) with the first SLIPWAY_ENCRYPTION_KEY.")
     if not unreadable:
         print("Older keys can now be removed from SLIPWAY_ENCRYPTION_KEY.")
+        if fixed:
+            print("\n".join(fixed))
         return
     if args.clear_unreadable:
         print(f"Erased {len(unreadable)} secret(s) no configured key could decrypt; re-enter them in Slipway.")
         print("Instances listed here refuse to deploy until their variables are re-entered or cleared, or, for")
         print("app secrets, until each secret is set as an instance variable (its old value, to keep the app's data):")
         print("\n".join(f"  {u}" for u in unreadable))
+        if fixed:
+            print("\n".join(fixed))
         return
     print(f"{len(unreadable)} secret(s) could not be decrypted with any configured key and were left unchanged:")
     print("\n".join(f"  {u}" for u in unreadable))
@@ -230,6 +282,158 @@ def rotate_encryption_key(args: argparse.Namespace) -> None:
         "Keep the old key: add it after the new one in SLIPWAY_ENCRYPTION_KEY and run this again. "
         "If it is lost, re-enter those secrets in Slipway or rerun with --clear-unreadable."
     )
+
+
+_ENV_FILE_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _read_env_file(path: str) -> dict[str, str]:
+    """KEY=VALUE lines (``export`` and one pair of matching quotes allowed; # comments). Values are secrets:
+    no message quotes them."""
+    from slipway.services.snapfile import SnapshotError
+
+    values: dict[str, str] = {}
+    with open(path, encoding="utf-8") as f:
+        for number, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = _ENV_FILE_LINE.match(stripped)
+            if match is None:
+                raise SnapshotError(f"{path} line {number} isn't KEY=VALUE")
+            key, value = match.group(1), match.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            values[key] = value
+    return values
+
+
+def _read_passphrase() -> str:
+    """One line from stdin (--passphrase-stdin). Typed at a terminal, it is asked twice."""
+    from slipway.services.snapfile import SnapshotError
+
+    if sys.stdin.isatty():
+        passphrase = getpass.getpass("Passphrase (12+ characters): ")
+        if getpass.getpass("Repeat passphrase: ") != passphrase:
+            raise SnapshotError("The passphrases don't match")
+        return passphrase
+    line = sys.stdin.readline()
+    if not line:
+        raise SnapshotError("--passphrase-stdin was given, but stdin was empty")
+    return line.removesuffix("\n").removesuffix("\r")
+
+
+def _input_file(path: str, flag: str, *, allow_empty: bool = False) -> tuple[int, str]:
+    """Size and SHA-256 of an input file, refusing anything but a readable regular file."""
+    import stat
+
+    from slipway.services.snapfile import SnapshotError, file_digest
+
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise SnapshotError(f"{flag} {path}: {exc.strerror}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise SnapshotError(f"{flag} {path} isn't a regular file")
+    if not info.st_size and not allow_empty:
+        raise SnapshotError(f"{flag} {path} is empty")
+    try:
+        return file_digest(path)
+    except OSError as exc:
+        raise SnapshotError(f"{flag} {path}: {exc.strerror}") from None
+
+
+def _default_source() -> str:
+    """This computer's short name, made to fit the snapshot's ``source`` rule."""
+    name = re.sub(r"[^A-Za-z0-9._ -]", "-", socket.gethostname().split(".")[0])[:100].lstrip("._ -")
+    return name or "local"
+
+
+def _pack_snapshot(args: argparse.Namespace) -> list[str]:
+    from slipway import __version__
+    from slipway.services import snapfile
+    from slipway.services.snapfile import SnapshotError
+
+    if (args.files is None) != (args.files_format is None):
+        raise SnapshotError("--files and --files-format come together")
+    if (args.identity_env is None) != (args.identity is None):
+        raise SnapshotError("--identity-env and --identity come together")
+
+    revision = None
+    if args.revision_file is not None:
+        try:
+            with open(args.revision_file, "rb") as f:
+                raw = f.read(snapfile.REVISION_MAX + 1)
+        except OSError as exc:
+            raise SnapshotError(f"--revision-file {args.revision_file}: {exc.strerror}") from None
+        if len(raw) > snapfile.REVISION_MAX:
+            raise SnapshotError("--revision-file is over 16 KiB")
+        try:
+            # Trimmed, as Slipway trims what commands.revision prints; an empty file means "unknown".
+            revision = raw.decode("utf-8").strip() or None
+        except UnicodeDecodeError:
+            raise SnapshotError("--revision-file isn't UTF-8 text") from None
+
+    identity = None
+    if args.identity_env is not None:
+        keys = [k.strip() for k in args.identity.split(",") if k.strip()]
+        if not keys:
+            raise SnapshotError("--identity names no keys")
+        if len(set(keys)) != len(keys):
+            raise SnapshotError("--identity names a key twice")
+        try:
+            env = _read_env_file(args.identity_env)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise SnapshotError(f"--identity-env {args.identity_env}: {getattr(exc, 'strerror', None) or exc}") from None
+        missing = [k for k in keys if k not in env]
+        if missing:
+            raise SnapshotError(f"{args.identity_env} doesn't set {', '.join(missing)}")
+        identity = {k: env[k] for k in keys}
+
+    db_bytes, db_sha = _input_file(args.database, "--database")
+    files = None
+    if args.files is not None:
+        files_bytes, files_sha = _input_file(args.files, "--files", allow_empty=True)
+        files = {"format": args.files_format, "bytes": files_bytes, "sha256": files_sha}
+    manifest = snapfile.build_manifest(
+        app=args.app, app_name=args.app_name, source=args.source or _default_source(),
+        database={"format": args.format, "revision": revision, "bytes": db_bytes, "sha256": db_sha},
+        repository=args.repository, commit=args.commit, notes=args.notes, files=files, identity=identity,
+        producer=f"slipway {__version__}",
+    )
+    snapfile.validate_manifest(manifest)
+    if identity is not None:
+        snapfile.validate_identity(identity, list(identity))
+    if os.path.lexists(args.out):
+        raise SnapshotError(f"{args.out} already exists; choose another --out or remove it first")
+
+    passphrase = _read_passphrase() if args.passphrase_stdin else None
+    result = snapfile.pack(
+        args.out, manifest, database_path=args.database, files_path=args.files, identity=identity,
+        passphrase=passphrase,
+    )
+    lines = [f"Wrote {result.path}: {result.bytes} bytes, SHA-256 {result.sha256}."]
+    if result.encrypted:
+        lines.append("Upload it on Slipway's Snapshots page (it asks for the passphrase).")
+    else:
+        what = "its keys are not encrypted" if result.has_identity else "it is not encrypted"
+        lines.append(f"Upload it on Slipway's Snapshots page, then delete it: {what}.")
+        lines.append("Add --passphrase-stdin to write an encrypted file instead.")
+    return lines
+
+
+def snapshot_pack(args: argparse.Namespace) -> None:
+    from slipway.services.snapfile import SnapshotError
+
+    try:
+        lines = _pack_snapshot(args)
+    except SnapshotError as exc:
+        sys.exit(f"Error: {exc}")
+    except OSError as exc:
+        sys.exit(f"Error: {exc.strerror or exc}")
+    except KeyboardInterrupt:
+        sys.exit("\nCancelled; nothing was written.")
+    print("\n".join(lines))
 
 
 def serve(args: argparse.Namespace) -> None:
@@ -280,6 +484,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Erase secrets no configured key can decrypt (they must then be re-entered)",
     )
+
+    p = sub.add_parser("snapshot", help="Work with snapshot files")
+    snap = p.add_subparsers(dest="snapshot_command", required=True, metavar="pack")
+    p = snap.add_parser(
+        "pack",
+        help="Make a snapshot file from a database dump (and optionally files and identity keys) to upload to Slipway",
+    )
+    p.add_argument("--app", required=True, help="The app id: data.app in the app's slipway.yml")
+    p.add_argument("--app-name", required=True, help="The app's name, as people know it")
+    p.add_argument("--format", required=True, help="The dump's format: data.format in the app's slipway.yml")
+    p.add_argument("--database", required=True, metavar="FILE", help="The database dump")
+    p.add_argument("--revision-file", metavar="FILE", help="A file holding the database's revision (what commands.revision prints)")
+    p.add_argument("--commit", metavar="SHA", help="The commit the data was made with (40 hex characters)")
+    p.add_argument("--repository", metavar="OWNER/NAME", help="The GitHub repository the data belongs to")
+    p.add_argument("--files", metavar="FILE", help="The app's files, as commands.export_files writes them")
+    p.add_argument("--files-format", metavar="F", help="Their format: data.files.format in the app's slipway.yml")
+    p.add_argument("--identity-env", metavar="FILE", help="A KEY=VALUE file holding the identity keys")
+    p.add_argument("--identity", metavar="K1,K2", help="Which keys of --identity-env to include")
+    p.add_argument("--source", help="Where the data comes from (default: this computer's name)")
+    p.add_argument("--notes", default="", help="Notes shown with the snapshot")
+    p.add_argument(
+        "--passphrase-stdin",
+        action="store_true",
+        help="Encrypt the file with a passphrase read from stdin (recommended; asked twice at a terminal)",
+    )
+    p.add_argument("--out", required=True, metavar="FILE", help="The file to write (must not exist yet)")
     return parser
 
 
@@ -295,6 +525,8 @@ def main() -> None:
         create_admin(args)
     elif args.command == "rotate-encryption-key":
         rotate_encryption_key(args)
+    elif args.command == "snapshot" and args.snapshot_command == "pack":
+        snapshot_pack(args)
 
 
 if __name__ == "__main__":

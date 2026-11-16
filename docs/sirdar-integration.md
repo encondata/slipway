@@ -1,6 +1,8 @@
 # Bringing Sirdar into Slipway
 
-Status: phase 1 is built on branch `sirdar` (from `instance-folders`); phases 2 to 6 are the plan.
+Status: phases 1 (manifest and steps) and 2 (data safety) are built on branch `sirdar`
+(from `instance-folders`); phase 2 still has to pass the real-host checks below. Phases 3
+to 6 are the plan.
 
 ## Goal
 
@@ -22,7 +24,7 @@ it deploys the same way. Once it matches Sirdar, Sirdar is retired.
 | Engine | shell over its own SSH session, one log per deployment | 17 numbered steps as Ansible playbooks, one log per step, retry from the failed step |
 | Targets | SSH hosts | SSH, Proxmox (Terraform), ESXi (pyvmomi), DigitalOcean (VPC, droplets, managed Postgres, Spaces, load balancer, firewall, certificates) |
 | Traffic | Switchyard routes | Cloudflare DNS, Nginx Proxy Manager on the LAN, DigitalOcean load balancer plus Caddy in the cloud |
-| Data | the app's own volumes | dumps before every change, restore, reset, roll back, snapshot bundles, VM snapshots |
+| Data | phase 2: a backup before every change that replaces data, the Backups list, restore, reset, roll back, encrypted snapshots ([snapshots.md](snapshots.md)) | a dump before each Update only (not before a restore or a reset), restore, reset, roll back, snapshot bundles, VM snapshots |
 
 Sirdar's ServerSherpa knowledge sits in a few modules: `envfile.py` (the `.env`
 keys, the secrets and how each is generated, the services and their ports),
@@ -38,9 +40,9 @@ app's repository, `slipway.yml`. BaseCampV3 already has most of what the
 manifest points at: `ss-stack` runs the stacks in order, dumps, restores and
 creates the first admin.
 
-Phase 1's format is in `slipway/services/manifest.py`, and the ServerSherpa
-manifest is [examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml).
-In short:
+The format is described in [manifest.md](manifest.md), and the ServerSherpa
+manifest is [examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml)
+(BaseCampV3's `slipway.yml` on branch `slipway-manifest`). Phase 1, in short:
 
 - `env_file` is the app's own `.env` template (ServerSherpa's
   `deploy/stack/env.example`). Slipway writes `<instance folder>/shared/.env` from
@@ -63,30 +65,72 @@ In short:
 - `commands` are `build`, `start` and `stop`: programs in the repository, run from
   the release.
 
-Phase 2 adds what this needs for data (a sketch):
+Phase 2 adds the app's data (all optional; [manifest.md](manifest.md#data) has
+every key):
+
+- `data` says what the data is: the app's id (`serversherpa`; a snapshot seeds
+  only an app with the same id), the dump's format label (`pg-custom`), the
+  Docker volumes that hold it (the database, the SeaweedFS objects and the status
+  page's volume, which Reset deletes), the files' format and the words the
+  dialogs use for the identity keys.
+- `secrets` marked `identity: true` (`SS_PASSWORD_PEPPER`, `SS_TOTP_ENCRYPTION_KEY`)
+  are the keys the data was made with. They travel with every backup and
+  snapshot, and a restore puts them back.
+- `commands` gains the data commands, each an `ss-stack` subcommand.
+  `{slipway.out}` and `{slipway.in}` are the files Slipway names; it checks,
+  hashes, keeps and prunes them itself, so `dump` is `ss-stack pgdump` (one file,
+  no naming or rotation of its own), not `ss-stack dump`.
+- `first_admin` is how a deploy creates the first account. The password goes to
+  `ss-stack admin` on stdin, never in argv.
 
 ```yaml
-data:                           # what Slipway can attach instead of the app's own
-  postgres:
-    self_hosted: deploy/stack/db          # skipped when a managed one is attached
-    env: {url: SS_DATABASE_URL, ssl: SS_DATABASE_SSL, ca: SS_DATABASE_CA_B64, password: POSTGRES_PASSWORD}
-  objects:
-    self_hosted: deploy/stack/storage
-    env: {bucket: SS_SPACES_BUCKET, key: SS_SPACES_ACCESS_KEY, secret: SS_SPACES_SECRET_KEY,
-          endpoint: SS_SPACES_ENDPOINT, region: SS_SPACES_REGION, path_style: SS_SPACES_USE_PATH_STYLE}
-  external_flag: STACK_EXTERNAL_DATA
-
 secrets:
-  SS_PASSWORD_PEPPER: {kind: hex, identity: true}   # travels with snapshots
+  SS_TOTP_ENCRYPTION_KEY: {kind: fernet, identity: true}
+  SS_PASSWORD_PEPPER:     {kind: hex, identity: true}
+
+data:
+  app: serversherpa
+  format: pg-custom
+  volumes:
+    - {name: "ss-{STACK_ENV}-db_pgdata",           holds: database}
+    - {name: "ss-{STACK_ENV}-storage_seaweeddata", holds: files}
+    - {name: "ss-{STACK_ENV}-status_status-data",  holds: other}
+  files: {format: serversherpa-objects-v1, label: Uploaded files}
 
 commands:                       # added to build, start and stop
-  dump: [deploy/stack/ss-stack, pgdump, "{slipway.env_dir}", "{out}"]
-  restore: [deploy/stack/ss-stack, restore, "{slipway.env_dir}", "{in}"]
-  revision: [deploy/stack/ss-stack, revision, "{slipway.env_dir}"]
-  first_admin: [deploy/stack/ss-stack, admin, "{slipway.env_dir}", bootstrap-admin, --email, "{email}"]
+  has_data:     [deploy/stack/ss-stack, has-data, "{slipway.env_dir}"]
+  data_up:      [deploy/stack/ss-stack, data, "{slipway.env_dir}"]
+  dump:         [deploy/stack/ss-stack, pgdump, "{slipway.env_dir}", "{slipway.out}"]
+  verify_dump:  [deploy/stack/ss-stack, verify-dump, "{slipway.env_dir}", "{slipway.in}"]
+  revision:     [deploy/stack/ss-stack, revision, "{slipway.env_dir}"]
+  accepts:      [deploy/stack/ss-stack, accepts, "{slipway.env_dir}", "{slipway.in}"]
+  restore:      [deploy/stack/ss-stack, restore, "{slipway.env_dir}", "{slipway.in}"]
+  export_files: [deploy/stack/ss-stack, export-objects, "{slipway.env_dir}", "{slipway.out}"]
+  import_files: [deploy/stack/ss-stack, import-objects, "{slipway.env_dir}", "{slipway.in}"]
+  after_import: [deploy/stack/ss-stack, clear-sessions, "{slipway.env_dir}"]
+  seed:         [deploy/stack/ss-stack, seed, "{slipway.env_dir}"]
 
-migrations: expand_contract     # Blue/Green slots share one database
+first_admin:                    # ss-stack admin runs serversherpa bootstrap-admin itself
+  command: [deploy/stack/ss-stack, admin, "{slipway.env_dir}", --email, "{admin.email}",
+            --first-name, "{admin.first_name}", --last-name, "{admin.last_name}",
+            --role, super_admin, --link-minutes, "240"]
+  password: {min_length: 8, stdin: true, args: [--password-stdin]}
+  invite:   {args: [--invite]}
+  done_codes: [0]
+  exists_codes: [10]            # the account already exists
 ```
+
+The draft's sketch of this was wrong in one place: its first admin passed
+`bootstrap-admin` to `ss-stack admin`, which already runs it (so
+`bootstrap-admin` reached the command twice and it failed with a usage error),
+and it lacked the required `--first-name` and `--last-name`.
+
+The draft's attachable data (a managed Postgres or Spaces bucket in place of
+the app's own stacks, with the `.env` keys that point the app at them) and
+`migrations: expand_contract` belong to phases 3 and 4. In phase 2 an instance
+whose data lives outside its host (`STACK_EXTERNAL_DATA=1`, `STACK_DB_HOST`, or
+a LAN data VM, where `ss-stack has-data` exits 4) is backed up, but Slipway
+won't restore over it, roll it back, reset it or seed it.
 
 A repository without `slipway.yml` deploys exactly as it does today.
 
@@ -126,13 +170,19 @@ deployment keeps one log in which each step starts with a `── Step N/M: name
 line. Retry runs a failed deployment's commit again: it reuses the release and the
 build when they are still on the host (the release of a deployment that failed
 after its build is kept for that), and runs the settings, ports and start again.
-Environment deploys will add Prepare server, Pre-deploy dump, Restore, Smoke test,
-Switch traffic and the teardown steps.
+Phase 2 adds Back up the data (after Build) to an app's deploys, and data jobs
+(restore, reset, roll back, snapshots, first admin, starter content) run as
+deployments of their own kind with their own steps. Environment deploys will add
+Prepare server, Restore, Smoke test, Switch traffic and the teardown steps.
 
-**Backups and snapshots.** A dump before every change that replaces data, kept
-per environment (newest N). Restore, reset, roll back. Snapshot bundles (database
-plus the manifest's `identity` secrets, encrypted) to seed new environments, and
-VM snapshots on Proxmox and ESXi.
+**Backups and snapshots (phase 2).** A backup before every change that replaces
+data: before a deploy (which migrates), a restore, a reset and a roll back, kept
+per instance (newest N) on its host. Sirdar dumps only before an Update. Restore,
+reset, start over and roll back, each refused before it changes anything when the
+copy doesn't fit. Snapshots (the database, the files and the manifest's `identity`
+secrets, encrypted) to seed new instances, kept on the Slipway server, and
+downloadable with a passphrase. [snapshots.md](snapshots.md) describes them. VM
+snapshots on Proxmox and ESXi come with phase 5.
 
 ## Decisions taken in this draft
 
@@ -157,10 +207,31 @@ Each phase merges on its own and leaves Slipway working.
 
 1. **Manifest and steps (built).** `slipway.yml`, generated secrets, optional
    services, numbered steps and retry. ServerSherpa deploys to one SSH host with
-   its own Postgres and object store. Still to do: add `slipway.yml` to BaseCampV3
-   and deploy it on a real host.
-2. **Data safety.** Dumps before changes, the Backups list, restore, reset, roll
-   back, snapshot bundles and seeding a new environment from one, the first admin.
+   its own Postgres and object store. BaseCampV3's `slipway.yml` is on branch
+   `slipway-manifest` (PR #2); it still has to be deployed on a real host.
+2. **Data safety (built; real-host checks to do).** Backups before changes, the
+   Backups list, restore, reset, start over, roll back, snapshots (take, upload,
+   download, seed a new instance from one), starter content and the first admin.
+   The design is [phase2-data-safety.md](phase2-data-safety.md). BaseCampV3's side
+   is on `slipway-manifest` too: the data commands in `slipway.yml`, the new
+   `ss-stack` subcommands (`has-data`, `accepts`, `verify-dump`, `clear-sessions`,
+   `export-objects`, `import-objects`; `seed` adds the Learning space itself when
+   learn runs), `deploy/stack/objects.py`, and `scripts/make-seed-snapshot.sh`
+   making Slipway snapshots with `slipway snapshot pack`.
+
+   **Real-host checks** (not in CI). Deploy BaseCampV3 `slipway-manifest` twice,
+   then:
+   1. Back up now;
+   2. take a snapshot;
+   3. reset from it;
+   4. roll back a commit with a failing migration;
+   5. download it with a passphrase and import it into a second Slipway;
+   6. seed a new instance from it;
+   7. Start over after a failed first deploy;
+   8. an instance with `STACK_EXTERNAL_DATA=1` shows that its data lives outside
+      the host, and still backs up.
+
+   After each, a user signs in with their own password and 2FA.
 3. **Environments and slots.** Environments, Blue/Green on SSH hosts with a
    separate data server, Switchyard switching, Activate, Cloudflare DNS.
 4. **DigitalOcean.** Accounts (production and development), VPC, droplets as hosts,

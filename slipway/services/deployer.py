@@ -27,6 +27,11 @@ touched by a redeploy. A failed deployment removes its release again unless cont
 started from it. Persistent data must live in named volumes or absolute host paths:
 relative bind mounts (``./data``) do not survive a redeploy.
 
+App instances (slipway.yml) also run data jobs, each a Deployment with a ``kind`` (spec §7): restore, roll back
+and reset run the live release again in place with data steps between build and start; Back up now, Take
+snapshot, Create first admin and Add starter content use the live release as it runs; Start over cleans up
+after failed first deploys. Nothing replaces app data before a checked copy of it is on the host (I1).
+
 Claimed instances (see ``api.v1.unmanaged``) were running before Slipway knew them. A claimed
 compose project keeps its project name, so Compose replaces its containers and keeps its named
 volumes. A claimed standalone container is stopped just before ``docker run``, removed once the
@@ -38,30 +43,57 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import posixpath
+import queue
 import re
 import shlex
 import tarfile
 import tempfile
+import threading
 import time
+import unicodedata
 import uuid
 import zlib
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, null, select, update
 
+from slipway import __version__
+from slipway.core.config import get_settings
+from slipway.core.permissions import Perm
 from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
-from slipway.models import BuildSource, Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
-from slipway.services import manifest, ports, ssh, switchyard
+from slipway.models import (
+    Backup,
+    BackupReason,
+    BackupStatus,
+    BuildSource,
+    Deployment,
+    DeploymentKind,
+    DeploymentStatus,
+    FirstAdmin,
+    FirstAdminStatus,
+    FreshData,
+    Host,
+    Instance,
+    InstanceStatus,
+    Repository,
+    Snapshot,
+    SnapshotStatus,
+    User,
+)
+from slipway.models.data import REVISION_MAX_BYTES
+from slipway.services import audit, data, manifest, ports, snapfile, snapshots, ssh, switchyard
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
+from slipway.services.snapfile import SnapshotError
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +101,7 @@ q = shlex.quote
 KEEP_RELEASES = 3
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9._/@+-]+$")
-ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}")
 
@@ -255,6 +287,21 @@ class InstancePaths:
     def current(self) -> str:
         return f"{self.base}/current"
 
+    @property
+    def backups(self) -> str:
+        """App mode: the instance's backups (0700), each a ``<name>.dump`` with its sidecar (services.data)."""
+        return data.backups_dir(self.base)
+
+    @property
+    def incoming(self) -> str:
+        """App mode: where backups are written before they are checked; emptied by every job's first host step."""
+        return data.incoming_dir(self.base)
+
+    @property
+    def lock(self) -> str:
+        """App mode: the host lock, naming the job and the PID of the command it runs (§4.5)."""
+        return data.lock_path(self.base)
+
     def release(self, sha: str, deployment_id: uuid.UUID) -> str:
         return f"{self.releases}/{sha[:12]}-{deployment_id.hex[:8]}"
 
@@ -277,7 +324,7 @@ def paths_for(instance: Instance) -> InstancePaths:
 
 MARKER_FILE = ".slipway-instance"
 # What Slipway puts in an instance's folder; nothing else in it is ever removed.
-SLIPWAY_ENTRIES = ("releases", "shared", "current", MARKER_FILE)
+SLIPWAY_ENTRIES = ("releases", "shared", "current", data.BACKUPS_DIR, data.LOCK_FILE, MARKER_FILE)
 DIR_MARK = "slipway-dir:"
 
 
@@ -623,9 +670,10 @@ def teardown_command(instance: Instance) -> str:
     app: list[str] = []
     if instance.build_source == BuildSource.APP:
         state = instance.app_state or {}
-        stop = state.get("commands", {}).get("stop")
+        # Read through command_argv: app_state holds either the old list form or {"argv", "stream"}.
+        stop = manifest.command_argv((state.get("commands") or {}).get("stop"))
         if stop:
-            app.append(f"({app_command(paths.current, list(stop))}) >/dev/null 2>&1")
+            app.append(f"({app_command(paths.current, stop)}) >/dev/null 2>&1")
         app += [f"(cd / && docker compose -p {q(p)} down --remove-orphans) >/dev/null 2>&1" for p in app_known_projects(instance)]
         refs = sorted({r for refs in (state.get("releases") or {}).values() for r in refs if manifest.IMAGE_RE.match(r)})
         if refs:  # without -f: one another instance's container still uses stays
@@ -703,50 +751,154 @@ def _claim_dir_inside(instance: Instance, directory: str) -> bool:
 
 
 KEPT_MARK = "slipway-env-kept"  # a line of its own: error messages naming the .slipway-kept folder never equal it
+BACKUPS_KEPT_MARK = "slipway-backups-kept"  # "<mark> <number of dumps> <folder>"
+BACKUPS_FAILED_MARK = "slipway-backups-failed"
+DUMPS_MARK = "slipway-dump:"
+
+
+def kept_backups_path(paths: InstancePaths, instance: Instance) -> str:
+    """Where deleting an app instance moves its ``backups/`` folder (a UTC time is added when it is taken)."""
+    return f"{paths.root}/.slipway-kept/{paths.slug}-{instance.id.hex[:8]}.backups"
+
+
+def _dumps_listing(backups: str) -> str:
+    """Names of the ``*.dump`` files in ``backups`` (no glob: zsh fails an unmatched one)."""
+    return f"ls -A {q(backups)} 2>/dev/null | grep '\\.dump$'"
 
 
 def keep_env_command(instance: Instance) -> str:
-    """App mode: copy ``shared/.env`` out of the folder (mode 600) when the app's projects still have volumes,
-    so their data can be opened again. Prints ``KEPT_MARK`` when it copied it."""
+    """App mode, after teardown: keep what the app's data needs outside the folder (§4.6).
+
+    When the app's projects still have volumes, or ``backups/`` holds a dump, ``shared/.env`` is copied out
+    (mode 600; prints ``KEPT_MARK``) and ``backups/`` is moved to ``.slipway-kept`` (prints ``BACKUPS_KEPT_MARK
+    <dumps> <folder>``). A failed copy of the .env exits 1; a failed move of the backups exits 2 (the folder,
+    with both, then stays where it is)."""
     paths = paths_for(instance)
     dest = kept_env_path(paths, instance)
-    vols = "; ".join(f"docker volume ls -q --filter {_project_filter(p)}" for p in app_known_projects(instance))
+    vols = "; ".join(f"docker volume ls -q --filter {_project_filter(p)}" for p in app_known_projects(instance)) or "true"
+    b, kept = q(paths.backups), q(kept_backups_path(paths, instance))
     return (
-        f"v=$({{ {vols}; }} 2>/dev/null); [ -n \"$v\" ] && [ -f {q(paths.env_file)} ] || exit 0; "
-        f"umask 077 && mkdir -p {q(posixpath.dirname(dest))} && cp -f {q(paths.env_file)} {q(dest)} && echo {q(KEPT_MARK)}"
+        f"v=$({{ {vols}; }} 2>/dev/null); d=$({_dumps_listing(paths.backups)}); "
+        f"[ -n \"$v\" ] || [ -n \"$d\" ] || exit 0; "
+        f"umask 077 && mkdir -p {q(posixpath.dirname(dest))} || exit 1; "
+        f"if [ -f {q(paths.env_file)} ]; then cp -f {q(paths.env_file)} {q(dest)} && echo {q(KEPT_MARK)} || exit 1; fi; "
+        f"if [ -d {b} ] && [ ! -L {b} ]; then rm -rf -- {q(paths.incoming)}; "
+        f"if [ -n \"$(ls -A {b} 2>/dev/null)\" ]; then k={kept}; "
+        f"[ -e \"$k\" ] && k=\"$k-$(date -u +%Y%m%dT%H%M%SZ)\"; "
+        f"mv -- {b} \"$k\" 2>&1 || {{ echo {q(BACKUPS_FAILED_MARK)}; exit 2; }}; "
+        f"n=$(ls -A \"$k\" | grep -c '\\.dump$'); echo \"{BACKUPS_KEPT_MARK} $n $k\"; fi; fi; true"
     )
 
 
-async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_session) -> str | None:
+async def _write_identity_files(remote: ssh.RemoteSession, instance: Instance, paths: InstancePaths,
+                                names: list[str], report: dict[str, Any] | None) -> None:
+    """Next to each kept dump, ``<name>.identity.env`` (0600): the identity values its data was made with,
+    which only Slipway's database held (data-loss 16). The rows go with the instance."""
+    async with session_scope() as db:
+        rows = (await db.scalars(select(Backup).where(Backup.instance_id == instance.id,
+                                                      Backup.status == BackupStatus.READY))).all()
+    listed = set(names)
+    kept = []
+    for row in rows:
+        if not data.NAME_RE.match(row.name or "") or row.name not in listed:
+            continue
+        kept.append({"name": row.name, "db_sha256": row.db_sha256})
+        if row.identity:
+            text = "".join(f"{k}={v}\n" for k, v in sorted(row.identity.items()) if "\n" not in str(v))
+            await remote.write_text(f"{paths.backups}/{row.name}.identity.env", text)
+    if report is not None:
+        report["backups"] = kept
+
+
+async def keep_identity_files(instance: Instance, *, connect: ConnectFactory = ssh.open_session) -> str | None:
+    """Removing an instance from Slipway only (purge=false): its dumps stay on the host, and the rows that hold
+    their identity values go. When a ready backup was taken with other identity values than the data's
+    (``live_identity``, which ``shared/.env`` keeps), the ``<name>.identity.env`` files are written next to the
+    dumps, as Destroy does (D18); nothing else on the host changes. A warning when that couldn't be done."""
+    if instance.build_source != BuildSource.APP:
+        return None
+    async with session_scope() as db:
+        rows = (await db.scalars(select(Backup).where(Backup.instance_id == instance.id,
+                                                      Backup.status == BackupStatus.READY))).all()
+    live = instance.live_identity or {}
+    others = sorted(r.name for r in rows if data.NAME_RE.match(r.name or "") and r.identity
+                    and any(live.get(k) != v for k, v in r.identity.items()))
+    if not others:
+        return None
+    paths = paths_for(instance)
+    host = instance.host.name
+    try:
+        async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+            _, listing = await remote.run(_dumps_listing(paths.backups), check=False, timeout=60)
+            dumps = [ln.strip()[:-5] for ln in listing.splitlines() if data.FILE_RE.match(ln.strip())]
+            if dumps:
+                await _write_identity_files(remote, instance, paths, dumps, None)
+    except Exception as exc:  # never block removing the instance on it: say what is lost
+        return (f"The {data.identity_label(instance)} of backup{'s' if len(others) != 1 else ''} {', '.join(others)} "
+                f"could not be written next to {'them' if len(others) != 1 else 'it'} on {host} "
+                f"({clean_text(str(exc))[:200]}); Slipway no longer has a copy")
+    return None
+
+
+async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_session,
+                  report: dict[str, Any] | None = None) -> str | None:
     """Remove the instance's containers, images and files from its host.
 
     Raises if containers are left behind. Returns a warning naming what is left when only
-    files could not be removed, or, for an app whose volumes stay, where its ``.env`` was kept.
+    files could not be removed, or, for an app whose volumes or backups stay, where its ``.env`` and its
+    backups were kept. ``report`` (optional) receives ``backups``: the names and SHA-256s of the backups kept
+    (for the audit record), and ``kept_backups``: their folder.
     """
     paths = paths_for(instance)
     host = instance.host.name
     kept: str | None = None  # where the app's .env was copied
-    keep_folder = False  # the copy failed: the folder, with its .env, stays
+    kept_backups: tuple[int, str] | None = None  # (dumps, folder) the app's backups were moved to
     async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
-        if instance.build_source == BuildSource.APP and app_known_projects(instance):
-            # The volumes stay (Slipway never removes data); their secrets are only in the .env and this row.
-            status, output = await remote.run(keep_env_command(instance), check=False, timeout=120)
-            if status == 0 and any(line.strip() == KEPT_MARK for line in output.splitlines()):
-                kept = kept_env_path(paths, instance)
-            elif status != 0:
-                keep_folder = True
+        # Teardown and the leftovers check come first: nothing has been moved when containers stay (data-loss 2).
         await remote.run(teardown_command(instance), timeout=600)
         _, left = await remote.run(leftovers_command(instance), timeout=60)
         if _container_ids(left):
-            if kept:  # the instance stays: so does its .env, in its folder
-                with contextlib.suppress(Exception):
-                    await remote.run(f"rm -f -- {q(kept)}", check=False, timeout=60)
             raise DeployError(f"Containers of {instance.name} are still on {host}; nothing was deleted")
-        notes = [f"Kept the app's volumes on {host}, and its settings and secrets in {kept} "
-                 f"(readable only by {instance.host.username})"] if kept else []
-        if keep_folder:
-            return (f"Kept {paths.base} on {host}: the app's volumes stay, and its settings and secrets could not be "
-                    f"copied to {posixpath.dirname(kept_env_path(paths, instance))}, so they stay in {paths.env_file}")
+        if instance.build_source == BuildSource.APP:
+            _, listing = await remote.run(_dumps_listing(paths.backups), check=False, timeout=60)
+            dumps = [ln.strip()[:-5] for ln in listing.splitlines() if data.FILE_RE.match(ln.strip())]
+            if dumps:
+                await _write_identity_files(remote, instance, paths, dumps, report)
+            if dumps or app_known_projects(instance):
+                # The volumes stay (Slipway never removes data); their secrets are only in the .env and this row.
+                status, output = await remote.run(keep_env_command(instance), check=False, timeout=600)
+                lines = [ln.strip() for ln in output.splitlines()]
+                if any(ln == KEPT_MARK for ln in lines):
+                    kept = kept_env_path(paths, instance)
+                for ln in lines:
+                    words = ln.split(" ", 2)
+                    if len(words) == 3 and words[0] == BACKUPS_KEPT_MARK and words[1].isdigit():
+                        kept_backups = (int(words[1]), words[2])
+                if status == 2:
+                    detail = next((clean_text(ln)[:200] for ln in lines if ln and ln != BACKUPS_FAILED_MARK
+                                   and ln != KEPT_MARK), "")
+                    if kept:
+                        with contextlib.suppress(Exception):
+                            await remote.run(f"rm -f -- {q(kept)}", check=False, timeout=60)
+                    return (f"Kept {paths.base} on {host}: its backups could not be moved to {paths.root}/.slipway-kept"
+                            + (f" ({detail})" if detail else ""))
+                if status != 0:
+                    return (f"Kept {paths.base} on {host}: the app's volumes stay, and its settings and secrets could "
+                            f"not be copied to {posixpath.dirname(kept_env_path(paths, instance))}, so they stay in "
+                            f"{paths.env_file}")
+        if report is not None and kept_backups is not None:
+            report["kept_backups"] = kept_backups[1]
+        notes = []
+        if kept_backups is not None:
+            n = kept_backups[0]
+            label = data.identity_label(instance)
+            what = f"settings, secrets and {n}" if kept else str(n)
+            volumes = f"the app's volumes on {host}, and " if app_known_projects(instance) else ""
+            notes.append(f"Kept {volumes}its {what} backup{'s' if n != 1 else ''} (with their {label}) in "
+                         f"{paths.root}/.slipway-kept/ (readable only by {instance.host.username})")
+        elif kept:
+            notes.append(f"Kept the app's volumes on {host}, and its settings and secrets in {kept} "
+                         f"(readable only by {instance.host.username})")
         if _claim_dir_inside(instance, paths.base):
             return " ".join([*notes, f"Kept {paths.base} on {host}: the claimed project's own directory is inside it"])
         status, output = await remote.run(remove_dir_command(instance), check=False, timeout=600)
@@ -802,11 +954,12 @@ def _moving(paths: InstancePaths) -> str:
     return f"{paths.root}/.{paths.slug}.moving"
 
 
-def move_prepare_command(new: list[InstancePaths]) -> str:
+def move_prepare_command(new: list[InstancePaths], old: list[InstancePaths] | None = None) -> str:
     """Create the new folders' parents and check nothing is in the way; on failure prints a MOVE_MARK line.
 
     A new folder may already exist if it is empty (made in advance, say); it is removed so the copy
-    can take its name.
+    can take its name. With ``old`` (the same order), a folder holding backups must fit where it goes:
+    ``slipway-move: nospace <need KiB> <free KiB> <old folder>`` (§4.6).
     """
     parts = []
     for root in dict.fromkeys(p.root for p in new):
@@ -817,6 +970,14 @@ def move_prepare_command(new: list[InstancePaths]) -> str:
         base = q(p.base)
         parts.append(f"if [ -L {base} ] || {{ [ -e {base} ] && ! rmdir -- {base} 2>/dev/null; }}; "
                      f"then echo {q(f'{MOVE_MARK} exists {p.base}')}; exit 1; fi")
+    for o, n in zip(old or [], new, strict=False):
+        b = q(o.backups)
+        parts.append(
+            f"if [ -d {b} ]; then need=$(du -sk -- {q(o.base)} 2>/dev/null | awk '{{print $1}}'); "
+            f"free=$(df -Pk -- {q(n.root)} | awk 'NR==2 {{print $4}}'); "
+            f'if [ -n "$need" ] && [ -n "$free" ] && [ "$need" -gt "$free" ]; then '
+            f'echo "{MOVE_MARK} nospace $need $free {o.base}"; exit 1; fi; fi'
+        )
     return "; ".join(parts)
 
 
@@ -871,17 +1032,22 @@ def bind_sources_command(instance: Instance) -> str:
 LEFT_MARK = "slipway-left:"
 
 
-def _remove_base_command(paths: InstancePaths) -> str:
+def _remove_base_command(paths: InstancePaths, *, backups: bool = False) -> str:
     """Remove what Slipway put in the folder, then the folder if nothing else is in it.
 
     Files someone else put there stay: the command then prints ``LEFT_MARK`` and their names, and
-    fails. Files containers wrote as root are removed through a throwaway container.
+    fails. Files containers wrote as root are removed through a throwaway container. ``backups/`` goes only
+    when it is empty (destroy moved it away first), unless ``backups`` (a folder move copied it: §4.6).
     """
     base = q(paths.base)
     parts = [f"[ -e {base} ] || [ -L {base} ] || exit 0; cd {base} || exit 1"]
     for name in ("releases", "shared"):
         parts.append(f"{{ rm -rf -- {name} 2>/dev/null || {_root_rm(base, name)} >/dev/null 2>&1; }}")
-    parts.append(f"rm -f -- current {MARKER_FILE}; cd / && rmdir -- {base} 2>/dev/null")
+    if backups:
+        parts.append(f"{{ [ ! -e {data.BACKUPS_DIR} ] || rm -rf -- {data.BACKUPS_DIR}; }}")
+    else:
+        parts.append(f"{{ rmdir -- {data.BACKUPS_DIR}/{data.INCOMING_DIR} {data.BACKUPS_DIR} 2>/dev/null; true; }}")
+    parts.append(f"rm -f -- current {MARKER_FILE} {data.LOCK_FILE}; cd / && rmdir -- {base} 2>/dev/null")
     parts.append(
         f"if [ -e {base} ]; then echo \"{LEFT_MARK} $(ls -A {base} | head -n 5 | tr '\\n' ' ')\"; exit 1; fi"
     )
@@ -940,8 +1106,17 @@ async def _move_dirs(
 ) -> list[str]:
     notes: list[str] = []
     async with connect(ssh.SSHTarget.from_host(host)) as remote:
-        status, output = await remote.run(move_prepare_command([new for _, _, new in moves]), check=False, timeout=60)
+        status, output = await remote.run(move_prepare_command([new for _, _, new in moves], [old for _, old, _ in moves]),
+                                          check=False, timeout=600)
         if status:
+            room = next((ln.split(" nospace ", 1)[1].split(" ", 2) for ln in output.splitlines()
+                         if f"{MOVE_MARK} nospace " in ln), None)
+            if room is not None and len(room) == 3 and room[0].isdigit() and room[1].isdigit():
+                who = next((inst.name for inst, old, _ in moves if old.base == room[2]), "the instance")
+                raise DeployError(
+                    f"{target} on {host.name} has {data.human_bytes(int(room[1]) * 1024)} free; moving {who} needs "
+                    f"{data.human_bytes(int(room[0]) * 1024)} (its backups included). Free some space or delete old "
+                    "backups first.")
             if f"{MOVE_MARK} not-writable" in output:
                 where = next((ln.split(" not-writable ", 1)[1].strip() for ln in output.splitlines()
                               if f"{MOVE_MARK} not-writable " in ln), target)
@@ -1000,7 +1175,7 @@ async def _move_dirs(
                     notes.append(f"Kept {old.base}: {inst.name}'s containers mount files from it. "
                                  f"Redeploy {inst.name}, then delete {old.base}.")
                     continue
-                status, output = await remote.run(_remove_base_command(old), check=False, timeout=600)
+                status, output = await remote.run(_remove_base_command(old, backups=True), check=False, timeout=600)
             except (ssh.SSHError, DeployError) as exc:
                 notes.append(f"Could not remove {old.base} ({exc}); delete it by hand.")
                 continue
@@ -1091,11 +1266,17 @@ class LogSink:
     Writes never raise: a failed write is kept and retried with the next flush. The stored
     log is capped: past ``LOG_HEAD_CHARS`` only the last ``LOG_TAIL_CHARS`` are kept, and
     ``close`` appends them.
+
+    ``hide`` holds the secret values of the job (the app's secrets, the instance's variables, identity keys,
+    the first admin's password): ``scrub`` replaces each with ``[hidden]``, and every line, step note and
+    error is scrubbed before it is cut or stored (§12.2). A value printed split up or encoded differently
+    is not caught.
     """
 
-    def __init__(self, deployment_id: uuid.UUID, flush_interval: float = 1.0) -> None:
+    def __init__(self, deployment_id: uuid.UUID, flush_interval: float = 1.0, *, hide: ssh.Redactor | None = None) -> None:
         self.deployment_id = deployment_id
         self.flush_interval = flush_interval
+        self.hide = hide if hide is not None else ssh.Redactor()
         self._buf: list[str] = []
         self._size = 0  # characters stored or waiting in _buf
         self._new = 0  # lines since the last flush attempt
@@ -1106,8 +1287,11 @@ class LogSink:
         self._last = time.monotonic()
         self._lock = asyncio.Lock()
 
+    def scrub(self, text: str) -> str:
+        return self.hide.scrub(text)
+
     async def line(self, text: str) -> None:
-        entry = f"[{utcnow():%H:%M:%S}] {ssh.clip_line(clean_text(text))}\n"
+        entry = f"[{utcnow():%H:%M:%S}] {ssh.clip_line(self.scrub(clean_text(text)))}\n"
         if not self._truncated and self._size + len(entry) <= LOG_HEAD_CHARS:
             self._buf.append(entry)
             self._size += len(entry)
@@ -1167,11 +1351,15 @@ async def _finish(
     *,
     error: str | None = None,
     short: bool = False,
+    scrub: Callable[[str], str] | None = None,
     **instance_fields: Any,
 ) -> None:
-    """Record the outcome, retrying with backoff so a deployment never stays running."""
+    """Record the outcome, retrying with backoff so a deployment never stays running.
+
+    ``scrub`` hides the job's secrets in ``error`` before it is cut (a secret straddling the cut stays hidden).
+    """
     if error is not None:
-        error = clean_text(error)[:2000]
+        error = clean_text(scrub(error) if scrub else error)[:2000]
     delays = FINISH_RETRY_DELAYS[:3] if short else FINISH_RETRY_DELAYS
     for attempt in range(len(delays) + 1):
         try:
@@ -1201,27 +1389,132 @@ STEP_NAMES = {
     "resolve": "Resolve the commit",
     "source": "Download the source",
     "upload": "Upload the release",
+    "release": "Check the live release",
     "manifest": "Read slipway.yml",
     "settings": "Write the settings",
     "ports": "Check host ports",
     "build": "Build",
+    "check": "Check the backup",
+    "backup": "Back up the data",
+    "stop": "Stop the app",
+    "reset": "Delete the data",
+    "restore": "Restore the database",
+    "files": "Restore the files",
+    "after_import": "Prepare the imported data",
     "start": "Start",
     "finish": "Switch to the new release",
+    "first_admin": "Create the first admin",
+    "seed": "Add starter content",
+    "export": "Export the data",
+    "store": "Keep the snapshot on Slipway",
+    "restart": "Start the app again",
+    "restop": "Stop the data services again",
     "proxy": "Update Switchyard",
 }
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped", "warning")
 # The header line each step starts with in the log; the deployment page splits the log on it.
 STEP_MARK = "── Step "
+# The steps of a deploy that run between build and start, in this order when listed (§7.3).
+PRE_START_STEPS = ("check", "backup", "stop", "reset", "restore", "files", "after_import")
+# The steps that run after finish, inside the same SSH session; they never fail the job (D12).
+POST_FINISH_STEPS = ("first_admin", "seed")
 
 
 def step_keys(instance: Instance) -> list[str]:
+    """A deploy's steps. Dockerfile and compose instances keep exactly these (I7); see ``steps_for``."""
     if instance.build_source == BuildSource.APP:
-        return ["resolve", "source", "upload", "manifest", "ports", "settings", "build", "start", "finish", "proxy"]
+        return ["resolve", "source", "upload", "manifest", "ports", "settings", "build", "backup", "start", "finish",
+                "proxy"]
     return ["resolve", "source", "upload", "settings", "ports", "build", "start", "finish", "proxy"]
 
 
+def steps_for(
+    instance: Instance, kind: str = DeploymentKind.DEPLOY, *, snapshot: bool = False, first_admin: bool = False,
+    seed: bool = False, files: bool = False, stop_app: bool = False, stopped: bool = False, start_over: bool = False,
+    rollback_of: uuid.UUID | None = None,
+) -> list[dict[str, Any]]:
+    """The numbered steps of a job, with the names its kind gives them (§7.2, §7.3).
+
+    The flags are the conditions known when the job is queued: ``snapshot`` the chain restores a snapshot,
+    ``first_admin`` a first admin is pending, ``seed`` starter content may be added after an empty start (the
+    deploy drops the step again when the release's slipway.yml has no seed command), ``files`` a restore
+    puts the files back, ``stop_app`` a snapshot stops the running app, ``stopped`` the instance is stopped
+    (data-only jobs stop its data services again at the end), ``start_over`` a reset of a never-live instance.
+    """
+    if instance.build_source != BuildSource.APP:
+        return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in step_keys(instance)]
+    after = ["first_admin"] if first_admin else []
+    if kind == DeploymentKind.DEPLOY:
+        keys = ["resolve", "source", "upload", "manifest", "ports", "settings", "build",
+                *(["check"] if snapshot else []), "backup",
+                *(["stop", "restore", "files", "after_import"] if snapshot else []),
+                "start", "finish", *after, *(["seed"] if seed else []), "proxy"]
+    elif kind == DeploymentKind.RESTORE:
+        keys = ["release", "manifest", "settings", "build", "check", "backup", "stop", "restore",
+                *(["files"] if files else []), "start", "finish", *after, "proxy"]
+    elif kind == DeploymentKind.ROLLBACK:
+        keys = ["release", "manifest", "settings", "build", "check", "backup", "stop", "restore", "start", "finish",
+                *after, "proxy"]
+    elif kind == DeploymentKind.RESET and start_over:
+        keys = ["release", "backup", "stop", "reset"]
+    elif kind == DeploymentKind.RESET:
+        keys = ["release", "manifest", "settings", "build", *(["check"] if snapshot else []), "backup", "stop", "reset",
+                *(["restore", "files", "after_import"] if snapshot else []), "start", "finish", *after,
+                *(["seed"] if seed else []), "proxy"]
+    elif kind == DeploymentKind.BACKUP:
+        keys = ["release", "backup", *(["restop"] if stopped else [])]
+    elif kind == DeploymentKind.SNAPSHOT:
+        keys = ["release", *(["stop"] if stop_app else []), "export", *(["restart"] if stop_app else []), "store",
+                *(["restop"] if stopped else [])]
+    elif kind == DeploymentKind.ADMIN:
+        keys = ["release", "first_admin"]
+    elif kind == DeploymentKind.CONTENT:
+        keys = ["release", "seed"]
+    else:
+        raise ValueError(f"Unknown kind of job {kind!r}")
+    names = dict(STEP_NAMES)
+    if snapshot:
+        names.update(check="Check the snapshot", restore="Restore the snapshot's database")
+    if kind == DeploymentKind.ROLLBACK and rollback_of is not None:
+        names["restore"] = f"Restore the backup from before deployment {rollback_of.hex[:8]}"
+    if kind == DeploymentKind.SNAPSHOT:
+        names["export"] = f"Export the data on {instance.host.name}"
+    return [{"key": k, "name": names[k], "status": "pending"} for k in keys]
+
+
 def new_steps(instance: Instance) -> list[dict[str, Any]]:
-    return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in step_keys(instance)]
+    """A deploy's steps as queued (the job settles the conditional ones when it starts)."""
+    return steps_for(instance)
+
+
+# Options a retry never copies: each needs its own typed confirmation, ``prev_status`` is what the instance
+# is when the retry starts (a half-restored app must not go back to "running"), and ``restop`` is whether the app
+# is stopped when the retry starts (an app started since must not be stopped by a Back up or a snapshot).
+ONE_SHOT_OPTIONS = frozenset({"skip_backup", "take_over_lock", "override_hold", "skip_revision_check", "inherit",
+                              "confirm", "prev_status", "restop"})
+
+
+async def retry_values(db: Any, parent: Deployment) -> dict[str, Any]:
+    """The fields ``queue_deployment(retry_of=parent)`` gives the retry (§8.1): the kind, the options (without
+    the one-shot ones), what it restores, and the commit of a job that runs the live release. The first
+    attempt's pre-change backup is inherited (``backup_id`` and ``options.inherit``) only when the parent is
+    the latest data-changing job and began a change step (D11); otherwise the retry backs up afresh."""
+    inheritance = await data.retry_inheritance(db, parent)
+    options = {k: v for k, v in (parent.options or {}).items() if k not in ONE_SHOT_OPTIONS}
+    values: dict[str, Any] = {"kind": parent.kind or DeploymentKind.DEPLOY, "branch": parent.branch,
+                              "restore_backup_id": parent.restore_backup_id, "snapshot_id": parent.snapshot_id,
+                              "previous_sha": parent.previous_sha}
+    if parent.kind not in (None, DeploymentKind.DEPLOY):
+        values.update(commit_sha=parent.commit_sha, commit_message=parent.commit_message,
+                      commit_author=parent.commit_author)
+    if inheritance.inherit and inheritance.backup_id is not None:
+        options["inherit"] = True
+        values["backup_id"] = inheritance.backup_id
+    if parent.kind in data.DATA_ONLY_KINDS:
+        instance = await db.get(Instance, parent.instance_id)
+        options["restop"] = instance is not None and instance.status == InstanceStatus.STOPPED
+    values["options"] = options
+    return values
 
 
 class Steps:
@@ -1269,13 +1562,25 @@ class Steps:
             return
         row.update(status=status, finished_at=utcnow().isoformat())
         if note:
-            row["note"] = clean_text(note)[:300]
+            row["note"] = clean_text(self.sink.scrub(note))[:300]
         self._current = None
         await self._save()
 
-    async def skip(self, key: str, note: str) -> None:
+    def listed(self, key: str) -> bool:
+        return any(r["key"] == key for r in self.rows)
+
+    async def drop(self, key: str) -> None:
+        """Take a step that hasn't begun off the list (one listed in case the release would need it)."""
+        if self.status(key) == "pending":
+            self.rows = [r for r in self.rows if r["key"] != key]
+            await self._save()
+
+    async def skip(self, key: str, note: str, *, listed_only: bool = False) -> None:
+        """Mark ``key`` skipped. ``listed_only``: do nothing when the job's list has no such step."""
+        if listed_only and not self.listed(key):
+            return
         i, row = self._row(key)
-        row.update(status="skipped", note=clean_text(note)[:300])
+        row.update(status="skipped", note=clean_text(self.sink.scrub(note))[:300])
         await self.sink.line(f"{STEP_MARK}{i + 1}/{len(self.rows)}: {row['name']}: skipped. {note}")
         await self._save()
 
@@ -1317,6 +1622,38 @@ class _Job:
     secrets: dict[str, str] | None  # the app's generated secrets; None when they cannot be decrypted
     steps: list[dict[str, Any]]
     retry: _Retry | None = None
+    deployment_id: uuid.UUID = uuid.UUID(int=0)
+    kind: str = DeploymentKind.DEPLOY
+    options: dict[str, Any] = field(default_factory=dict)
+    hide: ssh.Redactor = field(default_factory=ssh.Redactor)  # the job's secret values, hidden in its log
+    never_live: bool = False  # the instance had never gone live when the job started
+    inherited_backup_id: uuid.UUID | None = None  # a retry keeps the first attempt's pre-change backup (§8.1)
+    pre_retry: bool = False  # ... and backs up again: the app was started by hand since that attempt
+    parent_finished_at: Any = None  # when the attempt being retried ended
+    # Filled in while the job runs.
+    lock_held: bool = False  # this job wrote its line to the host lock
+    lock_left: str | None = None  # a command that may still run on the host (timed out, cancelled): keep the lock
+    lock_pid: str | None = None  # that command's PID, read back from the lock line it wrote
+    lock_cut: bool = False  # lock_left is only the job's kind: it was cut off between commands, so no PID to read
+    # The commit whose release `finish` made live (current switched, app_state saved): from then on the job has
+    # gone live, and nothing after it (pruning, first_admin, seed, proxy, a cut-off) can make it fail (D12).
+    went_live: str | None = None
+    data_app: bool = False  # the live or the new slipway.yml declares data
+    # commands.has_data said the data lives outside the host (exit 4); None when this job didn't probe (a skipped
+    # or inherited backup), and the live release's record then stands.
+    data_elsewhere: bool | None = None
+    identity: dict[str, str] | None = None  # the identity values the release went live with (live_identity)
+    ctx: Any = None  # the app run (_AppRun), for the steps after finish
+    # Restore, roll back and reset (D2): the live release runs again, with the inputs it went live with.
+    live_inputs: dict[str, Any] | None = None  # app_state.live
+    start_over: bool = False  # a reset of a never-live instance (§7.5 reset, Start over)
+    prev_status: str | None = None  # put back when a restore-type job changed nothing (§7.1)
+    snapshot_id: uuid.UUID | None = None  # the chain restores (or the job takes) this snapshot
+    restore_backup_id: uuid.UUID | None = None  # what a restore or roll back puts back
+    done_by: dict[str, str] = field(default_factory=dict)  # step -> the attempt that already did it (§8.1)
+    override: dict[str, str] = field(default_factory=dict)  # identity values the restore puts back (§9.3)
+    restore_from: dict[str, Any] = field(default_factory=dict)  # {database, files, name, source}: what restore reads
+    exported: dict[str, Any] = field(default_factory=dict)  # the snapshot kind's export, for store
 
 
 async def _start(deployment_id: uuid.UUID) -> _Job | None:
@@ -1334,6 +1671,7 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
             stored = await db.scalar(select(Instance.app_secrets.is_not(None)).where(Instance.id == instance.id))
             secrets = None if stored else {}
         retry = None
+        first = None
         if dep.retry_of_id is not None:
             first = await db.get(Deployment, dep.retry_of_id)
             if first is not None and first.commit_sha:
@@ -1341,12 +1679,106 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
                 named = bool(first.release) and _RELEASE_NAME.fullmatch(posixpath.basename(first.release)) is not None
                 retry = _Retry(id=first.id, sha=first.commit_sha, release=first.release,
                                reusable=built and named and first.instance_id == instance.id)
+        kind = dep.kind or DeploymentKind.DEPLOY
+        options = dict(dep.options or {})
+        never_live = instance.current_commit_sha is None
+        job = _Job(instance=instance, branch=dep.branch, user=dep.triggered_by, env=env, secrets=secrets, steps=[],
+                   retry=retry, deployment_id=dep.id, kind=kind, options=options, never_live=never_live)
+        data_only = kind in data.DATA_ONLY_KINDS
+        if instance.build_source == BuildSource.APP:
+            job.start_over = kind == DeploymentKind.RESET and bool(options.get("start_over"))
+            if kind in data.RESTORE_KINDS:
+                # What the instance was before the job, so a job that changed nothing leaves it so (§7.1).
+                if not options.get("prev_status"):
+                    options["prev_status"] = instance.status if instance.status != InstanceStatus.DEPLOYING \
+                        else InstanceStatus.FAILED
+                job.prev_status = str(options["prev_status"])
+                job.data_app = True
+            # A first deploy of an instance created from a snapshot restores it (§10.7).
+            if (kind == DeploymentKind.DEPLOY and never_live and dep.snapshot_id is None and dep.retry_of_id is None
+                    and instance.seed_snapshot_id is not None):
+                dep.snapshot_id = instance.seed_snapshot_id
+            job.snapshot_id, job.restore_backup_id = dep.snapshot_id, dep.restore_backup_id
+            if kind == DeploymentKind.SNAPSHOT and dep.snapshot_id is not None and dep.retry_of_id is not None:
+                snap = await db.get(Snapshot, dep.snapshot_id)
+                if snap is not None and snap.status == SnapshotStatus.FAILED:
+                    snap.status, snap.error = SnapshotStatus.PENDING, None  # taken again (§8.1)
+            # Inherit the first attempt's backup only when queue_deployment said so (§8.1, D11).
+            if options.get("inherit") and dep.backup_id is not None:
+                job.inherited_backup_id = dep.backup_id
+                job.parent_finished_at = first.finished_at if first is not None else None
+                job.pre_retry = bool(instance.last_control_at and job.parent_finished_at
+                                     and instance.last_control_at > job.parent_finished_at)
+            if first is not None and first.instance_id == instance.id and first.kind == kind:
+                # Only while the attempt being retried is still the latest changing job: a later one (Start over,
+                # another restore) may have undone what it did (§8.1).
+                job.done_by = (await data.retry_inheritance(db, first, exclude=dep.id)).done_by
+                changed = await data.seed_change_text(db, instance, first) if kind == DeploymentKind.DEPLOY else None
+                if changed:
+                    raise DeployError(changed)  # the seed changed after the retry was queued (§10.7)
+                if (dep.snapshot_id is None and data._restores_snapshot(first)
+                        and data.snapshot_steps_left(first, job.done_by)):
+                    raise DeployError("The snapshot this job restores was deleted; start a new reset instead")
+            if kind in data.RESTORE_KINDS and not job.start_over:
+                live = data.live_state(instance)
+                if live is not None and _RELEASE_NAME.fullmatch(str(live.get("release") or "")) \
+                        and _SHA_RE.match(str(live.get("sha") or "")):
+                    # The live release is reused as it is on the host: no GitHub, no upload (D2).
+                    job.live_inputs = live
+                    job.retry = _Retry(id=uuid.UUID(str(live["deployment"])), sha=str(live["sha"]),
+                                       release=f"{paths_for(instance).releases}/{live['release']}", reusable=True)
+                    if not dep.commit_sha:
+                        source = await db.get(Deployment, job.retry.id)
+                        dep.commit_sha = str(live["sha"])
+                        if source is not None:
+                            dep.commit_message, dep.commit_author = source.commit_message, source.commit_author
+            pending_admin = await db.scalar(select(FirstAdmin.id).where(
+                FirstAdmin.instance_id == instance.id, FirstAdmin.status == FirstAdminStatus.PENDING))
+            snapshot = dep.snapshot_id is not None
+            seed = (not snapshot and instance.seed_content
+                    and (bool(options.get("started_empty"))
+                         or (never_live and instance.fresh_data in (None, FreshData.EMPTY))))
+            # Worked out again here, not taken from the queued options: the app may have been started since (D17).
+            stopped = instance.status == InstanceStatus.STOPPED
+            if data_only:
+                options["restop"] = stopped
+            dep.steps = steps_for(instance, kind, snapshot=snapshot and kind != DeploymentKind.SNAPSHOT,
+                                  first_admin=pending_admin is not None,
+                                  seed=bool(seed) if kind == DeploymentKind.DEPLOY else bool(options.get("seed")),
+                                  files=bool(options.get("files")), rollback_of=_as_uuid(options.get("rollback_of")),
+                                  start_over=job.start_over,
+                                  stop_app=bool(options.get("stop_app")) and instance.status == InstanceStatus.RUNNING,
+                                  stopped=stopped and data_only)
+            dep.options = dict(options)
+            _hide_instance_values(job.hide, instance, env, secrets)
+        else:
+            dep.steps = new_steps(instance)
+        job.steps = dep.steps
         dep.status = DeploymentStatus.RUNNING
         dep.started_at = utcnow()
-        dep.steps = new_steps(instance)
-        instance.status = InstanceStatus.DEPLOYING
-        return _Job(instance=instance, branch=dep.branch, user=dep.triggered_by, env=env, secrets=secrets,
-                    steps=dep.steps, retry=retry)
+        if not (data_only and instance.build_source == BuildSource.APP):
+            instance.status = InstanceStatus.DEPLOYING  # data-only jobs never change the status (§7.1)
+        return job
+
+
+def _as_uuid(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _hide_instance_values(hide: ssh.Redactor, instance: Instance, env: dict[str, str] | None,
+                          secrets: dict[str, str] | None) -> None:
+    """App mode: every value that may be secret is hidden in the job's log (§12.2): the app's secrets, the
+    instance's variables (any of them may be a password, manifest.plan treats them so) and the identity values
+    the data was made with. Values shorter than six characters stay (they would blank out ordinary words)."""
+    for value in (secrets or {}).values():
+        hide.add(str(value))
+    for value in (env or {}).values():
+        hide.add(str(value))
+    for value in (instance.live_identity or {}).values():
+        hide.add(str(value))
 
 
 async def _check_repository(gh: GitHubClient, repo: Repository, sink: LogSink) -> None:
@@ -1651,6 +2083,77 @@ async def _take_dir(remote: ssh.RemoteSession, instance: Instance, sink: LogSink
         )
 
 
+async def _acquire_lock(remote: ssh.RemoteSession, instance: Instance, job: _Job, sink: LogSink) -> None:
+    """App mode, the first host step of every job (§4.5): take the host lock, then empty the backups' work area.
+
+    A lock whose command has ended (or whose host restarted) is taken over; a live non-data command only gets
+    a warning; a live data command (a restore, a dump) refuses the job before anything runs, unless the job was
+    queued with ``take_over_lock``. What a crashed job left in ``backups/.incoming`` is never used, so it goes.
+    """
+    paths = paths_for(instance)
+    _, output = await remote.run(data.lock_read_command(paths.lock, job.deployment_id), check=False, timeout=60)
+    try:
+        verdict = data.lock_verdict(data.parse_lock(output), host=instance.host.name,
+                                    take_over=bool(job.options.get("take_over_lock")))
+    except data.DataError as exc:
+        raise DeployError(str(exc)) from None
+    if verdict:
+        await sink.line(verdict)
+    await remote.run(data.lock_line_command(paths.lock, job.deployment_id, job.kind, data=False), timeout=60)
+    job.lock_held = True
+    await remote.run(data.empty_incoming_command(paths.backups), timeout=60)
+    await _settle_unverified(remote, instance, sink)
+
+
+async def _settle_unverified(remote: ssh.RemoteSession, instance: Instance, sink: LogSink) -> None:
+    """Backups a restart left ``unverified`` (§4.4): kept when their file is complete, forgotten otherwise."""
+    async with session_scope() as db:
+        waiting = await db.scalar(select(Backup.id).where(Backup.instance_id == instance.id,
+                                                          Backup.status == BackupStatus.UNVERIFIED).limit(1))
+        if waiting is None:
+            return
+        for line in await data.settle_unverified(remote, db, instance, paths_for(instance).backups):
+            await sink.line(line)
+
+
+async def _release_lock(remote: ssh.RemoteSession, instance: Instance, job: _Job, sink: LogSink) -> None:
+    """Remove the job's lock line, unless a command may still be running on the host (timed out or cut off):
+    then it stays, and the next job waits until that command has ended."""
+    if not job.lock_held:
+        return
+    if job.lock_left:
+        await _read_left_pid(remote, instance, job)
+        await sink.line(data.lock_left_message(job.lock_left, job.lock_pid, instance.host.name))
+        return
+    with contextlib.suppress(Exception):
+        await remote.run(data.lock_release_command(paths_for(instance).lock, job.deployment_id), check=False, timeout=60)
+    job.lock_held = False
+
+
+def _mark_cut_off(job: _Job) -> None:
+    """The job was cut off (shutdown): keep the lock for the command that was running, or for the job itself
+    when it was between commands."""
+    if not job.lock_left:
+        job.lock_left, job.lock_cut = job.kind, True
+
+
+async def _read_left_pid(remote: ssh.RemoteSession, instance: Instance, job: _Job) -> None:
+    """Best effort: ``job.lock_pid`` from the lock line the command left running wrote (§4.5), while it runs.
+    Not when the job was cut off between commands: every lock line names a command, never the job's kind, so
+    the read could never match, and on a dead link it would only hold up the shutdown."""
+    if job.lock_pid or not job.lock_left or job.lock_cut:
+        return
+    with contextlib.suppress(Exception):
+        _, output = await remote.run(data.lock_own_command(paths_for(instance).lock, job.deployment_id),
+                                     check=False, timeout=30)
+        job.lock_pid = data.parse_own_lock(output, job.lock_left)
+
+
+def _left_text(c: _AppRun) -> str:
+    """``<key> (pid <pid>) may still be running on <host>`` for the command the job left running."""
+    return data.lock_left_text(str(c.job.lock_left), c.job.lock_pid, c.instance.host.name)
+
+
 async def _record_release(deployment_id: uuid.UUID, release: str) -> None:
     async with session_scope() as db:
         await db.execute(update(Deployment).where(Deployment.id == deployment_id).values(release=release))
@@ -1691,15 +2194,42 @@ async def _install(
                else paths.release(sha, deployment_id))
     run = _Run(release=release, upload=f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz", tarball=tarball)
     await _record_release(deployment_id, release)
-    if reuse:
+    try:
+        await _install_locked(remote, instance, deployment_id, sha, tarball, job, sink, steps, paths, release, run, reuse)
+    except asyncio.CancelledError:
+        _mark_cut_off(job)  # cut off part-way: what ran may still be running
+        raise
+    finally:
+        if instance.build_source == BuildSource.APP and job.lock_held:
+            await _remove_job_dir(remote, instance, job)
+        await _release_lock(remote, instance, job, sink)
+
+
+async def _install_locked(
+    remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, tarball: Path | None,
+    job: _Job, sink: LogSink, steps: Steps, paths: InstancePaths, release: str, run: _Run, reuse: bool,
+) -> None:
+    app = instance.build_source == BuildSource.APP
+    if job.live_inputs is not None:
+        async with steps.step("release"):
+            await _take_dir(remote, instance, sink)
+            await _acquire_lock(remote, instance, job, sink)
+            await _check_live_release(remote, instance, paths, str(job.live_inputs["release"]))
+            await sink.line(f"Running the live release {sha[:7]} again ({release})")
+    elif reuse:
         await _take_dir(remote, instance, sink)
+        if app:
+            await _acquire_lock(remote, instance, job, sink)
         status, _ = await remote.run(f"[ -d {q(release)} ]", check=False, timeout=60)
         if status:
             raise DeployError(f"The release {release} is no longer on {instance.host.name}; deploy again instead of retrying")
-        await steps.skip("upload", f"Reusing {release} from deployment {job.retry.id.hex[:8]}")
+        assert job.retry is not None
+        await steps.skip("upload", f"Reusing {release} from deployment {job.retry.id.hex[:8]}", listed_only=True)
     else:
         async with steps.step("upload"):
             await _take_dir(remote, instance, sink)
+            if app:
+                await _acquire_lock(remote, instance, job, sink)
             await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
             try:
                 assert tarball is not None
@@ -1719,7 +2249,9 @@ async def _install(
     except Exception:
         if run.stopped_claimed:
             await _restart_claimed(remote, instance, sink)
-        if run.built or reuse:  # a reused release was kept by the deployment it came from: never remove it
+        if job.live_inputs is not None:
+            pass  # the live release: it stays as it is
+        elif run.built or reuse:  # a reused release was kept by the deployment it came from: never remove it
             with contextlib.suppress(Exception):
                 await remote.run(f"rm -f -- {q(run.upload)}", check=False, timeout=60)
             await sink.line(f"Kept {release} so a retry can start from it")
@@ -1733,13 +2265,46 @@ async def _install(
         await remote.run(f"ln -sfn {q(release)} {q(paths.current)}")
         await sink.line(f"Switched {paths.current} to {release}")
         if state is not None:  # what the app runs now: status, logs, stop and Switchyard follow it from here
-            await _save_instance(instance, app_state=state)
-        status, output = await remote.run(prune_command(instance, release), check=False, timeout=600)
-        if status != 0:
-            detail = " ".join(output.strip().splitlines()[-3:])
-            await sink.line(f"Warning: some old releases could not be removed. {detail}".strip())
-        if state is not None:
-            await _prune_app_images(remote, instance, state, sink)
+            # ``went_live`` names this job, so a restart from here on still counts it as live (_recover_instance).
+            state["went_live"] = deployment_id.hex
+            live_fields: dict[str, Any] = {"app_state": state}
+            kept: dict[str, str] = {}
+            unkept: list[str] = []
+            if job.data_app and job.identity is not None:
+                live_fields["live_identity"] = job.identity  # the data is now this release's (D8)
+                kept = _identity_from_variables(job)
+                if kept:
+                    # The stored secret becomes the value the data is now made with, so removing the variable
+                    # later keeps it (what the restore refusal tells the operator to do). Only while a ready
+                    # backup still holds the stored one: a secret Slipway made is never thrown away (§9.1).
+                    held = await _backed_up_secrets(instance, job.secrets or {}, kept)
+                    unkept = sorted(k for k in kept if k not in held)
+                    kept = {k: v for k, v in kept.items() if k in held}
+                if kept:
+                    job.secrets = live_fields["app_secrets"] = {**(job.secrets or {}), **kept}
+            await _save_instance(instance, **live_fields)
+            job.went_live = sha  # before any other await: a cut-off from here on still counts as live (D12)
+            if kept:
+                await sink.line(f"Kept {', '.join(sorted(kept))} from the instance's environment variables as the "
+                                "app's secrets: the data is made with them now")
+            if unkept:
+                await sink.line(f"Warning: {', '.join(unkept)} now comes from the instance's environment variables, "
+                                "and no backup holds the stored secret it replaces, so Slipway keeps that secret. "
+                                "Removing the variable brings it back.")
+        try:
+            status, output = await remote.run(prune_command(instance, release), check=False, timeout=600)
+            if status != 0:
+                detail = " ".join(output.strip().splitlines()[-3:])
+                await sink.line(f"Warning: some old releases could not be removed. {detail}".strip())
+            if state is not None:
+                await _prune_app_images(remote, instance, state, sink)
+        except Exception as exc:
+            if job.went_live is None:
+                raise
+            # The release is live: tidying up after it never fails the job.
+            await sink.line(f"Warning: old releases and images could not be removed: {exc}")
+    if app and job.ctx is not None:
+        await _post_finish(job.ctx)
 
 
 async def _prune_after_failure(remote: ssh.RemoteSession, instance: Instance, release: str, sink: LogSink) -> None:
@@ -1755,7 +2320,8 @@ async def _prune_after_failure(remote: ssh.RemoteSession, instance: Instance, re
         async with session_scope() as db:
             rows = (await db.execute(
                 select(Deployment.release, Deployment.status).where(
-                    Deployment.instance_id == instance.id, Deployment.release.is_not(None))
+                    Deployment.instance_id == instance.id, Deployment.release.is_not(None),
+                    Deployment.kind == DeploymentKind.DEPLOY)
                 .order_by(Deployment.created_at.desc())
             )).all()
         ran = {posixpath.basename(r) for r, st in rows if st == DeploymentStatus.SUCCEEDED}
@@ -1802,7 +2368,7 @@ async def _run_commands(
         await sink.line(f"$ {command}")
         if stop_claimed and stop_claimed in command:
             run.stopped_claimed = run.claimed_running
-        await remote.run(command, on_line=sink.line, timeout=3600)
+        await remote.run(command, on_line=sink.line, scrub=sink.scrub, timeout=3600)
 
 
 async def _install_dockerfile(
@@ -1843,7 +2409,7 @@ async def _install_compose(
         await _claimed_state(remote, instance, run)
         command = compose_env_command(instance, run.release)
         await sink.line(f"$ {command}")
-        await remote.run(command, on_line=sink.line, timeout=3600)
+        await remote.run(command, on_line=sink.line, scrub=sink.scrub, timeout=3600)
     async with steps.step("ports"):
         files = await _prepare_compose_ports(remote, instance, run.release, env, sink, run.tarball)
     _, *start = build_commands(instance, run.release, sha, **files)
@@ -1879,12 +2445,77 @@ def app_builtins(instance: Instance, release: str, sha: str, deployment_id: uuid
     }
 
 
-def app_command(release: str, argv: list[str]) -> str:
-    """Run one of slipway.yml's commands from the release: a program in the repository, or one on the PATH."""
-    program = argv[0]
+# slipway.yml's data commands, and first_admin: they run under ``umask 077`` (what they write stays the SSH
+# user's). build, start and stop keep running exactly as before data commands existed (security 12).
+UMASK_COMMANDS = frozenset({*manifest.COMMANDS[3:], "first_admin"})
+# Commands that change or write the app's data: their host lock line carries ``d``, so a later job waits for
+# them to end (§4.5). ``start`` counts too when slipway.yml declares ``dump`` (it migrates).
+LOCK_DATA_COMMANDS = frozenset({"dump", "export_files", "restore", "import_files", "after_import", "seed",
+                                "first_admin", "reset"})
+
+
+@dataclass(frozen=True)
+class LockLine:
+    """The host lock line a command writes for itself before it runs (``data.lock_line_command``)."""
+
+    path: str
+    deployment_id: uuid.UUID
+    key: str
+    data: bool
+
+
+def app_command(
+    release: str, cmd: Any, *, slots: dict[str, str] | None = None, stream_path: str | None = None,
+    stream: str | None = None, lock: LockLine | None = None, umask: bool = False, name: str | None = None,
+    env_from_stdin: str | None = None,
+) -> str:
+    """Run one of slipway.yml's commands from the release: a program in the repository, or one on the PATH.
+
+    ``cmd`` is a plan's ``{"argv": [...], "stream": ...}`` or the older plain argv list. An argument that is
+    ``{"slot": name}`` is replaced by ``slots[name]``; every item is quoted. ``stream_path`` is the file a
+    command in stream mode writes (``stdout``) or reads (``stdin``); ``stream`` overrides the command's own
+    mode (the revision is captured from stdout this way). ``lock`` writes the host lock line first and then
+    ``exec``s the program, so the line names the program's PID. ``umask`` makes what it writes private.
+    ``env_from_stdin`` reads one line of stdin into that variable before the program starts (the first
+    admin's password, which never appears in argv). Without any of these the command is exactly the one
+    Slipway always ran: ``cd <release> && <program> <args>``."""
+    argv = manifest.command_argv(cmd)
+    where = f"commands.{name}: " if name and name != "first_admin" else ("first_admin.command: " if name else "")
+    if not argv:
+        raise DeployError(f"{where}slipway.yml gave an empty command")
+    args: list[str] = []
+    for a in argv:
+        if isinstance(a, dict):
+            slot = str(a.get("slot", ""))
+            if slots is None or slot not in slots:
+                shown = "slipway." + slot if slot in ("in", "out") else slot
+                raise DeployError(f"{where}Slipway gave no value for {{{shown}}}")
+            a = slots[slot]
+        args.append(a)
+    program = args[0]
     if "/" in program:
         program = "./" + manifest.clean_repo_path(program, "the command")
-    return f"cd {q(release)} && {' '.join(q(a) for a in [program, *argv[1:]])}"
+    run = " ".join(q(a) for a in [program, *args[1:]])
+    direction = stream or (cmd.get("stream") if isinstance(cmd, dict) else None)
+    if direction is not None:
+        if direction not in ("stdout", "stdin"):
+            raise DeployError(f"{where}unknown stream mode {direction!r}")
+        if not stream_path:
+            raise DeployError(f"{where}Slipway gave no file for its {direction}")
+        run += f" {'>' if direction == 'stdout' else '<'} {q(stream_path)}"
+    if lock is None and not umask and env_from_stdin is None:
+        return f"cd {q(release)} && {run}"
+    if env_from_stdin is not None:
+        if not manifest.PASSWORD_VAR_RE.match(env_from_stdin):
+            raise DeployError(f"{where}{env_from_stdin!r} can't carry the password")
+        # Exit 97: nothing arrived on stdin. The variable is set only in this shell, which execs the program.
+        inner = (f"{{ IFS= read -r p || exit 97; {env_from_stdin}=$p; export {env_from_stdin}; unset p; "
+                 f"exec {run}; }}")
+    else:
+        inner = f"exec {run}"
+    if lock is not None:
+        inner = f"{data.lock_line_command(lock.path, lock.deployment_id, lock.key, data=lock.data)} && {inner}"
+    return f"cd {q(release)} && {'umask 077 && ' if umask else ''}{{ {inner}; }}"
 
 
 async def _save_instance(instance: Instance, **fields: Any) -> None:
@@ -1894,19 +2525,112 @@ async def _save_instance(instance: Instance, **fields: Any) -> None:
         setattr(instance, key, value)
 
 
+@dataclass
+class _Side:
+    """One release's slipway.yml rendered for this host: what runs its commands, and the ``.env`` they read."""
+
+    man: manifest.Manifest
+    plan: manifest.AppPlan
+    release: str  # its folder on the host
+    sha: str
+    content: str = ""  # the shared/.env this rendering writes
+
+    @property
+    def sha7(self) -> str:
+        return self.sha[:7]
+
+
+@dataclass
+class _AppRun:
+    """An app job on its host: the session, the job and its steps, and the release it deploys."""
+
+    remote: ssh.RemoteSession
+    instance: Instance
+    job: _Job
+    sink: LogSink
+    steps: Steps
+    paths: InstancePaths
+    new: _Side | None = None  # the release being deployed (None for jobs that only use the live release)
+    live: _Side | None = None  # the live release rendered by this job already (a data job's release step)
+    replan: Callable[[dict[str, str]], manifest.AppPlan] | None = None  # ``new`` planned with other secrets
+    template: str | None = None  # ``new``'s env_file template
+    data_up: bool = False  # ``data_up`` ran since the app was last stopped (restore, files, after_import need it)
+
+
+async def _app_run(
+    c: _AppRun, side: _Side, name: str, *, cmd: Any = None, slots: dict[str, str] | None = None,
+    stream_path: str | None = None, stream: str | None = None, check: bool = True, input: str | None = None,
+    env_from_stdin: str | None = None, lock_data: bool | None = None, timeout: float | None = None,
+) -> tuple[int, str]:
+    """Run slipway.yml's command ``name`` of ``side``'s release, under the host lock, logged and scrubbed.
+
+    The ``$`` line shows the command as the app sees it (never the lock line, never a password: that one
+    arrives on stdin). When the command doesn't return an exit status (it timed out, SSH broke, Slipway was
+    stopped), it may still be running, so the job leaves the host lock in place (§4.5). It then runs no other
+    command: each one rewrites the lock line, and the next job must keep waiting for the one left running.
+    """
+    await _refuse_while_left(c, f"commands.{name}")
+    cmd = side.plan.commands[name] if cmd is None else cmd
+    data_flag = name in LOCK_DATA_COMMANDS if lock_data is None else lock_data
+    lock = LockLine(c.paths.lock, c.job.deployment_id, name, data_flag)
+    command = app_command(side.release, cmd, slots=slots, stream_path=stream_path, stream=stream, lock=lock,
+                          umask=name in UMASK_COMMANDS, name=name, env_from_stdin=env_from_stdin)
+    shown = app_command(side.release, cmd, slots=slots, stream_path=stream_path, stream=stream, name=name)
+    await c.sink.line(f"$ {shown}")
+    extra: dict[str, Any] = {"input": input} if input is not None else {}
+    try:
+        return await c.remote.run(command, check=check, on_line=c.sink.line, scrub=c.sink.scrub,
+                                  timeout=timeout or side.man.timeout(name), **extra)
+    except ssh.CommandFailed:
+        raise
+    except (ssh.SSHError, asyncio.CancelledError):
+        c.job.lock_left = name
+        raise
+
+
+async def _refuse_while_left(c: _AppRun, what: str) -> None:
+    """A command the job left running holds the host lock line: nothing may rewrite it (§4.5)."""
+    if c.job.lock_left:
+        await _read_left_pid(c.remote, c.instance, c.job)
+        raise DeployError(f"Slipway didn't run {what}: {_left_text(c)}. Retry once it has ended.")
+
+
+def env_fingerprint(instance: Instance, env: dict[str, str]) -> str:
+    """A salted SHA-256 of the instance's variables, to tell later that they changed (never the values)."""
+    text = "".join(f"{k}={v}\n" for k, v in sorted(env.items()))
+    return hashlib.sha256(b"slipway-env-v1\x00" + instance.id.bytes + text.encode()).hexdigest()
+
+
+def _env_content(template: str | None, plan: manifest.AppPlan) -> str:
+    lines, _ = manifest.parse_env_template(template or "")
+    try:
+        return manifest.render_env(lines, plan.env, plan.written)
+    except manifest.ManifestError as exc:
+        raise DeployError(str(exc)) from exc
+
+
 async def _install_app(
     remote: ssh.RemoteSession, instance: Instance, deployment_id: uuid.UUID, sha: str, job: _Job, run: _Run,
     sink: LogSink, steps: Steps,
 ) -> dict[str, Any]:
     paths = paths_for(instance)
-    builtins = app_builtins(instance, run.release, sha, deployment_id)
+    live = job.live_inputs  # restore, roll back, reset: the live release again, with what it went live with (D3)
+    # The release's {slipway.deployment} is the deployment that made it (a reused live release keeps its own).
+    made_by = uuid.UUID(str(live["deployment"])) if live is not None else deployment_id
+    builtins = app_builtins(instance, run.release, sha, made_by)
     env = job.env or {}
+    if live is not None:
+        settings = {str(k): str(v) for k, v in (live.get("settings") or {}).items()}
+        chosen = live.get("services")
+    else:
+        settings, chosen = dict(instance.app_settings or {}), instance.app_services
 
-    def plan_with(host_ports: dict[str, int]) -> manifest.AppPlan:
+    def plan_with(host_ports: dict[str, int], with_secrets: dict[str, str] | None = None) -> manifest.AppPlan:
         try:
             return manifest.plan(
-                man, template=template, builtins=builtins, settings=instance.app_settings or {},
-                chosen=instance.app_services, host_ports=host_ports, secrets=secrets, env=env,
+                man, template=template, builtins=builtins, settings=settings,
+                chosen=chosen, host_ports=host_ports, secrets=with_secrets if with_secrets is not None else secrets,
+                env=env,
             )
         except manifest.ManifestError as exc:
             raise DeployError(str(exc)) from exc
@@ -1940,6 +2664,9 @@ async def _install_app(
         adopted = sorted(k for k in fresh if env.get(k))
         fresh.update({k: env[k] for k in adopted})
         secrets.update(fresh)
+        for value in fresh.values():
+            sink.hide.add(value)
+        job.secrets = secrets  # the live render of the backup step uses them too
         first = plan_with({})
         await _check_projects_free(instance, first.projects)
         await _check_projects_on_host(remote, instance, first.projects, [s.key for s in man.secrets], env)
@@ -1951,11 +2678,19 @@ async def _install_app(
             if adopted:
                 await sink.line(f"Kept {', '.join(adopted)} from the instance's environment variables as the app's secrets")
         await sink.line(f"{man.name}: running {', '.join(s.name for s in first.services) or 'no services'}")
+        if "seed" not in man.commands:
+            await steps.drop("seed")  # listed in case this release adds starter content: it doesn't
 
     planned = [s for s in first.services if s.port_var]
     fixed = [s for s in first.services if s.port is not None and not s.port_var]
     host_ports: dict[str, int] = {}
-    if planned:
+    if live is not None:  # the live release keeps its host ports (no ports step, §7.3)
+        try:
+            host_ports = {str(k): int(v) for k, v in (live.get("host_ports") or {}).items()}
+        except (TypeError, ValueError) as exc:
+            raise DeployError(f"Slipway's record of {instance.name}'s live release is damaged ({exc}); deploy again "
+                              "first.") from exc
+    elif planned:
         async with steps.step("ports"):
             declared = [ports.Binding(service=s.name, container=s.port, protocol=s.protocol, host=s.port) for s in planned]
             port_plan = await _plan_ports(remote, instance, declared, sink, projects=frozenset(first.projects))
@@ -1973,15 +2708,19 @@ async def _install_app(
 
     async with steps.step("settings"):
         final = plan_with(host_ports)
+        if live is not None:
+            problem = (_live_names_problem(final, live, sha[:7])
+                       or _identity_problem(instance, final, man.identity_keys(), sha[:7]))
+            if problem:
+                raise DeployError(problem)
+            if live.get("env_fp") and live.get("env_fp") != env_fingerprint(instance, env):
+                await sink.line(f"The instance's environment variables changed since {sha[:7]} went live; Slipway "
+                                "renders with the current ones")
         moved = [p for p in final.projects if p not in first.projects]  # a project name that uses a moved port
         if moved:
             await _check_projects_free(instance, moved)
             await _check_projects_on_host(remote, instance, moved, [s.key for s in man.secrets], env)
-        lines, _ = manifest.parse_env_template(template or "")
-        try:
-            content = manifest.render_env(lines, final.env, final.written)
-        except manifest.ManifestError as exc:
-            raise DeployError(str(exc)) from exc
+        content = _env_content(template, final)
         await remote.write_text(paths.env_file, content)
         await sink.line(f"Wrote {len(final.written)} value(s) to {paths.env_file} ({len(man.secrets)} of them secret)")
         old = dict(instance.app_state or {})
@@ -2000,17 +2739,1798 @@ async def _install_app(
             "commands": final.commands, "images": final.images, "releases": releases, "known_projects": known,
         }
 
-    if job.retry is not None and job.retry.reusable and await _images_exist(remote, final.images):
+    c = _AppRun(remote=remote, instance=instance, job=job, sink=sink, steps=steps, paths=paths,
+                new=_Side(man=man, plan=final, release=run.release, sha=sha, content=content),
+                replan=lambda with_secrets: plan_with(host_ports, with_secrets), template=template)
+    if live is not None:
+        c.live = c.new  # the release being run is the live one: its backup uses this rendering
+    job.ctx = c
+    reusable = job.retry is not None and job.retry.reusable
+    if reusable and live is not None and not _images_per_release(man):
+        # Another release may have built images under the same names since (generality 6).
+        await sink.line(f"Rebuilding release {sha[:7]}: its images aren't tagged per release (slipway.yml images), so "
+                        f"the ones on {instance.host.name} may be another release's")
+        reusable = False
+    if reusable and await _images_exist(remote, final.images):
+        assert job.retry is not None
         await steps.skip("build", f"Reusing the images from deployment {job.retry.id.hex[:8]}")
     elif "build" in final.commands:
         async with steps.step("build"):
-            await _run_commands(remote, instance, [app_command(run.release, final.commands["build"])], run, sink)
+            await _app_run(c, c.new, "build")
     else:
         await steps.skip("build", "slipway.yml has no build command")
     run.built = True
+    await _pre_start(c)
     async with steps.step("start"):
-        await _run_commands(remote, instance, [app_command(run.release, final.commands["start"])], run, sink)
+        # start migrates the data when the app has any: a later job waits for it (lock flag d).
+        await _app_run(c, c.new, "start", lock_data="dump" in man.commands)
+    keys = man.identity_keys()
+    job.identity = data.rendered_identity(c.new.plan.env, keys)  # a restore may have put other keys back
+    job.data_app = job.data_app or _declares_data(man)
+    # What the release goes live with: data jobs render its commands again from these (D3).
+    state["live"] = {
+        "release": name, "deployment": made_by.hex, "sha": sha,
+        "settings": settings,
+        "services": list(chosen) if chosen is not None else None,
+        "host_ports": host_ports, "projects": final.projects, "volumes": final.volumes,
+        "env_fp": env_fingerprint(instance, env),
+        "data_elsewhere": (job.data_elsewhere if job.data_elsewhere is not None
+                           else bool((data.live_state(instance) or {}).get("data_elsewhere"))),
+    }
     return state
+
+
+# The builtins that make an image name differ from one release to the next.
+_PER_RELEASE = frozenset({"slipway.sha", "slipway.sha12", "slipway.release", "slipway.deployment"})
+_SLOT = re.compile(r"\{\{|\}\}|\{([^{}]*)\}")  # as manifest.render reads a template: {{ and }} are literal
+
+
+def images_per_release(images: Iterable[str], variables: dict[str, Any]) -> bool:
+    """Whether every ``images`` template names the release (§7.4 image freshness): one of ``_PER_RELEASE``,
+    directly or through ``vars`` that do (``serversherpa-api:{STACK_IMAGE_TAG}`` with ``STACK_IMAGE_TAG:
+    "{slipway.sha12}"``). Images can't use an instance variable, and a var sees only the vars before it."""
+    per: set[str] = set()
+
+    def names_release(template: str) -> bool:
+        return any(m.group(1) in _PER_RELEASE or m.group(1) in per for m in _SLOT.finditer(template))
+
+    for key, template in variables.items():
+        if names_release(str(template)):
+            per.add(str(key))
+    refs = [str(i) for i in images]
+    return bool(refs) and all(names_release(i) for i in refs)
+
+
+def _images_per_release(man: manifest.Manifest) -> bool:
+    return images_per_release(man.images, man.vars)
+
+
+def _declares_data(man: manifest.Manifest) -> bool:
+    return "dump" in man.commands or bool(man.data.volumes)
+
+
+# ------------------------------------------------------------- the live release (D3)
+
+LIVE_MARK = "slipway-live: ok"
+
+
+async def _check_live_release(remote: ssh.RemoteSession, instance: Instance, paths: InstancePaths, name: str) -> str:
+    """``current`` must point at the release Slipway recorded as live, and its folder must be there."""
+    release = f"{paths.releases}/{name}"
+    _, output = await remote.run(f"readlink {q(paths.current)}; [ -d {q(release)} ] && [ ! -L {q(release)} ] && "
+                                 f"echo {q(LIVE_MARK)}", check=False, timeout=60)
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    target = next((ln for ln in lines if ln != LIVE_MARK), "")
+    if LIVE_MARK not in lines or target.rstrip("/") not in (release, f"releases/{name}"):
+        raise DeployError(f"The live release on {instance.host.name} isn't the one Slipway recorded (current points at "
+                          f"{target or 'nothing'}); deploy again first.")
+    return release
+
+
+def _live_names_problem(plan: manifest.AppPlan, live: dict[str, Any], sha7: str) -> str | None:
+    """The live render must run under the names the release runs with (data-loss 15)."""
+    want_projects = [str(p) for p in live.get("projects") or []]
+    want_volumes = [str(v.get("name")) if isinstance(v, dict) else str(v) for v in live.get("volumes") or []]
+    got_volumes = [v["name"] for v in plan.volumes]
+    diff = []
+    if plan.projects != want_projects:
+        diff.append(f"projects {', '.join(plan.projects) or 'none'} instead of {', '.join(want_projects) or 'none'}")
+    if got_volumes != want_volumes:
+        diff.append(f"volumes {', '.join(got_volumes) or 'none'} instead of {', '.join(want_volumes) or 'none'}")
+    if diff:
+        return (f"Release {sha7} would now run under other names ({'; '.join(diff)}) than it runs with; an "
+                "environment variable changed them. Put it back, or deploy, then retry.")
+    return None
+
+
+def _identity_problem(instance: Instance, plan: manifest.AppPlan, keys: list[str], sha7: str) -> str | None:
+    """The live render's identity values must be the ones the data was made with (data-loss 4)."""
+    known = instance.live_identity or {}
+    rendered = data.rendered_identity(plan.env, keys)
+    differing = [k for k in keys if k in known and rendered.get(k) != known[k]]
+    if differing:
+        return (f"{differing[0]} differs from the value {instance.name}'s data was made with (an environment variable "
+                f"of the instance changed since {sha7} went live). Put the variable back, or deploy, then retry.")
+    return None
+
+
+def _identity_from_variables(job: _Job) -> dict[str, str]:
+    """The identity values a release goes live with that an instance variable sets in place of a different
+    stored secret. They become the stored secrets at ``finish``, with ``live_identity``: otherwise removing the
+    variable would render the old secret, and every later backup, restore and deploy would refuse it."""
+    env, secrets = job.env or {}, job.secrets or {}
+    return {k: v for k, v in (job.identity or {}).items() if env.get(k) == v and k in secrets and secrets[k] != v}
+
+
+async def _backed_up_secrets(instance: Instance, secrets: dict[str, str], keys: Iterable[str]) -> set[str]:
+    """Which of ``keys`` a ready backup of the instance holds with its stored secret's value: those can be
+    replaced in ``app_secrets``, since restoring that backup brings the old value back with its data."""
+    wanted = {k: secrets[k] for k in keys if k in secrets}
+    if not wanted:
+        return set()
+    async with session_scope() as db:
+        rows = (await db.scalars(select(Backup.identity).where(
+            Backup.instance_id == instance.id, Backup.status == BackupStatus.READY))).all()
+    return {k for k, v in wanted.items() if any(isinstance(r, dict) and r.get(k) == v for r in rows)}
+
+
+async def _live_plan(c: _AppRun, *, deploying: bool = False) -> _Side:
+    """Render the live release's slipway.yml again, with the inputs it went live with (``app_state.live``),
+    today's paths, the stored secrets and the instance's variables, and write its ``shared/.env`` (§7.4).
+
+    ``deploying``: the pre-deploy backup of a deploy. An identity value an instance variable changed (set,
+    edited or removed) for the new release is then rendered with the value the data was made with (the deploy
+    brings in the new one, and the backup keeps the old); any other job refuses, so it never runs the live
+    release with keys its data wasn't made with.
+    """
+    instance, remote, job = c.instance, c.remote, c.job
+    host = instance.host.name
+    live = data.live_state(instance)
+    if live is None:
+        raise DeployError(data.not_live_text(instance))
+    name = str(live.get("release") or "")
+    sha = str(live.get("sha") or "")
+    if not _RELEASE_NAME.fullmatch(name) or not _SHA_RE.match(sha):
+        raise DeployError(f"Slipway's record of {instance.name}'s live release is damaged; deploy again first.")
+    release = await _check_live_release(remote, instance, c.paths, name)
+    text = await _read_release_file(remote, release, instance.manifest_file)
+    if text is None:
+        raise DeployError(f"{instance.manifest_file} of the live release {sha[:7]} can't be read in {release} on {host}; "
+                          "deploy again first.")
+    try:
+        man = manifest.parse(text)
+    except manifest.ManifestError as exc:
+        raise DeployError(f"The live release {sha[:7]}: {exc}") from exc
+    template = None
+    if man.env_file:
+        template = await _read_release_file(remote, release, man.env_file)
+        if template is None:
+            raise DeployError(f"The live release {sha[:7]}: env_file {man.env_file} can't be read in {release}")
+    env = dict(job.env or {})
+    keys = man.identity_keys()
+    known = instance.live_identity or {}
+
+    def render(env: dict[str, str]) -> manifest.AppPlan:
+        try:
+            return manifest.plan(
+                man, template=template,
+                builtins=app_builtins(instance, release, sha, uuid.UUID(str(live["deployment"]))),
+                settings={str(k): str(v) for k, v in (live.get("settings") or {}).items()},
+                chosen=live.get("services"),
+                host_ports={str(k): int(v) for k, v in (live.get("host_ports") or {}).items()},
+                secrets=dict(job.secrets or {}), env=env,
+            )
+        except manifest.ManifestError as exc:
+            raise DeployError(f"Release {sha[:7]} can't be rendered again for {instance.name}: {exc}") from exc
+        except KeyError as exc:
+            raise DeployError(f"Release {sha[:7]} needs the secret {exc.args[0]}, which Slipway doesn't have") from exc
+        except ValueError as exc:
+            raise DeployError(f"Slipway's record of {instance.name}'s live release is damaged ({exc}); deploy again first.") from exc
+
+    plan = render(env)
+    problem = _live_names_problem(plan, live, sha[:7])
+    if problem:
+        raise DeployError(problem)
+    rendered = data.rendered_identity(plan.env, keys)
+    differing = [k for k in keys if k in known and rendered.get(k) != known[k]]
+    if differing:
+        if not deploying:
+            raise DeployError(
+                f"{differing[0]} differs from the value {instance.name}'s data was made with (an environment variable "
+                f"of the instance changed since {sha[:7]} went live). Put the variable back, or deploy, then retry.")
+        plan = render({**env, **{k: known[k] for k in differing}})
+        await c.sink.line(f"Backing up with the {', '.join(differing)} the data was made with; the new value goes "
+                          "live with the new release")
+    if live.get("env_fp") and live.get("env_fp") != env_fingerprint(instance, env):
+        await c.sink.line(f"The instance's environment variables changed since {sha[:7]} went live; Slipway renders "
+                          "with the current ones")
+    content = _env_content(template, plan)
+    await remote.write_text(c.paths.env_file, content)
+    await c.sink.line(f"Wrote the settings of the live release {sha[:7]} to {c.paths.env_file}")
+    return _Side(man=man, plan=plan, release=release, sha=sha, content=content)
+
+
+# ------------------------------------------------------------------ data steps
+
+
+async def _pre_start(c: _AppRun) -> None:
+    """The listed steps between build and start, in their listed order (correctness 16)."""
+    for row in list(c.steps.rows):
+        key = row["key"]
+        if key not in PRE_START_STEPS:
+            continue
+        handler = _PRE_START.get(key)
+        if handler is None:
+            raise DeployError(f"Slipway can't run the step {row['name']!r} for this job yet")
+        await handler(c)
+
+
+async def _post_finish(c: _AppRun) -> None:
+    """first_admin, then seed, when listed. Their failures end the step as a warning; the job still succeeds."""
+    for row in list(c.steps.rows):
+        if row["key"] in POST_FINISH_STEPS and row.get("status") == "pending":
+            await _POST_FINISH[row["key"]](c)
+
+
+async def _outcome_step(c: _AppRun, key: str, body: Callable[[], Awaitable[tuple[str, str | None]]], *,
+                        never_fail: bool = False) -> None:
+    """Run a step whose body says how it ended: ``("succeeded" | "skipped" | "warning", note)``.
+
+    ``never_fail``: an error ends it as a warning instead of failing the job (the steps after finish, D12).
+    """
+    await c.steps.begin(key)
+    try:
+        status, note = await body()
+    except Exception as exc:
+        if not never_fail:
+            await c.steps.end("failed", note=str(exc) or type(exc).__name__)
+            raise
+        status, note = "warning", str(exc) or type(exc).__name__
+    except BaseException:
+        await c.steps.end("failed", note="Interrupted")
+        raise
+    if note and status in ("skipped", "warning"):
+        await c.sink.line(f"Warning: {note}" if status == "warning" else note)
+    await c.steps.end(status, note=note)
+
+
+async def _save_options(job: _Job, **values: Any) -> None:
+    job.options.update(values)
+    async with session_scope() as db:
+        await db.execute(update(Deployment).where(Deployment.id == job.deployment_id).values(options=dict(job.options)))
+
+
+async def _set_backup_id(job: _Job, backup_id: uuid.UUID | None) -> None:
+    async with session_scope() as db:
+        await db.execute(update(Deployment).where(Deployment.id == job.deployment_id).values(backup_id=backup_id))
+
+
+BACKUP_REASONS = {
+    DeploymentKind.DEPLOY: BackupReason.PRE_DEPLOY, DeploymentKind.RESTORE: BackupReason.PRE_RESTORE,
+    DeploymentKind.ROLLBACK: BackupReason.PRE_ROLLBACK, DeploymentKind.RESET: BackupReason.PRE_RESET,
+    DeploymentKind.BACKUP: BackupReason.MANUAL,
+}
+
+
+def _backup_files(job: _Job) -> bool:
+    """Files are backed up before a reset, before a restore that puts files back, and when "Back up now" asks."""
+    if job.kind == DeploymentKind.RESET:
+        return True
+    return job.kind in (DeploymentKind.RESTORE, DeploymentKind.BACKUP) and bool(job.options.get("files"))
+
+
+async def _backup_step(c: _AppRun) -> None:
+    await _outcome_step(c, "backup", lambda: _backup(c))
+
+
+async def _backup(c: _AppRun) -> tuple[str, str | None]:
+    """The ``backup`` step (§7.5): a verified copy of the data before anything changes it (I1)."""
+    job = c.job
+    reason = BACKUP_REASONS.get(job.kind, BackupReason.MANUAL)
+    if c.steps.listed("reset") and not job.done_by.get("reset"):
+        await _reset_precheck(c)  # a foreign volume refuses the reset before anything stops (I4)
+    no_new_backup = job.inherited_backup_id is not None or bool(job.options.get("skip_backup"))
+    if no_new_backup:
+        # The change steps that follow change the app's data: a failure in them leaves it dirty (§8.4, I6).
+        job.data_app = job.data_app or _has_declared_data(c)
+        if _replacing(job):
+            await _refuse_elsewhere(c)  # the probe that refuses it in _backup_with doesn't run (I4)
+    if job.inherited_backup_id is not None:
+        return await _inherited_backup(c)
+    if job.options.get("skip_backup"):
+        who = job.user.email if job.user is not None else "someone"
+        return "warning", f"Skipped on request by {who}: the data is changed without a backup"
+    taken = await _take_backup(c, reason, files=_backup_files(job))
+    if taken is None:
+        return "skipped", "slipway.yml declares no data"
+    status, note, _ = taken
+    return status, note if status != "succeeded" else None
+
+
+async def _inherited_backup(c: _AppRun) -> tuple[str, str | None]:
+    """A retry of a job that began changing the data keeps that job's pre-change backup (§8.1, D11)."""
+    job, instance, host = c.job, c.instance, c.instance.host.name
+    async with session_scope() as db:
+        row = await db.get(Backup, job.inherited_backup_id)
+        if row is None or row.instance_id != instance.id:
+            problem: str | None = "gone"
+            name = "its backup"
+        else:
+            name = row.name
+            problem = await data.confirm_backup(c.remote, db, row, c.paths.backups, host, files=row.has_files)
+            taken_at = _utc_text(row.taken_at)
+    if problem is None:
+        await _set_backup_id(job, job.inherited_backup_id)
+        status, note = "skipped", f"Keeping the backup taken before the first attempt: {name} (taken {taken_at})"
+    else:
+        await _set_backup_id(job, None)
+        status, note = "warning", (f"The backup taken before the first attempt ({name}) is no longer on {host}; a new "
+                                   "one now would hold half-changed data, so none is taken.")
+    if job.pre_retry:
+        since = _utc_text(job.parent_finished_at) if job.parent_finished_at else "the first attempt"
+        try:
+            again = await _take_backup(c, BackupReason.PRE_RETRY, files=False, sets_dep=False)
+        except Exception as exc:
+            if job.lock_left:  # its dump may still run: nothing else may run under the lock (§4.5)
+                raise
+            log.info("pre_retry backup of %s failed: %s", instance.id, c.sink.scrub(str(exc)))
+            again = None
+            failed = True
+        else:
+            failed = again is None or again[0] != "succeeded"
+        if failed:
+            await c.sink.line(f"Warning: The app was started by hand after the first attempt, and its data could not be "
+                              f"backed up again: writes since {since} aren't in any backup")
+            status = "warning"
+    return status, note
+
+
+def _replacing(job: _Job) -> bool:
+    """A job that replaces or deletes the data: restore, roll back, reset, Start over, or seeding from a snapshot."""
+    return job.snapshot_id is not None or job.kind in data.RESTORE_KINDS
+
+
+def _has_declared_data(c: _AppRun) -> bool:
+    """Whether the live or the new slipway.yml declares data (a dump command or data volumes)."""
+    live = data.live_state(c.instance)
+    live_json = data.live_manifest(c.instance) if live is not None else {}
+    return ("dump" in (live_json.get("commands") or {}) or bool((live or {}).get("volumes"))
+            or (c.new is not None and _declares_data(c.new.man)))
+
+
+def _elsewhere_text(instance: Instance) -> str:
+    return (f"{instance.name}'s data lives outside {instance.host.name} {data.ELSEWHERE_MARK}; Slipway backs it "
+            "up but won't restore, reset or seed it yet. Nothing was changed.")
+
+
+async def _cache_elsewhere(c: _AppRun, elsewhere: bool) -> None:
+    """Keep ``app_state.live.data_elsewhere`` as the last probe found it, also when the job then fails (§17)."""
+    state = dict(c.instance.app_state or {})
+    live = state.get("live")
+    if not isinstance(live, dict) or bool(live.get("data_elsewhere")) == elsewhere:
+        return
+    await _save_instance(c.instance, app_state={**state, "live": {**live, "data_elsewhere": elsewhere}})
+
+
+async def _refuse_elsewhere(c: _AppRun) -> None:
+    """A replacing job whose backup is skipped or inherited still asks ``has_data`` where the data lives: an
+    external or shared database is never restored, reset or seeded (D7, I4). Only exit 4 refuses here; the
+    data may be half-changed, so any other answer lets the job go on."""
+    side = c.new
+    if side is None or "has_data" not in side.plan.commands:
+        return
+    code, _ = await _app_run(c, side, "has_data", check=False)
+    if code == 4:
+        c.job.data_elsewhere = True
+        await _cache_elsewhere(c, True)
+        raise DeployError(_elsewhere_text(c.instance))
+
+
+def _utc_text(at: Any) -> str:
+    return at.strftime("%Y-%m-%d %H:%M UTC") if at else "an unknown time"
+
+
+def _volume_union(*lists: list[Any]) -> list[dict[str, str]]:
+    seen: dict[str, dict[str, str]] = {}
+    for vols in lists:
+        for v in vols or []:
+            if isinstance(v, dict) and v.get("name") and str(v["name"]) not in seen:
+                seen[str(v["name"])] = {"name": str(v["name"]), "holds": str(v.get("holds") or "other")}
+    return list(seen.values())
+
+
+async def _probe_data(c: _AppRun, side: _Side, volumes: list[dict[str, str]]) -> data.DataProbe:
+    """Whether the app has data on the host: ``commands.has_data`` when declared, else the declared volumes."""
+    if "has_data" in side.plan.commands:
+        code, _ = await _app_run(c, side, "has_data", check=False)
+        try:
+            return data.has_data_result(code, name=c.instance.name)
+        except data.DataError as exc:
+            raise DeployError(str(exc)) from None
+    if not volumes:
+        return data.DataProbe("empty", "slipway.yml declares no volume that holds the database or files")
+    _, output = await c.remote.run(data.volume_probe_command(v["name"] for v in volumes), check=False,
+                                   timeout=data.PROBE_TIMEOUT)
+    try:
+        return data.volumes_result(data.parse_volume_probe(output, host=c.instance.host.name), volumes,
+                                   host=c.instance.host.name)
+    except data.DataError as exc:
+        raise DeployError(str(exc)) from None
+
+
+def _file_args(cmd: dict[str, Any], slot: str, path: str) -> dict[str, Any]:
+    """How a file command gets its file: as its ``{slipway.<slot>}`` argument, or on stdout/stdin."""
+    return {"stream_path": path} if cmd.get("stream") else {"slots": {slot: path}}
+
+
+async def _read_small(remote: ssh.RemoteSession, path: str, limit: int) -> str | None:
+    """The first ``limit`` bytes of a small file on the host as text (None when it isn't a regular file)."""
+    p = q(path)
+    status, output = await remote.run(f"[ -f {p} ] && [ ! -L {p} ] && head -c {int(limit)} {p} | od -An -v -tx1",
+                                      check=False, timeout=60)
+    if status:
+        return None
+    return read_hex_output(output).decode("utf-8", "replace")
+
+
+def _last_line(output: str, default: str = "") -> str:
+    return next((ln.strip() for ln in reversed(output.splitlines()) if ln.strip()), default)
+
+
+async def _take_backup(c: _AppRun, reason: str, *, files: bool, sets_dep: bool = True,
+                       ) -> tuple[str, str | None, uuid.UUID | None] | None:
+    """Back up the data with the live release's commands (D4), or the new release's when the live one has no
+    dump. Returns None when neither slipway.yml declares data, else ``(status, note, backup id)``.
+
+    On a deploy the live render writes the live ``.env`` first and the new one is put back afterwards, and the
+    new release's ``accepts`` then checks the live data's revision (generality 10).
+    """
+    job, instance, new = c.job, c.instance, c.new
+    live = data.live_state(instance)
+    live_json = data.live_manifest(instance) if live is not None else {}
+    use_live = live is not None and "dump" in (live_json.get("commands") or {})
+    live_volumes = list((live or {}).get("volumes") or [])
+    if not _has_declared_data(c):
+        await _save_options(job, started_empty=True)
+        return None
+    job.data_app = True
+    rendered_here = False
+    if use_live and c.live is not None:
+        side = c.live
+    elif use_live:
+        side = await _live_plan(c, deploying=job.kind == DeploymentKind.DEPLOY)
+        rendered_here = True
+    elif new is not None:
+        side = new
+    else:
+        raise DeployError(data.not_live_text(instance))
+    revision: str | None = None
+    try:
+        result = await _backup_with(c, side, reason, files=files, sets_dep=sets_dep,
+                                    volumes=_volume_union(live_volumes, new.plan.volumes if new else []))
+        status, note, backup_id, revision = result
+    finally:
+        if rendered_here and new is not None:
+            await c.remote.write_text(c.paths.env_file, new.content)
+            await c.sink.line(f"Put back the settings of release {new.sha7}")
+    if (job.kind == DeploymentKind.DEPLOY and new is not None and revision and live is not None
+            and str(live.get("release")) != posixpath.basename(new.release)
+            and {"revision", "accepts"} <= set(new.plan.commands)):
+        warning = await _check_new_revision(c, new, revision)
+        if warning:
+            status, note = "warning", warning if not note else f"{note} {warning}"
+    return status, note, backup_id
+
+
+async def _check_new_revision(c: _AppRun, new: _Side, revision: str) -> str | None:
+    """Can the release being deployed run the live data's revision? Refuses before start (I4)."""
+    code, output = await _accepts(c, new, revision)
+    short = data.revision_short(revision) or "?"
+    if code == 0:
+        await c.sink.line(f"Release {new.sha7} can run the data at revision {short}")
+        return None
+    if code == 3:
+        why = f"Release {new.sha7} can't run the data at revision {short}: {_last_line(output, 'it says no')}."
+        if c.job.options.get("skip_revision_check"):
+            return f"{why} Deploying anyway, as asked (Skip the revision check)."
+        raise DeployError(f"{why} Nothing was changed. Deploy a commit that can, or deploy with \"Skip the revision check\".")
+    raise DeployError(f"The revision check failed (commands.accepts exited {code}). Nothing was changed.")
+
+
+async def _backup_with(
+    c: _AppRun, side: _Side, reason: str, *, files: bool, sets_dep: bool, volumes: list[dict[str, str]],
+) -> tuple[str, str | None, uuid.UUID | None, str | None]:
+    """Probe, then write and check the backup per §4.2. Returns (status, note, backup id, revision)."""
+    job, instance, remote, sink = c.job, c.instance, c.remote, c.sink
+    host = instance.host.name
+    cmds = side.plan.commands
+    probe = await _probe_data(c, side, volumes)
+    job.data_elsewhere = probe.state == "elsewhere"
+    await _cache_elsewhere(c, job.data_elsewhere)  # the queue checks read it, also after this job fails
+    replacing = _replacing(job)
+    if probe.state == "elsewhere" and replacing:
+        raise DeployError(_elsewhere_text(instance))
+    if probe.state == "here" and job.snapshot_id is not None and job.never_live and instance.fresh_data is None:
+        raise DeployError(await _seeding_over_data(c, probe))
+    if probe.state == "empty":
+        await _save_options(job, started_empty=True)
+        if job.never_live and instance.fresh_data != FreshData.SNAPSHOT:
+            await _save_instance(instance, fresh_data=FreshData.EMPTY)
+        return "skipped", f"No data yet: {probe.reason}", None, None
+    if "dump" not in cmds:
+        where = ", ".join(probe.present) or "its volumes"
+        if replacing:
+            # §7.5 step 7 is for deploys only: a job that deletes or replaces the data needs a copy first (I1).
+            verb = "delete" if job.kind == DeploymentKind.RESET else "replace"
+            raise DeployError(f"{instance.name} has data on {host} ({where}), and slipway.yml has no dump command, so "
+                              f"Slipway can't back it up first. Nothing was changed. To {verb} it anyway, Retry "
+                              "without the backup.")
+        return "warning", f"slipway.yml has no dump command, so the data in {where} was not backed up", None, None
+    if probe.state == "elsewhere":
+        await sink.line(f"{probe.reason}: Slipway backs it up, but won't restore, reset or seed it yet")
+    dirty = instance.data_dirty or {}
+    dirty_first = dirty.get("first") or {}
+    if dirty:
+        await sink.line(f"The data was changed by failed {data.kind_noun(str(dirty_first.get('kind') or 'job'))} "
+                        f"{str(dirty_first.get('deployment_id') or '')[:8]}: this backup holds that state")
+    if files and "export_files" not in cmds:
+        files = False
+    backups = c.paths.backups
+    await remote.run(data.prepare_backups_command(backups), timeout=60)
+
+    # Free space (§4.2 step 1): 1.25 × the last backup, or the volumes' sizes, plus the margin.
+    async with session_scope() as db:
+        last_db, last_files = await data.last_ready_sizes(db, instance.id)
+    sizes: dict[str, int] | None = None
+    if last_db is None or (files and last_files is None):
+        status, output = await remote.run(data.VOLUME_SIZES_COMMAND, check=False, timeout=data.PROBE_TIMEOUT)
+        sizes = data.parse_volume_sizes(output) if status == 0 else None
+        if sizes is None:
+            await sink.line(f"Couldn't read the volumes' sizes on {host} (docker system df -v exited {status})")
+    estimate = data.estimate_backup(last_db_bytes=last_db, last_files_bytes=last_files, include_files=files,
+                                    volumes=volumes, volume_sizes=sizes)
+    for line in estimate.notes:
+        await sink.line(line)
+    _, output = await remote.run(data.free_space_command(backups), check=False, timeout=data.PROBE_TIMEOUT)
+    problem = data.free_space_problem(free_kb=data.parse_free_kb(output), estimate=estimate.bytes,
+                                      where=backups, host=host)
+    if problem:
+        raise DeployError(problem)
+    if ram_backed(instance.host, c.paths.base):
+        await sink.line(f"Warning: {c.paths.base} is in RAM on {host} (Unraid): backups there are lost when it restarts; "
+                        "move the instance's folder under /mnt/user")
+    if "data_up" in cmds:
+        await _app_run(c, side, "data_up")
+
+    # The row first (pending), so a restart between here and the end leaves a trace (§4.4 unverified).
+    keys = side.man.identity_keys()
+    rendered = data.rendered_identity(side.plan.env, keys)
+    known = instance.live_identity or {}
+    identity = {k: known.get(k, rendered.get(k)) for k in keys if k in known or k in rendered}
+    if keys and instance.live_identity is None:
+        await _save_instance(instance, live_identity=dict(rendered))
+        await sink.line(f"Recorded {', '.join(keys)} as the {side.man.data.identity_label} {instance.name}'s data is made with")
+    for value in identity.values():
+        sink.hide.add(value)
+    row_id = uuid.uuid4()
+    taken_at = utcnow()
+    name = data.backup_name(row_id, taken_at)
+    async with session_scope() as db:
+        db.add(Backup(
+            id=row_id, instance_id=instance.id, deployment_id=job.deployment_id, name=name, reason=reason,
+            status=BackupStatus.PENDING, format=side.man.data.format or "", has_files=files,
+            files_format=side.man.data.files.format if files and side.man.data.files else None,
+            commit_sha=instance.current_commit_sha, release=posixpath.basename(side.release)[:64],
+            dirty_of=_as_uuid(dirty_first.get("deployment_id")) if dirty else None,
+            identity_keys=keys, identity=identity or None, identity_fp=data.identity_fp(row_id, keys, identity),
+            created_by_id=job.user.id if job.user is not None else None, taken_at=taken_at,
+            # Back up now's note (POST /instances/{id}/backups keeps it in the job's options).
+            note=str(job.options.get("note"))[:300] if job.kind == DeploymentKind.BACKUP and job.options.get("note")
+            else None,
+        ))
+    job_dir = data.job_dir(c.paths.base, job.deployment_id)
+    partials = {"dump": data.partial_file(backups, name, "dump")}
+    if files:
+        partials["files"] = data.partial_file(backups, name, "files")
+    try:
+        await remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
+        revision = await _read_revision(c, side, job_dir)
+        measured: dict[str, tuple[int, str | None]] = {}
+        no_hash = False
+        for part, command, verify in (("dump", "dump", "verify_dump"), ("files", "export_files", None)):
+            if part not in partials:
+                continue
+            path = partials[part]
+            code, _ = await _app_run(c, side, command, check=False, **_file_args(cmds[command], "out", path))
+            if code != 0:
+                raise _DumpFailed(command, code)
+            _, output = await remote.run(data.partial_check_command(path), check=False, timeout=data.HASH_TIMEOUT)
+            found = data.parse_file_check(output)
+            base = posixpath.basename(path)
+            size = found.sizes.get(base)
+            if size is None:
+                raise DeployError(data.empty_output_message(command, path))
+            sha = found.shas.get(base)
+            no_hash = no_hash or sha is None
+            measured[part] = (size, sha)
+            if verify and verify in cmds:
+                code, _ = await _app_run(c, side, verify, check=False, **_file_args(cmds[verify], "in", path))
+                if code != 0:
+                    raise DeployError(f"The backup failed its check (commands.{verify} exited {code}), so Slipway "
+                                      "changed nothing; the database is as it was. Fix the cause, then retry.")
+            elif verify:
+                await sink.line("slipway.yml has no verify_dump: checked only that the dump isn't empty")
+        if no_hash:
+            await sink.line(data.no_hash_tool_message(host))
+        await remote.run(data.finalize_command({p: data.backup_file(backups, name, part) for part, p in partials.items()}),
+                         timeout=60)
+        db_bytes, db_sha = measured["dump"]
+        files_bytes, files_sha = measured.get("files", (None, None))
+        async with session_scope() as db:
+            row = await db.get(Backup, row_id)
+            assert row is not None
+            row.status, row.db_bytes, row.db_sha256 = BackupStatus.READY, db_bytes, db_sha
+            row.files_bytes, row.files_sha256 = files_bytes, files_sha
+            row.revision = revision
+            row.finished_at = row.checked_at = utcnow()
+            await remote.write_text(data.backup_file(backups, name, "json"), data.sidecar(row, app=side.man.data.app))
+    except _DumpFailed as exc:
+        await _discard_backup(c, row_id, name)
+        if dirty.get("hold"):
+            return ("warning", f"The backup failed (commands.{exc.command} exited {exc.code}); the data was left "
+                    "half-changed, so it may not be dumpable. Continuing without a backup.", None, None)
+        raise DeployError(
+            f"The backup failed (commands.{exc.command} exited {exc.code}), so Slipway changed nothing; the database is "
+            "as it was. Is the database running? Fix the cause, then retry. If the data can't be backed up, Retry "
+            "without the backup.") from None
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await _discard_backup(c, row_id, name)
+        raise
+    finally:
+        with contextlib.suppress(Exception):  # the folder stays while it holds a staged snapshot
+            await remote.run(f"rm -f -- {q(job_dir + '/revision.out')}; rmdir -- {q(job_dir)} 2>/dev/null; true",
+                             check=False, timeout=60)
+    if sets_dep:
+        await _set_backup_id(job, row_id)
+    size_text = data.human_bytes(db_bytes + (files_bytes or 0))
+    await sink.line(f"Backed up the data: {name} ({size_text})")
+    async with session_scope() as db:
+        fresh = await db.get(Instance, instance.id)
+        if fresh is not None:
+            await data.apply_retention(remote, db, fresh, backups, just_taken=row_id, say=sink.line)
+    return "succeeded", None, row_id, revision
+
+
+class _DumpFailed(Exception):
+    def __init__(self, command: str, code: int) -> None:
+        super().__init__(f"commands.{command} exited {code}")
+        self.command, self.code = command, code
+
+
+async def _discard_backup(c: _AppRun, row_id: uuid.UUID, name: str) -> None:
+    """A failed backup leaves nothing: its partial files (by their exact names) and its row go."""
+    with contextlib.suppress(Exception):
+        await c.remote.run(data.discard_partials_command(c.paths.backups, name), check=False, timeout=60)
+    async with session_scope() as db:
+        await db.execute(delete(Backup).where(Backup.id == row_id))
+
+
+async def _read_revision(c: _AppRun, side: _Side, job_dir: str) -> str | None:
+    """``commands.revision``'s stdout, captured to a file (stderr goes to the log), up to 16 KiB (D6)."""
+    if "revision" not in side.plan.commands:
+        return None
+    out = f"{job_dir}/revision.out"
+    code, _ = await _app_run(c, side, "revision", stream_path=out, stream="stdout", check=False)
+    text = (await _read_small(c.remote, out, REVISION_MAX_BYTES) or "").strip() if code == 0 else ""
+    if not text:
+        await c.sink.line(f"Couldn't read the database's revision (exit {code}); the backup is kept without one")
+        return None
+    await c.sink.line(f"The database is at revision {data.revision_short(text)}")
+    return text
+
+
+# --------------------------------------------------- first admin and starter content (§11.2, §11.3)
+
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s.]{2,}$")
+
+
+def _bad_text(value: str) -> bool:
+    return any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value)
+
+
+def first_admin_problem(spec: manifest.FirstAdmin, fields: dict[str, Any], mode: str, password: str | None) -> str | None:
+    """What makes a first admin unfit for a release's ``first_admin`` (§11.1), or None."""
+    names = {f.name for f in spec.fields}
+    if set(fields) != names:
+        missing, extra = sorted(names - set(fields)), sorted(set(fields) - names)
+        return "; ".join(filter(None, [f"it needs {', '.join(missing)}" if missing else "",
+                                       f"it doesn't know {', '.join(extra)}" if extra else ""]))
+    for f in spec.fields:
+        value = fields[f.name]
+        if not isinstance(value, str):
+            return f"{f.label} must be text"
+        # The raw value is checked: it is what reaches the command (blanks around a text field are dropped).
+        if f.kind == "email":
+            if (len(value) > min(254, f.max) or not _EMAIL_RE.match(value) or _bad_text(value)
+                    or value.startswith("-")):
+                return f"{f.label} isn't an email address"
+        else:
+            text = value.strip()
+            if not 1 <= len(text) <= f.max or _bad_text(value) or text.startswith("-"):
+                return f"{f.label} must be 1 to {f.max} characters of plain text, not starting with -"
+    if mode == "password":
+        if spec.password is None:
+            return "it can't set a password (invite them instead)"
+        least = max(8, spec.password.min_length)
+        if password is None or not least <= len(password) <= 1024 or _bad_text(password):
+            return f"the password must be {least} to 1024 characters"
+    elif mode == "invite":
+        if spec.invite is None:
+            return "it can't invite by email (set a password instead)"
+        if password:
+            return "a first admin invited by email has no password"
+    else:
+        return f"unknown mode {mode!r}"
+    return None
+
+
+async def _first_admin_step(c: _AppRun) -> None:
+    await _outcome_step(c, "first_admin", lambda: _first_admin(c), never_fail=True)
+
+
+async def _first_admin(c: _AppRun) -> tuple[str, str | None]:
+    side, instance, job = c.new, c.instance, c.job
+    assert side is not None
+    again = " Change the first admin on the instance if needed, then Create it now."
+    async with session_scope() as db:
+        row = await db.scalar(select(FirstAdmin).where(FirstAdmin.instance_id == instance.id))
+        if row is None:
+            return "skipped", "No first admin to create"
+        if row.status == FirstAdminStatus.DONE:
+            return "skipped", f"Already created on {row.done_at:%Y-%m-%d}" if row.done_at else "Already created"
+        stored = await db.scalar(select(FirstAdmin.password.is_not(None)).where(FirstAdmin.id == row.id))
+        row_id, read_at, fields, mode, password = row.id, row.updated_at, dict(row.fields or {}), row.mode, row.password
+    spec, planned = side.man.first_admin, side.plan.first_admin
+    if spec is None or planned is None:
+        return "warning", (f"The first admin doesn't fit release {side.sha7}'s slipway.yml: it declares no first_admin."
+                           " Change it on the instance, then Create it now.")
+    if mode == "password" and password is None:
+        if stored:
+            return "warning", ("The first admin's password can't be decrypted with SLIPWAY_ENCRYPTION_KEY; set it again "
+                               "on the instance, then Create it now")
+        return "warning", "The first admin has no password; set it again on the instance, then Create it now"
+    problem = first_admin_problem(spec, fields, mode, password)
+    if problem:
+        return "warning", (f"The first admin doesn't fit release {side.sha7}'s slipway.yml: {problem}. Change it on the "
+                           "instance, then Create it now.")
+    if job.lock_left:  # an earlier command may still run, and holds the host lock line (§4.5)
+        await _read_left_pid(c.remote, instance, job)
+        return "warning", f"The first admin wasn't created: {_left_text(c)}. Create it now once it has ended."
+    if password:
+        c.sink.hide.add(password, min_length=4)
+    argv = [*planned["argv"], *(planned["password_args"] if mode == "password" else planned["invite_args"])]
+    slots = {f"admin.{k}": str(v).strip() for k, v in fields.items()}  # as first_admin_problem checked them
+    env_var = spec.password.env if mode == "password" and spec.password is not None else None
+    code, output = await _app_run(
+        c, side, "first_admin", cmd={"argv": argv, "stream": None}, slots=slots, check=False,
+        input=password + "\n" if mode == "password" and password is not None else None, env_from_stdin=env_var,
+    )
+    if code in spec.done_codes or code in spec.exists_codes:
+        existed = code in spec.exists_codes
+        async with session_scope() as db:
+            done = await db.execute(
+                update(FirstAdmin).where(FirstAdmin.id == row_id, FirstAdmin.updated_at == read_at,
+                                         FirstAdmin.status == FirstAdminStatus.PENDING)
+                .values(status=FirstAdminStatus.DONE, password=None, done_at=utcnow(),
+                        deployment_id=job.deployment_id, existed=existed, last_error=None))
+        if not done.rowcount:
+            return "warning", "The first admin was changed while it was being created; Create it now to create the new one"
+        who = next((str(fields[f.name]) for f in spec.fields if f.kind == "email"), None) or "the first admin"
+        if existed:
+            return "succeeded", f"An account for {who} already existed in the app; Slipway left it as it is"
+        await c.sink.line(f"Created the first admin ({who})")
+        return "succeeded", None
+    if code == 97 and env_var:
+        message = "The first admin's password didn't arrive on stdin."
+    else:
+        message = spec.messages.get(code) or f"The app's first-admin command failed (exit {code})."
+    message = message.rstrip() + again
+    async with session_scope() as db:
+        await db.execute(update(FirstAdmin).where(FirstAdmin.id == row_id)
+                         .values(last_error=clean_text(c.sink.scrub(message))[:300]))
+    return "warning", message
+
+
+async def _seed_step(c: _AppRun) -> None:
+    await _outcome_step(c, "seed", lambda: _seed(c), never_fail=True)
+
+
+async def _seed(c: _AppRun) -> tuple[str, str | None]:
+    side, instance, job = c.new, c.instance, c.job
+    assert side is not None
+    if "seed" not in side.plan.commands:
+        return "skipped", "slipway.yml has no seed command"
+    if job.kind == DeploymentKind.DEPLOY:
+        empty = bool(job.options.get("started_empty")) or (job.never_live and instance.fresh_data == FreshData.EMPTY)
+        if not instance.seed_content:
+            return "skipped", "Starter content is off for this instance"
+        if not empty:
+            return "skipped", "The app already had data: starter content is only added after an empty start"
+    if job.lock_left:  # first_admin timed out and may still run: it keeps the host lock line (§4.5)
+        await _read_left_pid(c.remote, instance, job)
+        await _save_instance(instance, content_pending=True)
+        return "warning", f"The starter content wasn't added: {_left_text(c)}. Add starter content once it has ended."
+    code, _ = await _app_run(c, side, "seed", check=False)
+    if code:
+        await _save_instance(instance, content_pending=True)
+        return "warning", f"commands.seed exited {code}: the starter content may be missing. Add starter content to try again."
+    return "succeeded", None
+
+
+# ------------------------------------------- restore, roll back, reset and seeding (§7.5)
+
+STAGE_HEADROOM = 512 * 1024 * 1024  # free space a staged snapshot needs on the host beyond its own size
+STAGE_DEPTH = 8  # pieces in flight between the decrypting thread and the upload
+
+
+def _refuse(text: str) -> DeployError:
+    """A check step's refusal: it comes before anything changed (I4)."""
+    return DeployError(f"{text.rstrip('.')}. Nothing was changed.")
+
+
+async def _done_by_first(c: _AppRun, key: str) -> bool:
+    """A retry doesn't repeat a data step the attempt it retries finished (§8.1): skip it, and say so."""
+    by = c.job.done_by.get(key)
+    if not by or not c.steps.listed(key):
+        return False
+    _, row = c.steps._row(key)
+    row["done_by"] = by
+    await c.steps.skip(key, f"Done by the first attempt ({by[:8]}); not repeated")
+    return True
+
+
+async def _snapshot_name(snapshot_id: uuid.UUID | None) -> str:
+    async with session_scope() as db:
+        snap = await db.get(Snapshot, snapshot_id) if snapshot_id is not None else None
+    return snap.name if snap is not None else "(deleted)"
+
+
+async def _seeding_over_data(c: _AppRun, probe: data.DataProbe) -> str:
+    """The refusal to seed a new instance over data its host already has (§7.5 backup step 6)."""
+    name = await _snapshot_name(c.job.snapshot_id)
+    where = ", ".join(probe.present) or probe.reason
+    volumes = " ".join(probe.present) or "<volume>"
+    return (f"{c.instance.host.name} already has data for this app ({where}). Seeding from snapshot {name} would "
+            f"replace it: deploy without the snapshot, then Reset data from it, or remove the volumes (docker volume "
+            f"rm {volumes}) to start afresh.")
+
+
+async def _accepts(c: _AppRun, side: _Side, revision: str) -> tuple[int, str]:
+    """Run ``side``'s ``accepts`` on a revision Slipway writes to a 0600 file (D6)."""
+    job_dir = data.job_dir(c.paths.base, c.job.deployment_id)
+    path = f"{job_dir}/revision"
+    await c.remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
+    await c.remote.write_text(path, revision)
+    try:
+        return await _app_run(c, side, "accepts", check=False, **_file_args(side.plan.commands["accepts"], "in", path))
+    finally:
+        with contextlib.suppress(Exception):  # the folder goes too unless it holds a staged snapshot
+            await c.remote.run(f"rm -f -- {q(path)}; rmdir -- {q(job_dir)} 2>/dev/null; true", check=False, timeout=60)
+
+
+async def _remove_job_dir(remote: ssh.RemoteSession, instance: Instance, job: _Job) -> None:
+    """The job's own work folder in ``backups/.incoming`` (a staged snapshot, an export) goes at the end."""
+    if not (job.restore_from.get("staged") or job.exported) or job.lock_left:
+        return  # a command that may still run reads it: the next job's first step empties .incoming
+    with contextlib.suppress(Exception):
+        await remote.run(f"rm -rf -- {q(data.job_dir(paths_for(instance).base, job.deployment_id))}", check=False,
+                         timeout=600)
+
+
+async def _check_step(c: _AppRun) -> None:
+    body = _check_snapshot if c.job.snapshot_id is not None else _check_backup
+    await _outcome_step(c, "check", lambda: body(c))
+
+
+async def _check_backup(c: _AppRun) -> tuple[str, str | None]:
+    """Restore and roll back: the backup passes §9.2, is on the host unchanged, and the live release can run it."""
+    job, instance, side, sink = c.job, c.instance, c.new, c.sink
+    assert side is not None
+    host, cmds, label = instance.host.name, side.plan.commands, side.man.data.identity_label
+    files = bool(job.options.get("files"))
+    async with session_scope() as db:
+        row = None
+        if job.restore_backup_id is not None:
+            row = await db.scalar(select(Backup).where(Backup.id == job.restore_backup_id,
+                                                       Backup.instance_id == instance.id))
+        if row is None:
+            raise _refuse("The backup to restore was deleted")
+        dirty_job = await db.get(Deployment, row.dirty_of) if row.dirty_of is not None else None
+        rule = data.restorable(instance, row, dirty_job=dirty_job)
+        if not rule.ok:
+            raise _refuse(rule.reason or "The backup can't be restored")
+        if files and not row.has_files:
+            raise _refuse(f"The backup {row.name} has no files")
+        if files and "import_files" not in cmds:
+            raise _refuse(f"Release {side.sha7} can't import files (no commands.import_files)")
+        problem = await data.confirm_backup(c.remote, db, row, c.paths.backups, host, files=files)
+        if problem:
+            raise _refuse(problem)
+        name, revision = row.name, row.revision
+    await sink.line(f"The backup {name} is on {host}, unchanged since Slipway took it")
+    if rule.dirty_note:
+        await sink.line(f"This backup: {rule.dirty_note}")
+    if {"revision", "accepts"} <= set(cmds) and revision:
+        short = data.revision_short(revision)
+        code, output = await _accepts(c, side, revision)
+        if code == 3:
+            raise _refuse(f"Release {side.sha7} can't open a database at revision {short}: {_last_line(output, 'it says no')}")
+        if code:
+            raise _refuse(f"The revision check failed (commands.accepts exited {code})")
+        await sink.line(f"Release {side.sha7} can open the database at revision {short}")
+    elif "accepts" in cmds:
+        await sink.line(f"The backup {name} has no revision; Slipway can't check it against release {side.sha7}")
+    else:
+        await sink.line(f"Slipway can't check this backup's revision against release {side.sha7} (slipway.yml has no "
+                        "accepts command)")
+    override = dict(rule.override)
+    if override and job.kind == DeploymentKind.ROLLBACK:
+        raise _refuse(f"The backup from before the failed deploy was made with other {label}; restore it from the "
+                      "Backups card instead")
+    if override and not job.options.get("restore_identity"):
+        raise _refuse(f"This backup was made with other {label}; restoring it puts them back. Restore it again with "
+                      f"\"Put back its {label}\" (needs data:reset)")
+    for value in override.values():
+        sink.hide.add(value)
+    job.override = override
+    job.restore_from = {"database": data.backup_file(c.paths.backups, name, "dump"),
+                        "files": data.backup_file(c.paths.backups, name, "files") if files else None,
+                        "name": name, "source": f"backup {name}"}
+    return "succeeded", None
+
+
+async def _check_snapshot(c: _AppRun) -> tuple[str, str | None]:
+    """A seeding deploy or a reset from a snapshot: every check before anything stops, then the staging (I4)."""
+    job, instance, side, sink, remote = c.job, c.instance, c.new, c.sink, c.remote
+    assert side is not None
+    host, man, cmds = instance.host.name, side.man, side.plan.commands
+    if job.kind == DeploymentKind.DEPLOY:
+        probe = await _probe_data(c, side, side.plan.volumes)
+        if probe.state == "elsewhere":
+            raise _refuse(f"{instance.name}'s data lives outside {host} (commands.has_data says so); Slipway won't seed it")
+        if probe.state == "here" and instance.fresh_data is None:
+            raise DeployError(await _seeding_over_data(c, probe))
+    async with session_scope() as db:
+        snap = await db.get(Snapshot, job.snapshot_id) if job.snapshot_id is not None else None
+        if snap is None:
+            raise _refuse("The snapshot was deleted")
+        if snap.status != SnapshotStatus.READY:
+            raise _refuse(f"Snapshot {snap.name} isn't ready ({snap.status})")
+        try:
+            key = snapshots.data_key(snap)
+        except snapshots.SnapshotsError as exc:
+            raise _refuse(exc.message) from None
+        name, repository, app, app_name = snap.name, snap.repository, snap.app, snap.app_name
+        db_format, db_revision, db_bytes = snap.db_format, snap.db_revision, int(snap.db_bytes or 0)
+        files_format, files_bytes = snap.files_format, int(snap.files_bytes or 0)
+    repo = instance.repository.full_name
+    if repository != repo and not (job.user is not None and job.user.can(Perm.SNAPSHOTS_DOWNLOAD)):
+        raise _refuse(f"Snapshot {name} was made from {repository or 'an unknown repository'}; seeding {instance.name} "
+                      f"({repo}) from it needs the snapshots:download permission")
+    if app != man.data.app:
+        raise _refuse(f"This snapshot is of app {app} ({app_name}); {instance.name} runs {man.data.app}")
+    if db_format != man.data.format:
+        raise _refuse(f"The snapshot's database is in format {db_format}; release {side.sha7} restores {man.data.format}")
+    if "restore" not in cmds:
+        raise _refuse(f"Release {side.sha7}'s slipway.yml has no restore command")
+    files_label = (man.data.files.label if man.data.files else "files").lower()
+    if files_format:
+        if man.data.files is None or files_format != man.data.files.format:
+            wanted = man.data.files.format if man.data.files else "no files"
+            raise _refuse(f"The snapshot's files are in format {files_format}; release {side.sha7} imports {wanted}")
+        if "import_files" not in cmds:
+            raise _refuse(f"The snapshot has {files_label}, and release {side.sha7} can't import files "
+                          "(no commands.import_files)")
+    else:
+        await sink.line(f"The snapshot has no files; {files_label} start empty")
+    if {"revision", "accepts"} <= set(cmds) and db_revision:
+        short = data.revision_short(db_revision)
+        code, output = await _accepts(c, side, db_revision)
+        if code == 3:
+            raise _refuse(f"Release {side.sha7} can't open a database at revision {short}: {_last_line(output, 'it says no')}")
+        if code:
+            raise _refuse(f"The revision check failed (commands.accepts exited {code})")
+        await sink.line(f"Release {side.sha7} can open the database at revision {short}")
+    elif "accepts" not in cmds:
+        await sink.line(f"Slipway can't check the snapshot's revision against release {side.sha7} (slipway.yml has no "
+                        "accepts command)")
+    # Free space for the staged copy.
+    await remote.run(data.prepare_backups_command(c.paths.backups), timeout=60)
+    _, output = await remote.run(data.free_space_command(c.paths.backups), check=False, timeout=data.PROBE_TIMEOUT)
+    free_kb = data.parse_free_kb(output)
+    need = db_bytes + files_bytes + STAGE_HEADROOM
+    if free_kb is None or free_kb * 1024 < need:
+        free = data.human_bytes(free_kb * 1024) if free_kb is not None else "an unknown amount of space"
+        raise _refuse(f"Only {free} is free in {c.paths.backups} on {host}; the snapshot needs about "
+                      f"{data.human_bytes(need)}")
+    assert job.snapshot_id is not None
+    async with snapshots.transfer(on_wait=lambda: sink.line("Waiting for another snapshot transfer to finish")):
+        job.restore_from = {"staged": True}  # the job's folder holds what was staged: removed at the end
+        contents, staged = await _stage_snapshot(c, job.snapshot_id, key)
+    await sink.line(f"Copied snapshot {name} to {host} and checked it ({data.human_bytes(db_bytes + files_bytes)})")
+    # Identity (§9.3): the snapshot's values for the release's identity keys that it has.
+    keys = man.identity_keys()
+    values = contents.identity or {}
+    warnings = []
+    for k in keys:
+        if k not in values:
+            warnings.append(f"The snapshot has no {k} (release {side.sha7} marks it as identity); the instance keeps "
+                            f"its own. Anything in the snapshot's data that needed the source's {k} can't be read here.")
+    extra = sorted(set(values) - set(keys))
+    if extra:
+        await sink.line(f"The snapshot also has {', '.join(extra)}, which release {side.sha7} doesn't use; Slipway "
+                        "ignores them")
+    override = {k: values[k] for k in keys if k in values}
+    for value in override.values():
+        sink.hide.add(value)
+    try:
+        data.check_override(override, man.to_json(), source="snapshot")
+    except data.DataError as exc:
+        raise _refuse(str(exc)) from None
+    env = job.env or {}
+    pinned = sorted(k for k in override if k in env and env[k] != override[k])
+    if pinned:
+        raise _refuse(data.env_pin_message(pinned[0], source="snapshot"))
+    job.override = override
+    job.restore_from = {"database": staged["database"], "files": staged.get("files"), "name": name,
+                        "source": f"snapshot {name}", "snapshot": True, "staged": True}
+    return ("warning", " ".join(warnings)) if warnings else ("succeeded", None)
+
+
+class _Stopped(Exception):
+    """The staging gave up (the upload failed): the decrypting thread stops."""
+
+
+async def _stage_snapshot(c: _AppRun, snapshot_id: uuid.UUID, key: bytes) -> tuple[snapfile.SnapshotContents, dict[str, str]]:
+    """Decrypt the stored ``.sbx`` in a thread through the validator (§10.3) and upload its members as they come
+    to ``.incoming/job-<d8>/{database,files}`` (0600). Each member's checksum is checked in transit by the
+    validator and again on the host before it gets its final name."""
+    remote, host = c.remote, c.instance.host.name
+    job_dir = data.job_dir(c.paths.base, c.job.deployment_id)
+    await remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
+    path = snapshots.bundle_path(snapshot_id)
+    pieces: queue.Queue[tuple[str, str | None, Any]] = queue.Queue(STAGE_DEPTH)
+    stop = threading.Event()
+    max_bytes = get_settings().snapshot_max_bytes
+
+    def put(item: tuple[str, str | None, Any]) -> None:
+        while True:
+            if stop.is_set():
+                raise _Stopped
+            try:
+                pieces.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def sink(name: str, chunk: bytes | None) -> None:
+        put(("chunk", name, chunk) if chunk is not None else ("done", name, None))
+
+    def work() -> None:
+        try:
+            contents = snapfile.validate(snapfile.open_container(path, key), max_bytes=max_bytes, sink=sink)
+            put(("end", None, contents))
+        except _Stopped:
+            pass
+        except BaseException as exc:  # handed to the event loop, which raises it
+            with contextlib.suppress(_Stopped):
+                put(("error", None, exc))
+
+    async def get() -> tuple[str, str | None, Any]:
+        while True:
+            try:
+                return await asyncio.to_thread(pieces.get, True, 0.5)
+            except queue.Empty:
+                if worker.done():
+                    raise DeployError("Slipway couldn't read the stored snapshot") from None
+
+    worker = asyncio.ensure_future(asyncio.to_thread(work))
+    staged: dict[str, str] = {}
+    on_host: dict[str, str | None] = {}
+    contents: snapfile.SnapshotContents | None = None
+    try:
+        item = await get()
+        while contents is None:
+            kind, name, value = item
+            if kind == "error":
+                if isinstance(value, SnapshotError | OSError):
+                    raise _refuse(f"The stored snapshot can't be used: {value}")
+                raise value
+            if kind == "end":
+                contents = value
+                break
+            assert name in (snapfile.DATABASE, snapfile.FILES)
+            partial = f"{job_dir}/{name}.partial"
+            after: list[tuple[str, str | None, Any]] = []
+
+            async def member(first: tuple[str, str | None, Any], name: str = name,
+                             after: list[tuple[str, str | None, Any]] = after) -> AsyncIterator[bytes]:
+                item = first
+                while True:
+                    kind, which, value = item
+                    if kind == "chunk" and which == name:
+                        yield value
+                    elif kind == "done" and which == name:
+                        return
+                    else:  # an error part-way: the upload ends here, and the error is raised below
+                        after.append(item)
+                        return
+                    item = await get()
+
+            await remote.write_stream(partial, member(item))
+            if after:
+                item = after[0]
+                continue
+            # The validator matched the member's size and checksum in transit; the host's copy must match too.
+            _, output = await remote.run(data.sha_command(partial), check=False, timeout=data.HASH_TIMEOUT)
+            staged[name] = partial
+            on_host[name] = data.parse_sha(output)
+            item = await get()
+        assert contents is not None
+        if snapfile.DATABASE not in staged:
+            raise _refuse("The snapshot has no database")
+        for name in list(staged):
+            entry = contents.manifest["database" if name == snapfile.DATABASE else "files"]
+            if on_host.get(name) and on_host[name] != entry["sha256"]:
+                raise _refuse(f"The snapshot's {name} changed while it was copied to {host}")
+            final = f"{job_dir}/{name}"
+            await remote.run(f"mv -f -- {q(staged[name])} {q(final)}", timeout=60)
+            staged[name] = final
+        return contents, staged
+    finally:
+        stop.set()
+        with contextlib.suppress(BaseException):
+            await worker
+
+
+async def _stop_step(c: _AppRun) -> None:
+    async with c.steps.step("stop"):
+        if c.job.kind in data.DATA_ONLY_KINDS:
+            await _control(c, "stop")
+        else:
+            await _stop_app(c)
+
+
+async def _stop_app(c: _AppRun) -> None:
+    """Stop the release with its own ``stop``, then what a failed release left running (§7.5 stop)."""
+    side, instance, remote, sink = c.new, c.instance, c.remote, c.sink
+    assert side is not None
+    host = instance.host.name
+    c.data_up = False  # the release's stop may stop the data services too (ss-stack down does)
+    if "stop" in side.plan.commands:
+        await _app_run(c, side, "stop")
+    else:
+        await sink.line(f"Release {side.sha7}'s slipway.yml has no stop command")
+    for project in (instance.app_state or {}).get("starting") or []:
+        project = str(project)
+        if project in side.plan.projects or not manifest.PROJECT_RE.match(project):
+            continue
+        command = f"(cd / && docker compose -p {q(project)} down --remove-orphans)"
+        await sink.line(f"$ {command}")
+        await remote.run(command, on_line=sink.line, scrub=sink.scrub, timeout=side.man.timeout("stop"))
+    if not side.plan.projects:
+        return
+    check = "; ".join(f"docker ps -q --filter {_project_filter(p)} || exit 1" for p in side.plan.projects)
+    status, output = await remote.run(check, check=False, timeout=60)
+    if status:
+        raise DeployError(f"Couldn't check that {instance.name} stopped on {host} (docker ps exited {status}); "
+                          "nothing was deleted or restored")
+    running = _container_ids(output)
+    if running:
+        raise DeployError(f"Containers of {instance.name} are still running on {host} ({', '.join(running[:5])}); "
+                          "nothing was deleted or restored")
+
+
+async def _control(c: _AppRun, action: str) -> None:
+    """Data-only jobs stop and start the app's containers as they are (D17), never with slipway.yml's own
+    stop or start (``ss-stack down`` removes containers, ``up`` migrates)."""
+    command = control_command(c.instance, action)
+    await c.sink.line(f"$ {command}")
+    await c.remote.run(command, on_line=c.sink.line, scrub=c.sink.scrub, timeout=600)
+
+
+def _locked(c: _AppRun, key: str, command: str) -> str:
+    """A shell command of Slipway's own that changes data, under the host lock with its own PID (§4.5)."""
+    return f"{{ {data.lock_line_command(c.paths.lock, c.job.deployment_id, key, data=True)} && exec {command}; }}"
+
+
+async def _probe_volumes(c: _AppRun) -> data.VolumeProbe:
+    assert c.new is not None
+    names = [v["name"] for v in c.new.plan.volumes]
+    if not names:
+        return data.VolumeProbe(present={}, absent=[])
+    _, output = await c.remote.run(data.volume_probe_command(names), check=False, timeout=data.PROBE_TIMEOUT)
+    try:
+        return data.parse_volume_probe(output, host=c.instance.host.name)
+    except data.DataError as exc:
+        raise DeployError(str(exc)) from None
+
+
+def _own_projects(c: _AppRun) -> list[str]:
+    assert c.new is not None
+    return list(dict.fromkeys([*app_known_projects(c.instance), *c.new.plan.projects]))
+
+
+async def _reset_precheck(c: _AppRun) -> None:
+    """Before anything stops (I4, I5): a reset deletes only volumes of the app's own Compose projects."""
+    problem = data.foreign_volume((await _probe_volumes(c)).present, _own_projects(c))
+    if problem:
+        raise DeployError(problem)
+
+
+async def _reset_step(c: _AppRun) -> None:
+    if await _done_by_first(c, "reset"):
+        return
+    async with c.steps.step("reset"):
+        await _reset(c)
+
+
+async def _reset(c: _AppRun) -> None:
+    """Delete the app's data volumes: only names Slipway rendered, only with the app's own label (I5)."""
+    job, instance, side, remote, sink = c.job, c.instance, c.new, c.remote, c.sink
+    assert side is not None
+    host, cmds = instance.host.name, side.plan.commands
+    if "has_data" in cmds:
+        code, _ = await _app_run(c, side, "has_data", check=False)
+        if code == 4:
+            raise DeployError(f"{instance.name}'s data lives outside {host} (commands.has_data says so); Slipway can only "
+                              "reset data in volumes it can delete.")
+    names = [v["name"] for v in side.plan.volumes]
+    probe = await _probe_volumes(c)
+    own = _own_projects(c)
+    problem = data.foreign_volume(probe.present, own)
+    if problem:
+        raise DeployError(problem)
+    c.data_up = False
+    for project in own:
+        command = f"(cd / && docker compose -p {q(project)} down --remove-orphans)"
+        await sink.line(f"$ {command}")
+        await remote.run(command, on_line=sink.line, scrub=sink.scrub, timeout=side.man.timeout("stop"))
+    present = [n for n in names if n in probe.present]
+    if present:
+        shown = f"docker volume rm -- {' '.join(q(v) for v in present)}"
+        await _refuse_while_left(c, shown)
+        await sink.line(f"$ {shown}")
+        try:
+            code, output = await remote.run(_locked(c, "reset", shown), check=False, on_line=sink.line, scrub=sink.scrub,
+                                            timeout=data.VOLUME_RM_TIMEOUT)
+        except (ssh.SSHError, asyncio.CancelledError):
+            job.lock_left = "reset"
+            raise
+        if code:
+            after = await _probe_volumes(c)
+            which = next((n for n in present if n in after.present), present[0])
+            raise DeployError(f"Could not delete {which}: {_last_line(output, f'docker volume rm exited {code}')}")
+    left = [n for n in names if n in (await _probe_volumes(c)).present]
+    if left:
+        raise DeployError(f"Reset ran, but {left[0]} is still on {host}")
+    await sink.line(f"Deleted the data: {', '.join(present)}" if present else "There was no data to delete")
+    if "has_data" in cmds:
+        code, _ = await _app_run(c, side, "has_data", check=False)
+        if code != 3:
+            raise DeployError(f"Reset ran, but commands.has_data still finds data (it exited {code})")
+    await _save_options(job, started_empty=True)
+    if job.start_over:
+        # The instance starts again as new: its next deploy is an empty start, and the first admin is made again.
+        await _save_instance(instance, fresh_data=FreshData.EMPTY)
+        async with session_scope() as db:
+            await db.execute(update(FirstAdmin).where(FirstAdmin.instance_id == instance.id).values(
+                status=FirstAdminStatus.PENDING, done_at=None, existed=False, deployment_id=None))
+
+
+async def _restore_step(c: _AppRun) -> None:
+    if await _done_by_first(c, "restore"):
+        return
+    async with c.steps.step("restore"):
+        await _restore(c)
+
+
+async def _restore(c: _AppRun) -> None:
+    job, side, sink = c.job, c.new, c.sink
+    assert side is not None
+    source = job.restore_from
+    cmds = side.plan.commands
+    if not source.get("database"):
+        raise DeployError("Slipway has nothing to restore (the check step found nothing)")
+    if "restore" not in cmds:
+        raise DeployError(f"Release {side.sha7}'s slipway.yml has no restore command")
+    await _data_up_after_stop(c, side)
+    code, _ = await _app_run(c, side, "restore", check=False, **_file_args(cmds["restore"], "in", source["database"]))
+    if code:
+        async with session_scope() as db:
+            before_id = await db.scalar(select(Deployment.backup_id).where(Deployment.id == job.deployment_id))
+            before = await db.get(Backup, before_id) if before_id is not None else None
+        another = f" (the one taken just before is {before.name})" if before is not None else ""
+        raise DeployError(f"commands.restore exited {code}: the database may be empty or half-restored, and the app is "
+                          f"stopped. Retry this job, or restore another backup{another}.")
+    await sink.line(f"Restored the database from {source['source']}")
+    await _apply_override(c)
+
+
+async def _apply_override(c: _AppRun) -> None:
+    """After a restore that succeeded, and only then (I3): the identity keys the data was made with come back,
+    in ``.env``, ``app_secrets`` and ``live_identity`` together."""
+    job, instance, side, sink = c.job, c.instance, c.new, c.sink
+    assert side is not None
+    source = job.restore_from
+    override = {k: v for k, v in job.override.items() if (job.secrets or {}).get(k) != v
+                or (instance.live_identity or {}).get(k) != v}
+    if override:
+        assert c.replan is not None
+        secrets = {**(job.secrets or {}), **override}
+        plan = c.replan(secrets)
+        content = _env_content(c.template, plan)
+        await c.remote.write_text(c.paths.env_file, content)
+        c.new = replace(side, plan=plan, content=content)
+        if c.live is side:
+            c.live = c.new
+        job.secrets = secrets
+        keys = side.man.identity_keys()
+        effective = {**(instance.live_identity or {}), **data.rendered_identity(plan.env, keys)}
+        now = utcnow()
+        fields = {"app_secrets": secrets, "live_identity": effective, "identity_changed_at": now,
+                  "identity_source": _fit(Instance, "identity_source", str(source["source"]))}
+        async with session_scope() as db:
+            await db.execute(update(Instance).where(Instance.id == instance.id).values(**fields))
+            audit.record(db, "instance.identity_secrets", actor=job.user, target=instance,
+                         summary=f"{', '.join(sorted(override))} of {instance.name} now come from {source['source']}",
+                         details={"keys": sorted(override), "source": source["source"]})
+        for key, value in fields.items():
+            setattr(instance, key, value)
+        help_text = side.man.data.identity_help
+        await sink.line(f"{', '.join(sorted(override))} now come from {source['source']}."
+                        + (f" {help_text}" if help_text else ""))
+    if job.never_live and source.get("snapshot"):
+        await _save_instance(instance, fresh_data=FreshData.SNAPSHOT)
+
+
+async def _data_up_after_stop(c: _AppRun, side: _Side) -> None:
+    """Start the data services for restore, import_files and after_import (§3.1), once after the app stopped: a
+    retry that skips the restore as done still needs them for the files."""
+    if "data_up" in side.plan.commands and not c.data_up:
+        await _app_run(c, side, "data_up")
+        c.data_up = True
+
+
+async def _files_step(c: _AppRun) -> None:
+    if await _done_by_first(c, "files"):
+        return
+    await _outcome_step(c, "files", lambda: _files(c))
+
+
+async def _files(c: _AppRun) -> tuple[str, str | None]:
+    side, source = c.new, c.job.restore_from
+    assert side is not None
+    path = source.get("files")
+    if not path:
+        return "skipped", ("The snapshot has no files" if source.get("snapshot") else "This restore doesn't put the "
+                           "files back")
+    cmds = side.plan.commands
+    if "import_files" not in cmds:
+        raise DeployError(f"Release {side.sha7} can't import files (no commands.import_files)")
+    await _data_up_after_stop(c, side)
+    code, _ = await _app_run(c, side, "import_files", check=False, **_file_args(cmds["import_files"], "in", path))
+    if code:
+        raise DeployError(f"commands.import_files exited {code}: some files may be missing. Retry this job.")
+    return "succeeded", None
+
+
+async def _after_import_step(c: _AppRun) -> None:
+    if await _done_by_first(c, "after_import"):
+        return
+    await _outcome_step(c, "after_import", lambda: _after_import(c))
+
+
+async def _after_import(c: _AppRun) -> tuple[str, str | None]:
+    side = c.new
+    assert side is not None
+    if not c.job.restore_from.get("snapshot"):
+        return "skipped", "Only after a snapshot is restored"
+    if "after_import" not in side.plan.commands:
+        return "skipped", "slipway.yml has no after_import command"
+    await _data_up_after_stop(c, side)
+    code, _ = await _app_run(c, side, "after_import", check=False)
+    if code:
+        raise DeployError(f"commands.after_import exited {code}: the imported data may not be ready. Retry this job.")
+    return "succeeded", None
+
+
+_PRE_START: dict[str, Callable[[_AppRun], Awaitable[None]]] = {
+    "check": _check_step, "backup": _backup_step, "stop": _stop_step, "reset": _reset_step, "restore": _restore_step,
+    "files": _files_step, "after_import": _after_import_step,
+}
+_POST_FINISH: dict[str, Callable[[_AppRun], Awaitable[None]]] = {"first_admin": _first_admin_step, "seed": _seed_step}
+
+
+# ---------------------------------------------------------------- data-only jobs (§7.5)
+
+
+async def _data_job(job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory) -> None:
+    """Back up now, take a snapshot, create the first admin, add starter content: with the live release as it
+    runs (no build, no proxy). These jobs never change the instance's status (§7.1)."""
+    instance = job.instance
+    if instance.build_source != BuildSource.APP or data.live_state(instance) is None:
+        raise DeployError(data.not_live_text(instance))
+    if job.env is None:
+        raise DeployError(ENV_UNREADABLE)
+    async with contextlib.AsyncExitStack() as stack:
+        await sink.line(f"Connecting to {instance.host.username}@{instance.host.address}")
+        remote = await stack.enter_async_context(connect(ssh.SSHTarget.from_host(instance.host)))
+        c = _AppRun(remote=remote, instance=instance, job=job, sink=sink, steps=steps, paths=paths_for(instance))
+        job.ctx = c
+        job.data_app = True
+        try:
+            async with steps.step("release"):
+                if job.kind == DeploymentKind.SNAPSHOT:
+                    # Taken before the app stops, so a stopped app never waits for a transfer slot (data-loss 10).
+                    await stack.enter_async_context(snapshots.transfer(
+                        on_wait=lambda: sink.line("Waiting for another snapshot transfer to finish")))
+                await _take_dir(remote, instance, sink)
+                await _acquire_lock(remote, instance, job, sink)
+                c.live = c.new = await _live_plan(c)
+                job.identity = dict(instance.live_identity or {}) or None
+            if job.kind == DeploymentKind.BACKUP:
+                await _backup_step(c)
+            elif job.kind == DeploymentKind.SNAPSHOT:
+                await _snapshot_steps(c)
+            elif job.kind == DeploymentKind.ADMIN:
+                await _first_admin_step(c)
+            elif job.kind == DeploymentKind.CONTENT:
+                await _seed_step(c)
+            else:
+                raise DeployError(f"Slipway can't run {data.kind_label(job.kind)} jobs this way")
+        except asyncio.CancelledError:
+            _mark_cut_off(job)
+            raise
+        finally:
+            if steps.status("restop") == "pending" and job.lock_held:
+                # The app was stopped: what data_up started stops again, whatever happened (D17).
+                await _outcome_step(c, "restop", lambda: _control_outcome(c, "stop"), never_fail=True)
+            await _remove_job_dir(remote, instance, job)
+            await _release_lock(remote, instance, job, sink)
+
+
+async def _control_outcome(c: _AppRun, action: str) -> tuple[str, str | None]:
+    await _control(c, action)
+    return "succeeded", None
+
+
+async def _snapshot_steps(c: _AppRun) -> None:
+    """stop (when asked), export, start again, store: the app runs again before the copy to Slipway (§7.5)."""
+    job = c.job
+    try:
+        stopping = c.steps.listed("stop")
+        exported = False
+        try:
+            if stopping:
+                await _stop_step(c)
+            async with c.steps.step("export"):
+                await _export(c)
+            exported = True
+        finally:
+            if stopping:  # also when the export failed: the app never stays stopped
+                await _outcome_step(c, "restart", lambda: _control_outcome(c, "start"), never_fail=not exported)
+        await _outcome_step(c, "store", lambda: _store(c))
+    except BaseException as exc:
+        await _snapshot_failed(job, c.sink.scrub(str(exc) or type(exc).__name__))
+        raise
+
+
+async def _snapshot_failed(job: _Job, error: str) -> None:
+    if job.snapshot_id is None:
+        return
+    with contextlib.suppress(Exception):
+        async with session_scope() as db:
+            await db.execute(update(Snapshot).where(Snapshot.id == job.snapshot_id,
+                                                    Snapshot.status == SnapshotStatus.PENDING)
+                             .values(status=SnapshotStatus.FAILED, error=clean_text(error)[:500]))
+
+
+async def _export(c: _AppRun) -> None:
+    """The snapshot's dump (and files) in the job's work folder on the host, checked and hashed (§7.5 export)."""
+    job, side, remote, sink = c.job, c.new, c.remote, c.sink
+    assert side is not None
+    host, cmds = c.instance.host.name, side.plan.commands
+    if "dump" not in cmds:
+        raise DeployError(f"Release {side.sha7}'s slipway.yml has no dump command, so Slipway can't take a snapshot")
+    job_dir = data.job_dir(c.paths.base, job.deployment_id)
+    await remote.run(data.prepare_backups_command(c.paths.backups), timeout=60)
+    await remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
+    job.exported = {"dir": job_dir}
+    if "data_up" in cmds:
+        await _app_run(c, side, "data_up")
+    job.exported["revision"] = await _read_revision(c, side, job_dir)
+    parts: dict[str, tuple[str, str | None]] = {snapfile.DATABASE: ("dump", "verify_dump")}
+    if "export_files" in cmds and side.man.data.files is not None:
+        parts[snapfile.FILES] = ("export_files", None)
+    for part, (command, verify) in parts.items():
+        path = f"{job_dir}/{part}"
+        code, _ = await _app_run(c, side, command, check=False, **_file_args(cmds[command], "out", path))
+        if code:
+            raise DeployError(f"The export failed (commands.{command} exited {code}); {c.instance.name}'s data wasn't "
+                              "changed. Is the database running? Fix the cause, then retry.")
+        _, output = await remote.run(data.partial_check_command(path), check=False, timeout=data.HASH_TIMEOUT)
+        found = data.parse_file_check(output)
+        size, sha = found.sizes.get(part), found.shas.get(part)
+        if size is None:
+            raise DeployError(data.empty_output_message(command, path))
+        if sha is None:
+            raise DeployError(f"{host} has none of sha256sum, shasum or openssl; a snapshot needs one")
+        if verify and verify in cmds:
+            code, _ = await _app_run(c, side, verify, check=False, **_file_args(cmds[verify], "in", path))
+            if code:
+                raise DeployError(f"The export failed its check (commands.{verify} exited {code}); {c.instance.name}'s "
+                                  "data wasn't changed.")
+        job.exported[part] = {"path": path, "bytes": size, "sha256": sha}
+    total = sum(int(job.exported[p]["bytes"]) for p in parts)
+    await sink.line(f"Exported the data on {host} ({data.human_bytes(total)})")
+
+
+_SOURCE_BAD = re.compile(r"[^A-Za-z0-9._ -]")
+
+
+def _snapshot_source(name: str) -> str:
+    """The instance's name as a snapshot's ``source`` (letters, digits, '.', '_', ' ' and '-')."""
+    text = _SOURCE_BAD.sub("-", name).strip()[:100]
+    return text if text and text[0].isalnum() else f"i{text}"[:100]
+
+
+class _QueueReader:
+    """A ``read(n)`` file for the thread writing a snapshot, fed by the event loop from ``remote.read_stream``."""
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[bytes | None] = queue.Queue(STAGE_DEPTH)
+        self._buf = b""
+        self._eof = False
+        self._stopped = threading.Event()  # the reader gave up: put returns False
+        self._failed = threading.Event()  # the feeding side gave up: read raises
+
+    def put(self, chunk: bytes | None) -> bool:
+        while not self._stopped.is_set():
+            try:
+                self._q.put(chunk, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+    def fail(self) -> None:
+        self._failed.set()
+        self._stopped.set()
+
+    def read(self, n: int = -1, /) -> bytes:
+        while not self._buf and not self._eof:
+            if self._failed.is_set():
+                raise _Stopped
+            try:
+                item = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                self._eof = True
+            else:
+                self._buf = item
+        if n < 0:
+            out, self._buf = self._buf, b""
+        else:
+            out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+
+class _GuardedWriter:
+    def __init__(self, out: snapfile.ContainerWriter, guard: snapshots.SpaceGuard) -> None:
+        self._out, self._guard = out, guard
+
+    def write(self, chunk: bytes) -> int:
+        n = self._out.write(chunk)
+        self._guard.wrote(len(chunk))
+        return n
+
+
+async def _store(c: _AppRun) -> tuple[str, str | None]:
+    """Copy the export into an encrypted ``.sbx`` on Slipway (§7.5 store). Plaintext never touches its disk:
+    the host's files stream through the encryptor, and each member is hashed again on the way."""
+    job, instance, side, sink = c.job, c.instance, c.new, c.sink
+    assert side is not None
+    exported, man = job.exported, side.man
+    async with session_scope() as db:
+        snap = await db.get(Snapshot, job.snapshot_id) if job.snapshot_id is not None else None
+        if snap is None:
+            raise DeployError("The snapshot was deleted while it was being taken")
+        snap_id, snap_name, notes = snap.id, snap.name, snap.notes or ""
+    keys = man.identity_keys()
+    identity = {k: str(v) for k, v in (instance.live_identity or {}).items() if k in keys} or None
+    db_part = exported[snapfile.DATABASE]
+    files_part = exported.get(snapfile.FILES)
+    repository = instance.repository.full_name
+    try:
+        manifest_json = snapfile.build_manifest(
+            app=str(man.data.app), app_name=man.name[:100], source=_snapshot_source(instance.name),
+            database={"format": man.data.format, "revision": exported.get("revision"), "bytes": db_part["bytes"],
+                      "sha256": db_part["sha256"]},
+            repository=repository if snapfile.REPOSITORY_RE.match(repository or "") else None,
+            commit=side.sha if _SHA_RE.match(side.sha) else None, notes=notes,
+            files=({"format": man.data.files.format, "bytes": files_part["bytes"], "sha256": files_part["sha256"]}
+                   if files_part and man.data.files else None),
+            identity=identity, producer=f"slipway {__version__}",
+        )
+        snapfile.validate_manifest(manifest_json, max_bytes=get_settings().snapshot_max_bytes)
+    except SnapshotError as exc:
+        raise DeployError(f"The snapshot can't be made: {exc}") from None
+    plaintext = int(db_part["bytes"]) + int(files_part["bytes"] if files_part else 0) + snapfile.MANIFEST_MAX
+    try:
+        async with session_scope() as db, snapshots.reserve(db, snapshots.stored_size(plaintext)) as guard:
+            await db.commit()  # no read transaction stays open during the copy
+            size, sha, key = await _write_bundle(c, snap_id, manifest_json, identity, guard)
+            # READY is committed before the reservation goes: until then the row is pending, and the stored
+            # total doesn't count it, so an upload checking the quota in between would count it nowhere.
+            try:
+                async with session_scope() as done:
+                    snap = await done.get(Snapshot, snap_id)
+                    if snap is None:
+                        raise DeployError("The snapshot was deleted while it was being taken")
+                    snapshots.apply_manifest(snap, manifest_json)
+                    snap.data_key = snapshots.encode_key(key)
+                    snap.file_bytes, snap.file_sha256 = size, sha
+                    snap.status, snap.error = SnapshotStatus.READY, None
+                    snap.deployment_id, snap.source_instance_id = job.deployment_id, instance.id
+            except BaseException:
+                snapshots.remove_bundle(snap_id)
+                raise
+    except snapshots.SnapshotsError as exc:
+        raise DeployError(exc.message) from None
+    await sink.line(f"Kept snapshot {snap_name} on Slipway ({data.human_bytes(size)}, encrypted)")
+    if files_part and not job.options.get("stop_app"):
+        return "succeeded", "The database and the files were copied a moment apart while the app ran"
+    return "succeeded", None
+
+
+async def _write_bundle(c: _AppRun, snap_id: uuid.UUID, manifest_json: dict[str, Any], identity: dict[str, str] | None,
+                        guard: snapshots.SpaceGuard) -> tuple[int, str, bytes]:
+    """Stream the exported members from the host through the tar writer and the encryptor, in a thread, into
+    ``incoming/<snapshot id>.partial``, then move it to ``bundles/``. Returns (size, sha256, data key)."""
+    exported = c.job.exported
+    key = snapfile.new_data_key()
+    bundle = snapshots.NewBundle(stem=str(snap_id))
+    readers = {name: _QueueReader() for name in (snapfile.DATABASE, snapfile.FILES) if name in exported}
+    max_bytes = get_settings().snapshot_max_bytes
+
+    def work() -> None:
+        try:
+            writer = bundle.encrypting(key)
+            snapfile.write_tar(_GuardedWriter(writer, guard), manifest_json, identity=identity,
+                               database=readers[snapfile.DATABASE], files=readers.get(snapfile.FILES),
+                               max_bytes=max_bytes)
+            writer.close()
+            bundle.close()
+        finally:
+            for reader in readers.values():
+                reader.stop()
+
+    worker = asyncio.ensure_future(asyncio.to_thread(work))
+    try:
+        for name, reader in readers.items():
+            async for chunk in c.remote.read_stream(exported[name]["path"]):
+                if not await asyncio.to_thread(reader.put, chunk):
+                    break  # the writer stopped (it raises below)
+            await asyncio.to_thread(reader.put, None)
+        await worker
+        bundle.install(snap_id)
+    except BaseException as exc:
+        for reader in readers.values():
+            reader.fail()
+        with contextlib.suppress(BaseException):
+            await worker
+        bundle.discard()
+        if isinstance(exc, SnapshotError):
+            raise DeployError(str(exc)) from None
+        raise
+    return bundle.bytes, bundle.sha256, key
+
+
+# ------------------------------------------------------------------- Start over (§7.5 reset)
+
+
+async def _start_over(job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory) -> None:
+    """A never-live instance whose first deploys failed: back up, stop and delete what they left, with the
+    newest release still on the host. The instance's status stays as it was."""
+    instance = job.instance
+    if job.env is None:
+        raise DeployError(ENV_UNREADABLE)
+    if instance.current_commit_sha:
+        raise DeployError(f"{instance.name} has gone live; use Reset data")
+    await sink.line(f"Connecting to {instance.host.username}@{instance.host.address}")
+    async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+        c = _AppRun(remote=remote, instance=instance, job=job, sink=sink, steps=steps, paths=paths_for(instance))
+        job.ctx = c
+        try:
+            async with steps.step("release"):
+                await _take_dir(remote, instance, sink)
+                await _acquire_lock(remote, instance, job, sink)
+                c.new = await _newest_release(c)
+            await _pre_start(c)
+        except asyncio.CancelledError:
+            _mark_cut_off(job)
+            raise
+        finally:
+            await _release_lock(remote, instance, job, sink)
+
+
+async def _newest_release(c: _AppRun) -> _Side:
+    """The newest release of the instance still on the host, planned with today's inputs (§7.4)."""
+    instance, remote, job = c.instance, c.remote, c.job
+    host = instance.host.name
+    async with session_scope() as db:
+        rows = (await db.execute(
+            select(Deployment.id, Deployment.release, Deployment.commit_sha).where(
+                Deployment.instance_id == instance.id, Deployment.kind == DeploymentKind.DEPLOY,
+                Deployment.release.is_not(None))
+            .order_by(Deployment.created_at.desc()))).all()
+    _, listing = await remote.run(_image_list_command(c.paths.releases), check=False, timeout=60)
+    present = {line.strip() for line in listing.splitlines()}
+    found = next(((dep_id, posixpath.basename(release), sha) for dep_id, release, sha in rows
+                  if _RELEASE_NAME.fullmatch(posixpath.basename(release)) and posixpath.basename(release) in present
+                  and _SHA_RE.match(sha or "")), None)
+    if found is None:
+        raise DeployError(f"Slipway has no release of {instance.name} on {host} to back up its data with; deploy once "
+                          "more, or remove the volumes by hand")
+    dep_id, name, sha = found
+    release = f"{c.paths.releases}/{name}"
+    text = await _read_release_file(remote, release, instance.manifest_file)
+    if text is None:
+        raise DeployError(f"{instance.manifest_file} can't be read in {release} on {host}")
+    try:
+        man = manifest.parse(text)
+    except manifest.ManifestError as exc:
+        raise DeployError(f"Release {sha[:7]}: {exc}") from exc
+    template = None
+    if man.env_file:
+        template = await _read_release_file(remote, release, man.env_file)
+        if template is None:
+            raise DeployError(f"Release {sha[:7]}: env_file {man.env_file} can't be read in {release}")
+    host_ports: dict[str, int] = {}
+    for row in instance.published_ports or []:
+        with contextlib.suppress(TypeError, ValueError, KeyError):
+            if row.get("service"):
+                host_ports[str(row["service"])] = int(row["host"])
+    try:
+        plan = manifest.plan(man, template=template, builtins=app_builtins(instance, release, sha, dep_id),
+                             settings=instance.app_settings or {}, chosen=instance.app_services, host_ports=host_ports,
+                             secrets=dict(job.secrets or {}), env=dict(job.env or {}))
+    except manifest.ManifestError as exc:
+        raise DeployError(f"Release {sha[:7]} can't be rendered for {instance.name}: {exc}") from exc
+    except KeyError as exc:
+        raise DeployError(f"Release {sha[:7]} needs the secret {exc.args[0]}, which Slipway doesn't have") from exc
+    # Today's inputs may render other project names than the failed deploys used (an edited setting, say).
+    # Stop and reset act on every one of them, so each must be one of this instance's own (I5).
+    known = app_known_projects(instance)
+    other = [p for p in plan.projects if p not in known]
+    if other:
+        raise DeployError(
+            f"Release {sha[:7]} would now run under other Compose projects ({', '.join(other)}) than "
+            f"{instance.name}'s deploys used ({', '.join(known) or 'none'}); a setting or an environment variable "
+            "changed them. Put it back, then retry. Nothing was changed.")
+    await _check_projects_free(instance, plan.projects)
+    content = _env_content(template, plan)
+    await remote.write_text(c.paths.env_file, content)
+    await c.sink.line(f"Wrote the settings of release {sha[:7]} ({release}) to {c.paths.env_file}")
+    c.job.data_app = True
+    return _Side(man=man, plan=plan, release=release, sha=sha, content=content)
+
 
 
 def _image_list_command(releases: str) -> str:
@@ -2085,8 +4605,10 @@ def projects_on_host_command(instance: Instance, projects: list[str]) -> str:
             f'[ -z "$vols" ] || printf \'%s\\n\' "$vols" | sed {q(f"s/^/{HOST_MARK} v {p} /")}'
         )
     kept = q(f"{paths.root}/.slipway-kept")
-    name = q(paths.slug.replace(".", "\\.") + "-[0-9a-f]*\\.env")
-    parts.append(f"{{ ls -1 {kept} 2>/dev/null | grep -x -- {name} | sed {q(f's/^/{HOST_MARK} k /')}; true; }}")
+    slug = paths.slug.replace(".", "\\.")
+    names = " ".join(f"-e {q(slug + pattern)}" for pattern in
+                     ("-[0-9a-f]*\\.env", "-[0-9a-f]*\\.backups", "-[0-9a-f]*\\.backups-[0-9TZ]*"))
+    parts.append(f"{{ ls -1 {kept} 2>/dev/null | grep -x {names} | sed {q(f's/^/{HOST_MARK} k /')}; true; }}")
     return "; ".join(parts)
 
 
@@ -2137,6 +4659,10 @@ async def _pipeline(
 ) -> CommitInfo:
     instance, branch = job.instance, job.branch
     repo, host = instance.repository, instance.host
+    if job.kind in data.RESTORE_KINDS:
+        return await _live_pipeline(deployment_id, job, sink, steps, connect)
+    if job.kind != DeploymentKind.DEPLOY:
+        raise DeployError(f"Slipway can't run {data.kind_label(job.kind)} jobs this way")
     if job.env is None:
         raise DeployError(ENV_UNREADABLE)
     token, source = github_token_for(job.user)
@@ -2187,6 +4713,161 @@ async def _pipeline(
     return commit
 
 
+async def _live_pipeline(
+    deployment_id: uuid.UUID, job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory,
+) -> CommitInfo:
+    """Restore, roll back and reset: the live release again, in place, with data steps between build and start
+    (D2). GitHub is never called: the release is on the host, and its commit is the live one."""
+    instance = job.instance
+    if job.live_inputs is None or job.retry is None:
+        raise DeployError(data.not_live_text(instance))
+    if job.env is None:
+        raise DeployError(ENV_UNREADABLE)
+    async with session_scope() as db:
+        dep = await db.get(Deployment, deployment_id)
+        message = (dep.commit_message if dep is not None else None) or ""
+        author = (dep.commit_author if dep is not None else None) or ""
+    commit = CommitInfo(sha=job.retry.sha, message=message, author=author, date=None)
+    await sink.line(f"{data.kind_label(job.kind)} of {instance.name}: the live release {commit.sha[:7]} runs again")
+    await sink.line(f"Connecting to {instance.host.username}@{instance.host.address}")
+    async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+        await _install(remote, instance, deployment_id, commit.sha, None, job, sink, steps)
+    return commit
+
+
+async def _failure_fields(deployment_id: uuid.UUID, job: _Job) -> dict[str, Any]:
+    """The instance fields a failed job leaves (§7.1, §8.4).
+
+    A deploy: FAILED, and ``data_dirty`` when it began changing an app's data (its ``start`` began). A restore,
+    roll back or reset: FAILED with ``data_dirty`` once its ``stop`` began, otherwise the status it had (the old
+    app still runs). Start over keeps the status it had either way. Data-only jobs never change the instance,
+    except a snapshot that stopped the app and couldn't start it again: STOPPED, as the app is.
+    """
+    if job.instance.build_source == BuildSource.APP and job.kind in data.DATA_ONLY_KINDS:
+        return await _left_stopped_fields(deployment_id, job.instance)
+    restore_kind = job.instance.build_source == BuildSource.APP and job.kind in data.RESTORE_KINDS
+    fields: dict[str, Any] = {"status": InstanceStatus.FAILED}
+    if job.start_over and job.prev_status:
+        fields["status"] = job.prev_status
+    if job.instance.build_source != BuildSource.APP or not job.data_app:
+        return fields
+    try:
+        async with session_scope() as db:
+            dep = await db.get(Deployment, deployment_id)
+            inst = await db.get(Instance, job.instance.id)
+            if dep is None or inst is None or not data.change_began(dep):
+                if restore_kind and job.prev_status:
+                    fields["status"] = job.prev_status
+                return fields
+            step = next((r.get("key") for r in dep.steps or [] if r.get("status") in ("failed", "running")), None)
+            fields["data_dirty"] = data.mark_dirty(inst.data_dirty, dep, step=step)
+    except Exception as exc:  # recording the dirty state must never keep the job from ending
+        log.warning("Could not record the data state of deployment %s: %s", deployment_id, exc)
+    return fields
+
+
+async def _left_stopped_fields(deployment_id: uuid.UUID, instance: Instance) -> dict[str, Any]:
+    """STOPPED when a snapshot job stopped the running app and didn't start it again (data.left_stopped)."""
+    try:
+        async with session_scope() as db:
+            dep = await db.get(Deployment, deployment_id)
+            inst = await db.get(Instance, instance.id)
+            if dep is not None and inst is not None and inst.status == InstanceStatus.RUNNING and data.left_stopped(dep):
+                return {"status": InstanceStatus.STOPPED}
+    except Exception as exc:  # never keeps the job from ending
+        log.warning("Could not read the steps of deployment %s: %s", deployment_id, exc)
+    return {}
+
+
+def _settle_after_live(rows: list[dict[str, Any]], interrupted: str, not_run: str) -> list[dict[str, Any]]:
+    """The steps of a job cut off after it went live: from ``finish`` on, the one cut off becomes a warning and
+    those it never reached are skipped. The proxy note says how to update Switchyard by hand."""
+    out: list[dict[str, Any]] = []
+    after = False
+    for row in rows:
+        row = dict(row)
+        after = after or row.get("key") == "finish"
+        note: str | None = None
+        if after and row.get("status") in ("running", "failed"):
+            row["status"], note = "warning", interrupted
+        elif after and row.get("status") == "pending":
+            row["status"], note = "skipped", not_run
+        if note is not None:
+            if row.get("key") == "proxy":
+                note += ". Use Sync proxy on the instance page to update Switchyard"
+            row["note"] = note
+        out.append(row)
+    return out
+
+
+def _seed_missed(kind: str, rows: list[dict[str, Any]], options: dict[str, Any], instance: Instance,
+                 never_live: bool) -> bool:
+    """Whether a job cut off after it went live never finished a seed it would have run (content_pending)."""
+    row = next((r for r in rows if r.get("key") == "seed"), None)
+    if row is None or row.get("status") not in ("pending", "running", "failed"):
+        return False
+    if kind != DeploymentKind.DEPLOY:
+        return True
+    return bool(instance.seed_content) and (bool(options.get("started_empty"))
+                                            or (never_live and instance.fresh_data == FreshData.EMPTY))
+
+
+async def _note_went_live(deployment_id: uuid.UUID, job: _Job) -> None:
+    """Set ``job.went_live`` when ``finish`` saved app_state naming this job but was cut off before it noted so
+    in memory (a cancel landing in the save's commit): the stored state is what a restart would go by (D12)."""
+    if job.went_live is not None or job.instance.build_source != BuildSource.APP or job.start_over \
+            or job.kind in data.DATA_ONLY_KINDS:
+        return
+    try:
+        async with session_scope() as db:
+            state = await db.scalar(select(Instance.app_state).where(Instance.id == job.instance.id))
+    except Exception as exc:  # the in-memory record stands
+        log.warning("Could not read the live state of deployment %s: %s", deployment_id, exc)
+        return
+    if isinstance(state, dict) and state.get("went_live") == deployment_id.hex:
+        sha = str((state.get("live") or {}).get("sha") or "")
+        if sha:
+            job.instance.app_state = state
+            job.went_live = sha
+
+
+async def _end_after_live(deployment_id: uuid.UUID, job: _Job, commit: CommitInfo | None, sink: LogSink,
+                          steps: Steps, word: str, why: str) -> None:
+    """A job cut off (or failing) once its release went live still succeeds (D12): the release is live and
+    healthy, so the instance records it as live, its data as clean, and nothing offers to roll it back."""
+    sha = commit.sha if commit is not None else str(job.went_live)
+    why = clean_text(sink.scrub(why))[:200]
+    missed =_seed_missed(job.kind, steps.rows, job.options, job.instance, job.never_live)
+    steps._current = None
+    steps.rows = _settle_after_live(steps.rows, f"Interrupted: {why}", f"Not run: {why}")
+    await sink.line(f"{word} cut off after release {sha[:7]} went live ({why}); it still counts as succeeded")
+    await steps.close()
+    await sink.close()
+    fields = _success_fields(job, CommitInfo(sha=sha, message="", author="", date=None), steps)
+    if missed:
+        fields["content_pending"] = True
+    await _finish(deployment_id, DeploymentStatus.SUCCEEDED, short=True, **fields)
+
+
+def _success_fields(job: _Job, commit: CommitInfo | None, steps: Steps) -> dict[str, Any]:
+    instance = job.instance
+    if instance.build_source == BuildSource.APP and job.kind in data.DATA_ONLY_KINDS:
+        if job.kind == DeploymentKind.CONTENT and steps.status("seed") == "succeeded":
+            return {"content_pending": False}
+        return {}
+    if job.start_over:
+        return {"status": job.prev_status or instance.status, "data_dirty": null()}
+    assert commit is not None
+    fields: dict[str, Any] = {"status": InstanceStatus.RUNNING, "current_commit_sha": commit.sha,
+                              "last_deployed_at": utcnow()}
+    if instance.build_source == BuildSource.APP:
+        # The data is now what this release made of it: clean, and made with these identity values (D8, D9).
+        fields.update(data_dirty=null(), seed_snapshot_id=None, fresh_data=None)
+        if job.data_app and job.identity is not None:
+            fields["live_identity"] = job.identity
+    return fields
+
+
 async def run_deployment(
     deployment_id: uuid.UUID,
     *,
@@ -2202,45 +4883,69 @@ async def run_deployment(
     if job is None:
         return
 
-    sink = LogSink(deployment_id)
+    sink = LogSink(deployment_id, hide=job.hide)
     steps = Steps(deployment_id, job.steps, sink)
+    app = job.instance.build_source == BuildSource.APP
+    data_only = app and job.kind in data.DATA_ONLY_KINDS
+    word = "Deployment" if job.kind == DeploymentKind.DEPLOY else data.kind_label(job.kind)
+    commit: CommitInfo | None = None
     try:
-        commit = await _pipeline(deployment_id, job, sink, steps, connect, github)
+        if data_only:
+            await _data_job(job, sink, steps, connect)
+        elif job.start_over:
+            await _start_over(job, sink, steps, connect)
+        else:
+            commit = await _pipeline(deployment_id, job, sink, steps, connect, github)
     except asyncio.CancelledError:
-        await sink.line("Deployment interrupted: Slipway is shutting down")
+        await _note_went_live(deployment_id, job)
+        if job.went_live is not None:  # after finish: the release is live, so the job still succeeds (D12)
+            await _end_after_live(deployment_id, job, commit, sink, steps, word, "Slipway is shutting down")
+            raise
+        await sink.line(f"{word} interrupted: Slipway is shutting down")
         await steps.close()
         await sink.close()
-        await _finish(deployment_id, DeploymentStatus.CANCELLED, error="Interrupted", short=True, status=InstanceStatus.FAILED)
+        if job.kind == DeploymentKind.SNAPSHOT:
+            await _snapshot_failed(job, "Interrupted: Slipway was shutting down; take it again")
+        await _finish(deployment_id, DeploymentStatus.CANCELLED, error="Interrupted", short=True,
+                      **await _failure_fields(deployment_id, job))
         raise
     except Exception as exc:
-        log.info("Deployment %s failed: %s", deployment_id, exc)
-        await sink.line(f"Deployment failed: {exc}")
+        await _note_went_live(deployment_id, job)
+        if job.went_live is not None:
+            log.warning("Deployment %s went live, then: %s", deployment_id, sink.scrub(str(exc)))
+            await sink.line(f"Warning: {exc}")
+            await _end_after_live(deployment_id, job, commit, sink, steps, word, str(exc) or type(exc).__name__)
+            return
+        log.info("Deployment %s failed: %s", deployment_id, sink.scrub(str(exc)))
+        await sink.line(f"{word} failed: {exc}")
         await steps.close()
         await sink.close()
-        await _finish(deployment_id, DeploymentStatus.FAILED, error=str(exc), status=InstanceStatus.FAILED)
+        if job.kind == DeploymentKind.SNAPSHOT:
+            await _snapshot_failed(job, sink.scrub(str(exc)))
+        await _finish(deployment_id, DeploymentStatus.FAILED, error=str(exc), scrub=sink.scrub,
+                      **await _failure_fields(deployment_id, job))
         return
-    if has_routes(job.instance):
+    if not steps.listed("proxy") and app:
+        pass  # data-only jobs and Start over leave the proxy as it is
+    elif has_routes(job.instance):
         await steps.begin("proxy")
         try:
             await switchyard.sync_and_store(job.instance, say=sink.line)
+        except asyncio.CancelledError:  # the release is live: a shutdown here still ends the job as succeeded
+            await _end_after_live(deployment_id, job, commit, sink, steps, word, "Slipway is shutting down")
+            raise
         except Exception as exc:  # the containers are running: a proxy problem never fails the deploy
-            log.warning("Proxy sync after deployment %s failed: %s", deployment_id, exc)
+            log.warning("Proxy sync after deployment %s failed: %s", deployment_id, sink.scrub(str(exc)))
             await sink.line(f"Proxy: could not update Switchyard: {exc}")
-            await steps.end("warning", note=str(exc)[:300])
+            await steps.end("warning", note=str(exc))
         else:
             await steps.end("succeeded")
     else:
         await steps.skip("proxy", "No hostnames")
-    await sink.line("Deployment succeeded")
+    await sink.line(f"{word} succeeded")
     await steps.close()
     await sink.close()
-    await _finish(
-        deployment_id,
-        DeploymentStatus.SUCCEEDED,
-        status=InstanceStatus.RUNNING,
-        current_commit_sha=commit.sha,
-        last_deployed_at=utcnow(),
-    )
+    await _finish(deployment_id, DeploymentStatus.SUCCEEDED, **_success_fields(job, commit, steps))
 
 
 class DeployRunner:
@@ -2298,7 +5003,11 @@ class DeployRunner:
             self._deleting.discard(instance_id)
 
     async def recover_interrupted(self) -> None:
-        """Mark deployments left queued/running by a previous process as failed."""
+        """Mark deployments left queued/running by a previous process as failed, and settle what their data
+        steps left (§7.6): pending backups become ``unverified`` (the next job checks them), pending snapshots
+        fail, background checks start again, a job that had begun changing the data leaves ``data_dirty`` (a
+        running change step counts as begun), and a restore-type job that changed nothing puts the status back.
+        The host lock stays: a command may still be running there (§4.5)."""
         async with session_scope() as db:
             stale = (
                 await db.scalars(
@@ -2313,14 +5022,85 @@ class DeployRunner:
                              for r in dep.steps or []]
                 dep.error = "Interrupted by a Slipway restart"
                 dep.finished_at = utcnow()
-                if dep.instance.status == InstanceStatus.DEPLOYING:
-                    dep.instance.status = InstanceStatus.FAILED
+                _recover_instance(dep)
+            await db.execute(update(Backup).where(Backup.status == BackupStatus.PENDING)
+                             .values(status=BackupStatus.UNVERIFIED).execution_options(synchronize_session=False))
+            await db.execute(update(Snapshot).where(Snapshot.status == SnapshotStatus.PENDING)
+                             .values(status=SnapshotStatus.FAILED,
+                                     error="Slipway restarted while this snapshot was being taken; take it again")
+                             .execution_options(synchronize_session=False))
+            checking = list((await db.scalars(select(Snapshot.id).where(Snapshot.status == SnapshotStatus.CHECKING))).all())
+        for snapshot_id in checking:
+            snapshots.schedule_validation(snapshot_id)
 
     async def shutdown(self) -> None:
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+def _declared_data(dep: Deployment) -> bool:
+    """Whether an interrupted deploy's slipway.yml declared data (its backup step got past "declares no data")."""
+    row = next((r for r in dep.steps or [] if r.get("key") == "backup"), None)
+    if row is None:
+        return False
+    return not (row.get("status") in ("pending", "skipped") and row.get("note") in (None, "slipway.yml declares no data"))
+
+
+def _recover_instance(dep: Deployment) -> None:
+    """The instance fields an interrupted job leaves, as ``_failure_fields`` sets them for a failed one (§7.1)."""
+    instance = dep.instance
+    kind = dep.kind or DeploymentKind.DEPLOY
+    app = instance.build_source == BuildSource.APP
+    if app and kind in data.DATA_ONLY_KINDS:
+        # Data-only jobs never change the status, but a snapshot cut off with the app stopped leaves it stopped.
+        if instance.status == InstanceStatus.RUNNING and data.left_stopped(dep):
+            instance.status = InstanceStatus.STOPPED
+            dep.error = (f"{dep.error}. The app was stopped for the snapshot and Slipway didn't start it again; "
+                         "start it on the instance page.")
+        return
+    if app and kind in data.PIPELINE_KINDS and (instance.app_state or {}).get("went_live") == dep.id.hex:
+        _recover_live(dep)
+        return
+    if app and kind in data.PIPELINE_KINDS and (kind != DeploymentKind.DEPLOY or _declared_data(dep)) \
+            and data.change_began(dep):
+        step = next((r.get("key") for r in dep.steps or [] if r.get("status") in ("failed", "running")), None)
+        instance.data_dirty = data.mark_dirty(instance.data_dirty, dep, step=step)
+        start_over = kind == DeploymentKind.RESET and bool((dep.options or {}).get("start_over"))
+        if instance.status == InstanceStatus.DEPLOYING:
+            prev = (dep.options or {}).get("prev_status") if start_over else None
+            instance.status = prev or InstanceStatus.FAILED
+        return
+    if app and kind in data.RESTORE_KINDS:
+        if instance.status == InstanceStatus.DEPLOYING:
+            instance.status = (dep.options or {}).get("prev_status") or InstanceStatus.FAILED
+        return
+    if instance.status == InstanceStatus.DEPLOYING:
+        instance.status = InstanceStatus.FAILED
+
+
+def _recover_live(dep: Deployment) -> None:
+    """A job Slipway lost after its ``finish`` made the release live (app_state.went_live names it): it
+    succeeded (D12), as ``_end_after_live`` records it in-process. The steps after finish that it was cut off in
+    become warnings, the ones it never reached are skipped. live_identity was saved at finish."""
+    instance = dep.instance
+    kind = dep.kind or DeploymentKind.DEPLOY
+    missed = _seed_missed(kind, list(dep.steps or []), dict(dep.options or {}), instance,
+                          never_live=instance.current_commit_sha is None)
+    dep.status = DeploymentStatus.SUCCEEDED
+    dep.error = None
+    dep.steps = _settle_after_live(list(dep.steps or []), "Interrupted by a Slipway restart",
+                                   "Not run: Slipway restarted")
+    live = data.live_state(instance) or {}
+    instance.status = InstanceStatus.RUNNING
+    instance.current_commit_sha = str(live.get("sha") or dep.commit_sha or instance.current_commit_sha or "") or None
+    instance.last_deployed_at = dep.finished_at or utcnow()
+    instance.data_dirty = null()
+    instance.seed_snapshot_id = None
+    instance.fresh_data = None
+    if missed:
+        instance.content_pending = True
 
 
 runner = DeployRunner()

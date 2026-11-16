@@ -128,9 +128,9 @@
         <span class="tl-icon {{ kind }}">{{ icon({"succeeded": "check", "failed": "x"}.get(d.status, "clock")) }}</span>
         <a href="/deployments/{{ d.id }}" style="color:inherit">
           {% if can_hosts %}
-          <div class="tl-title">{{ d.instance.name }}<span>{{ {"succeeded": "Deployed to", "failed": "Failed on", "running": "Building on", "queued": "Queued for", "cancelled": "Cancelled on"}.get(d.status, "") }} {{ d.instance.host.name }}</span></div>
+          <div class="tl-title">{{ d.instance.name }}<span>{% if d.kind and d.kind != "deploy" %}{{ d.kind|kind_label }}: {{ {"succeeded": "done on", "failed": "failed on", "running": "running on", "queued": "queued for", "cancelled": "cancelled on"}.get(d.status, "") }}{% else %}{{ {"succeeded": "Deployed to", "failed": "Failed on", "running": "Building on", "queued": "Queued for", "cancelled": "Cancelled on"}.get(d.status, "") }}{% endif %} {{ d.instance.host.name }}</span></div>
           {% else %}
-          <div class="tl-title">{{ d.instance.name }}<span>{{ {"succeeded": "Deployed", "failed": "Failed", "running": "Building", "queued": "Queued", "cancelled": "Cancelled"}.get(d.status, "") }}</span></div>
+          <div class="tl-title">{{ d.instance.name }}<span>{% if d.kind and d.kind != "deploy" %}{{ d.kind|kind_label }}: {{ {"succeeded": "done", "failed": "failed", "running": "running", "queued": "queued", "cancelled": "cancelled"}.get(d.status, "") }}{% else %}{{ {"succeeded": "Deployed", "failed": "Failed", "running": "Building", "queued": "Queued", "cancelled": "Cancelled"}.get(d.status, "") }}{% endif %}</span></div>
           {% endif %}
           <div class="tl-meta">{{ d.branch }}{% if d.short_sha %} · <span class="mono">{{ d.short_sha }}</span>{% endif %}{% if d.commit_message %} · {{ d.commit_message|truncate(60) }}{% endif %}</div>
         </a>

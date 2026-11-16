@@ -37,6 +37,28 @@ in order, each seeing the ones before it. ``{{`` and ``}}`` are literal braces.
 Slipway writes the ``.env`` from ``env_file``: the lines for the keys it sets get their values, and every
 other line is kept exactly as written, so Compose reads it as before.
 
+An app with data says so too (all optional; a manifest without them deploys as before)::
+
+    secrets:
+      SS_PASSWORD_PEPPER: {kind: hex, identity: true}   # the data can't be used without it
+    data:
+      app: serversherpa                                 # what snapshots are matched on
+      format: pg-custom                                 # what dump writes and restore reads
+      volumes: [{name: "ss-{STACK_ENV}-db_pgdata", holds: database}]
+    commands:
+      data_up: [deploy/stack/ss-stack, data, "{slipway.env_dir}"]
+      dump: [deploy/stack/ss-stack, pgdump, "{slipway.env_dir}", "{slipway.out}"]
+      verify_dump: {run: [docker, run, --rm, -i, "postgres:16-alpine", pg_restore, --list], stdin: true}
+    first_admin:
+      command: [deploy/stack/ss-stack, admin, "{slipway.env_dir}", --email, "{admin.email}"]
+      fields: {email: {label: Email, kind: email}}
+      password: {stdin: true, args: [--password-stdin]}
+    timeouts: {restore: 120}                            # minutes
+
+``{slipway.out}``, ``{slipway.in}`` and ``{admin.<field>}`` are *slots*: values Slipway fills in when it
+runs the command (a file it names, or what an operator typed). Each is a whole argument, and ``plan``
+leaves it as ``{"slot": ...}`` for the deployer to fill in and quote. docs/manifest.md has the whole format.
+
 Everything here is pure: parsing, checking, rendering. The deployer does the I/O.
 """
 
@@ -54,22 +76,53 @@ import yaml
 DEFAULT_FILE = "slipway.yml"
 MAX_BYTES = 256 * 1024
 
-ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
-PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")  # what Compose accepts as a project name
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}\Z")  # what Compose accepts as a project name
 # An image a release builds, with its tag: Slipway removes it once the release is gone.
-IMAGE_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
-HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-_SAFE_PATH = re.compile(r"^[A-Za-z0-9._/@+-]+$")
+IMAGE_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+HOSTNAME_RE = re.compile(r"^(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z")
+_SAFE_PATH = re.compile(r"^[A-Za-z0-9._/@+-]+\Z")
 _PLACEHOLDER = re.compile(r"\{\{|\}\}|\{([^{}]*)\}|[{}]")
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 # Values written to .env without quotes: what a shell sourcing the file and Compose both read the same way.
-_RAW_VALUE = re.compile(r"^[A-Za-z0-9._+/=:@%^*!?,-]*$")
+_RAW_VALUE = re.compile(r"^[A-Za-z0-9._+/=:@%^*!?,-]*\Z")
 
 # {slipway.<name>} in a template.
 BUILTINS = ("slug", "name", "release", "env_dir", "sha", "sha12", "host", "deployment")
-COMMANDS = ("build", "start", "stop")
+# Only start is required. The rest after stop are about the app's data (docs/manifest.md says what each does).
+COMMANDS = ("build", "start", "stop", "has_data", "data_up", "dump", "verify_dump", "revision", "accepts", "restore",
+            "export_files", "import_files", "after_import", "seed")
 SECRET_KINDS = ("hex", "fernet", "token")
+
+# The commands that move a file, the slot that names it and the stream flag that can replace the slot:
+# {slipway.out} is the file a command writes, {slipway.in} the one it reads.
+FILE_COMMANDS: dict[str, tuple[str, str]] = {
+    "dump": ("out", "stdout"), "export_files": ("out", "stdout"),
+    "verify_dump": ("in", "stdin"), "accepts": ("in", "stdin"), "restore": ("in", "stdin"), "import_files": ("in", "stdin"),
+}
+# How long each command may run, in minutes, unless slipway.yml's timeouts say otherwise.
+DEFAULT_TIMEOUTS = {
+    "build": 60, "start": 60, "stop": 15, "has_data": 2, "data_up": 15, "dump": 120, "verify_dump": 30, "revision": 2,
+    "accepts": 2, "restore": 240, "export_files": 240, "import_files": 240, "after_import": 30, "seed": 30,
+    "first_admin": 10,
+}
+MAX_TIMEOUT = 1440  # minutes: a day
+# What the pages and endpoints offer an app, in this order (Manifest.capabilities).
+CAPABILITIES = ("backup", "verify", "restore", "revision_check", "files", "reset", "snapshot", "seed", "first_admin",
+                "starter_content")
+HOLDS = ("database", "files", "other")
+MAX_IDENTITY = 16
+
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+DATA_FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,39}\Z")
+VOLUME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}\Z")  # a Docker volume name
+FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}\Z")
+PASSWORD_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
+# Variables the shell or the dynamic loader reads for itself: a password put in one would be acted on.
+_SHELL_VARS = frozenset({"PATH", "HOME", "SHELL", "IFS", "ENV", "BASH_ENV", "CDPATH", "PS4", "USER", "LOGNAME"})
+_PROGRAM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+_WHOLE = re.compile(r"^\{([^{}]*)\}\Z")
 
 
 class ManifestError(ValueError):
@@ -94,6 +147,7 @@ class Secret:
     key: str
     kind: str = "hex"
     bytes: int = 32
+    identity: bool = False  # the app's data can't be used without it: it travels with backups and snapshots
 
     def generate(self) -> str:
         raw = _secrets.token_bytes(self.bytes)
@@ -116,6 +170,88 @@ class Service:
 
 
 @dataclass(frozen=True)
+class Volume:
+    name: str  # template
+    holds: str  # database, files or other
+
+
+@dataclass(frozen=True)
+class DataFiles:
+    format: str
+    label: str = "Files"
+
+
+@dataclass(frozen=True)
+class DataSpec:
+    """What slipway.yml says about the app's data (``data:``). Every field is optional."""
+
+    app: str | None = None
+    format: str | None = None
+    volumes: tuple[Volume, ...] = ()
+    files: DataFiles | None = None
+    identity_label: str = "identity keys"
+    identity_help: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "app": self.app, "format": self.format,
+            "volumes": [{"name": v.name, "holds": v.holds} for v in self.volumes],
+            "files": {"format": self.files.format, "label": self.files.label} if self.files else None,
+            "identity_label": self.identity_label, "identity_help": self.identity_help,
+        }
+
+
+@dataclass(frozen=True)
+class AdminField:
+    name: str
+    label: str
+    kind: str = "text"  # text or email
+    help: str = ""
+    max: int = 200
+
+
+@dataclass(frozen=True)
+class AdminPassword:
+    """How the first admin's password reaches the command: on its stdin, or (``env``) in that variable."""
+
+    min_length: int = 8
+    env: str | None = None
+    args: tuple[str, ...] = ()  # templates, appended in password mode
+
+    @property
+    def mode(self) -> str:
+        return "env" if self.env else "stdin"
+
+
+@dataclass(frozen=True)
+class AdminInvite:
+    label: str
+    args: tuple[str, ...] = ()  # templates, appended in invite mode
+
+
+@dataclass(frozen=True)
+class FirstAdmin:
+    command: tuple[str, ...]  # templates and {admin.<field>} slots
+    fields: tuple[AdminField, ...]
+    help: str = ""
+    password: AdminPassword | None = None
+    invite: AdminInvite | None = None
+    done_codes: tuple[int, ...] = (0,)
+    exists_codes: tuple[int, ...] = ()
+    messages: dict[int, str] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "help": self.help,
+            "fields": [f.__dict__ for f in self.fields],
+            "password": {"min_length": self.password.min_length, "mode": self.password.mode} if self.password else None,
+            "invite": {"label": self.invite.label} if self.invite else None,
+            "done_codes": list(self.done_codes), "exists_codes": list(self.exists_codes),
+            "messages": {str(code): text for code, text in self.messages.items()},
+        }
+
+
+@dataclass(frozen=True)
 class Manifest:
     name: str
     env_file: str | None = None
@@ -128,7 +264,11 @@ class Manifest:
     optional_none: str = ""
     projects: tuple[str, ...] = ()
     images: tuple[str, ...] = ()
-    commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    commands: dict[str, tuple[str, ...]] = field(default_factory=dict)  # argv templates (slots kept as written)
+    streams: dict[str, str] = field(default_factory=dict)  # command: "stdout" or "stdin", for those in stream mode
+    data: DataSpec = field(default_factory=DataSpec)
+    first_admin: FirstAdmin | None = None
+    timeouts: dict[str, int] = field(default_factory=dict)  # minutes, as slipway.yml sets them
 
     # -- what the instance chooses
 
@@ -160,19 +300,53 @@ class Manifest:
     def secret_keys(self) -> set[str]:
         return {s.key for s in self.secrets}
 
+    def identity_keys(self) -> list[str]:
+        """The secrets the app's data is made with, in slipway.yml's order."""
+        return [s.key for s in self.secrets if s.identity]
+
+    # -- what the app can do with its data
+
+    def capabilities(self) -> tuple[str, ...]:
+        """The data features slipway.yml makes possible, in ``CAPABILITIES`` order."""
+        has = set(self.commands)
+        on = {
+            "backup": "dump" in has,
+            "verify": "verify_dump" in has,
+            "restore": {"dump", "restore"} <= has,  # parse also made sure of stop and data_up
+            "revision_check": {"revision", "accepts"} <= has,
+            "files": "export_files" in has,
+            "reset": "restore" in has and bool(self.data.volumes),
+            "snapshot": "dump" in has,
+            "seed": "restore" in has,
+            "first_admin": self.first_admin is not None,
+            "starter_content": "seed" in has,
+        }
+        return tuple(c for c in CAPABILITIES if on[c])
+
+    def timeout(self, command: str) -> int:
+        """How long ``command`` (or ``first_admin``) may run, in seconds."""
+        return self.timeouts.get(command, DEFAULT_TIMEOUTS[command]) * 60
+
     def to_json(self) -> dict[str, Any]:
         """What the API and the instance page show (and what is stored with the instance)."""
+        timed = [*self.commands, *(["first_admin"] if self.first_admin else [])]
         return {
             "name": self.name,
             "env_file": self.env_file,
+            "placeholder": self.placeholder,  # a restored identity value may not be it (§9.3)
             "settings": [s.__dict__ for s in self.settings],
             "vars": dict(self.vars),
-            "secrets": [{"key": s.key, "kind": s.kind} for s in self.secrets],
+            "secrets": [{"key": s.key, "kind": s.kind, "identity": s.identity} for s in self.secrets],
             "services": [s.__dict__ for s in self.services],
             "optional_var": self.optional_var,
             "projects": list(self.projects),
             "images": list(self.images),
             "commands": {k: list(v) for k, v in self.commands.items()},
+            "streams": dict(self.streams),
+            "data": self.data.to_json(),
+            "first_admin": self.first_admin.to_json() if self.first_admin else None,
+            "timeouts": {k: self.timeout(k) // 60 for k in timed},  # minutes, the defaults filled in
+            "capabilities": list(self.capabilities()),
         }
 
 
@@ -255,7 +429,7 @@ def parse(text: str) -> Manifest:
         raise ManifestError(f"slipway.yml is not valid YAML: {exc}") from None
     data = _mapping(data, "the file")
     _only(data, ("version", "name", "env_file", "placeholder", "settings", "vars", "secrets", "services",
-                 "optional_services", "projects", "images", "commands"), "the file")
+                 "optional_services", "projects", "images", "commands", "data", "first_admin", "timeouts"), "the file")
     if data.get("version") != 1:
         raise _err("version", "must be 1")
     name = _str(data.get("name"), "name", max_len=100)
@@ -300,7 +474,7 @@ def parse(text: str) -> Manifest:
         if isinstance(spec, str):
             spec = {"kind": spec}
         spec = _mapping(spec, where)
-        _only(spec, ("kind", "bytes"), where)
+        _only(spec, ("kind", "bytes", "identity"), where)
         kind = spec.get("kind", "hex")
         if kind not in SECRET_KINDS:
             raise _err(f"{where}.kind", f"must be one of {', '.join(SECRET_KINDS)}")
@@ -309,7 +483,10 @@ def parse(text: str) -> Manifest:
             raise _err(f"{where}.bytes", "must be a whole number from 16 to 128")
         if kind == "fernet" and size != 32:
             raise _err(f"{where}.bytes", "a Fernet key is always 32 bytes")
-        secret_list.append(Secret(key=key, kind=kind, bytes=size))
+        identity = _bool(spec.get("identity", False), f"{where}.identity")
+        secret_list.append(Secret(key=key, kind=kind, bytes=size, identity=identity))
+    if sum(s.identity for s in secret_list) > MAX_IDENTITY:
+        raise _err("secrets", f"at most {MAX_IDENTITY} can be identity secrets")
 
     services = []
     ports_used: dict[tuple[int, str], str] = {}
@@ -356,24 +533,28 @@ def parse(text: str) -> Manifest:
     projects = tuple(_template_list(data.get("projects"), "projects", 20))
     images = tuple(_template_list(data.get("images"), "images", 30))
 
-    commands = {}
-    for key, argv in _mapping(data.get("commands"), "commands").items():
+    commands: dict[str, tuple[str, ...]] = {}
+    streams: dict[str, str] = {}
+    for key, spec in _mapping(data.get("commands"), "commands").items():
         where = f"commands.{key}"
         if key not in COMMANDS:
             raise _err(where, f"unknown command (allowed: {', '.join(COMMANDS)})")
-        if not isinstance(argv, list) or not argv or len(argv) > 50:
-            raise _err(where, "must be a list: the program, then its arguments")
-        args = [_str(a, f"{where}[{i}]", max_len=1000, allow_empty=i > 0) for i, a in enumerate(argv)]
-        for i, a in enumerate(args):
-            check_template(a, f"{where}[{i}]")
-        commands[key] = tuple(args)
+        commands[key], stream = _command(key, spec, where)
+        if stream:
+            streams[key] = stream
     if "start" not in commands:
         raise _err("commands", "start is required: the command that starts or updates the app")
+
+    data_spec = _data(data.get("data"))
+    first_admin = _first_admin(data["first_admin"], taken) if data.get("first_admin") is not None else None
+    _check_data_rules(commands, data_spec)
+    timeouts = _timeouts(data.get("timeouts"), commands, first_admin)
 
     return Manifest(
         name=name, env_file=env_file, placeholder=placeholder, settings=tuple(settings), vars=variables,
         secrets=tuple(secret_list), services=tuple(services), optional_var=optional_var, optional_none=optional_none,
-        projects=projects, images=images, commands=commands,
+        projects=projects, images=images, commands=commands, streams=streams, data=data_spec, first_admin=first_admin,
+        timeouts=timeouts,
     )
 
 
@@ -387,6 +568,306 @@ def _template_list(value: Any, where: str, limit: int) -> list[str]:
         text = _str(item, f"{where}[{i}]", max_len=200)
         check_template(text, f"{where}[{i}]")
         out.append(text)
+    return out
+
+
+# --------------------------------------------------------------- commands and slots
+
+
+def _slot(name: str) -> str | None:
+    """The slot a placeholder names (``out``, ``in`` or ``admin.<field>``), or None for a template value."""
+    if name in ("slipway.out", "slipway.in"):
+        return name.removeprefix("slipway.")
+    if name.startswith("admin."):
+        return name
+    return None
+
+
+def _slot_places(slot: str) -> str:
+    if slot.startswith("admin."):
+        return "first_admin.command"
+    places = [f"commands.{k}" for k, (s, _) in FILE_COMMANDS.items() if s == slot]
+    return ", ".join(places[:-1]) + " and " + places[-1]
+
+
+def whole_slot(arg: str) -> str | None:
+    """The slot ``arg`` is, when it is exactly one slot token (the only way parse lets a slot be written)."""
+    m = _WHOLE.match(arg)
+    return _slot(m.group(1)) if m else None
+
+
+def _argv(value: Any, where: str, *, allowed: Any = lambda slot: False, hint: str = "",
+          limit: int = 50) -> tuple[tuple[str, ...], list[str]]:
+    """An argv (the program, then its arguments) and the slots it uses. ``allowed(slot)`` says which slots
+    it may hold; each must be a whole argument, and never the program. ``hint`` ends the whole-argument message."""
+    if not isinstance(value, list) or not value or len(value) > limit:
+        raise _err(where, "must be a list: the program, then its arguments"
+                   + (f" (at most {limit})" if isinstance(value, list) and value else ""))
+    args = tuple(_str(a, f"{where}[{i}]", max_len=1000, allow_empty=i > 0) for i, a in enumerate(value))
+    used: list[str] = []
+    for i, a in enumerate(args):
+        names = [n for n in placeholders(a) if _slot(n) is not None]
+        if not names:
+            check_template(a, f"{where}[{i}]")
+            continue
+        if i == 0:
+            raise _err(f"{where}[0]", "the program can't be a value filled at run time")
+        for n in names:
+            if not allowed(_slot(n)):
+                raise _err(f"{where}[{i}]", f"{{{n}}} can only be used in {_slot_places(_slot(n))}")
+        token = "{" + names[0] + "}"
+        if a != token:
+            before, _, after = a.partition(token)
+            how = (f"write {before.rstrip('=')} and {token} as two arguments" if before.rstrip("=") and not after
+                   else "give it an argument of its own")
+            raise _err(f"{where}[{i}]", f"{token} must be a whole argument; {how}{hint}")
+        used.append(_slot(names[0]) or "")
+    return args, used
+
+
+def _command(key: str, spec: Any, where: str) -> tuple[tuple[str, ...], str | None]:
+    """One of commands: a list, or for a command that moves a file, ``{run: [...], stdout|stdin: true}``.
+    Returns the argv and its stream (None when the file is a slot, or the command moves none)."""
+    if key not in FILE_COMMANDS:
+        return _argv(spec, where)[0], None
+    slot, flag = FILE_COMMANDS[key]
+    token = f"{{slipway.{slot}}}"
+    if isinstance(spec, dict):
+        other = "stdin" if flag == "stdout" else "stdout"
+        if other in spec:
+            does = "writes" if flag == "stdout" else "reads"
+            raise _err(where, f"{other}: true doesn't fit {key}, which {does} a file: write {{run: [...], {flag}: true}}")
+        _only(spec, ("run", flag), where)
+        if "run" not in spec:
+            raise _err(where, "give the program and its arguments in run")
+        if flag not in spec:
+            raise _err(where, f"give {flag}: true with run, or write the command as a list with {token}")
+        if spec[flag] is not True:
+            raise _err(f"{where}.{flag}", f"must be true (or write the command as a list with {token})")
+        run = spec["run"]
+        if isinstance(run, list) and any(isinstance(a, str) and token in a for a in run):
+            raise _err(where, f"give either {token} or {flag}: true, not both")
+        return _argv(run, f"{where}.run")[0], flag
+    args, used = _argv(spec, where, allowed=lambda s: s == slot, hint=f", or use {flag}: true")
+    if len(used) != 1:
+        does = "write" if slot == "out" else "read"
+        raise _err(where, f"needs {token} exactly once (the file Slipway gives it to {does}), "
+                          f"or write it as {{run: [...], {flag}: true}}")
+    return args, None
+
+
+def _text(spec: dict[str, Any], key: str, where: str, default: str, max_len: int) -> str:
+    return _str(spec.get(key, default), f"{where}.{key}", max_len=max_len, allow_empty=not default)
+
+
+def _label(value: Any, pattern: re.Pattern[str], where: str, what: str) -> str:
+    text = _str(value, where, max_len=100)
+    if not pattern.match(text):
+        raise _err(where, what)
+    return text
+
+
+def _data(value: Any) -> DataSpec:
+    spec = _mapping(value, "data")
+    _only(spec, ("app", "format", "volumes", "files", "identity_label", "identity_help"), "data")
+    fmt_rule = "a format label is lowercase letters, digits, '.', '_', '+' and '-', at most 40, such as pg-custom"
+    app = _label(spec["app"], APP_ID_RE, "data.app",
+                 "an app id is lowercase letters, digits, '.', '_' and '-', at most 64, such as serversherpa") \
+        if spec.get("app") is not None else None
+    fmt = _label(spec["format"], DATA_FORMAT_RE, "data.format", fmt_rule) if spec.get("format") is not None else None
+    raw = spec.get("volumes")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list) or len(raw) > 20:
+        raise _err("data.volumes", "must be a list of at most 20")
+    volumes: list[Volume] = []
+    for i, entry in enumerate(raw):
+        where = f"data.volumes[{i}]"
+        entry = _mapping(entry, where)
+        _only(entry, ("name", "holds"), where)
+        if "name" not in entry or "holds" not in entry:
+            raise _err(where, "give name (the volume) and holds (database, files or other)")
+        name = _str(entry["name"], f"{where}.name", max_len=255)
+        check_template(name, f"{where}.name")
+        if entry["holds"] not in HOLDS:
+            raise _err(f"{where}.holds", f"must be one of {', '.join(HOLDS)}")
+        if any(v.name == name for v in volumes):
+            raise _err(f"{where}.name", f"{name} is listed twice")
+        volumes.append(Volume(name=name, holds=entry["holds"]))
+    files = None
+    if spec.get("files") is not None:
+        fspec = _mapping(spec["files"], "data.files")
+        _only(fspec, ("format", "label"), "data.files")
+        if fspec.get("format") is None:
+            raise _err("data.files", "give format: a label for what export_files writes and import_files reads")
+        files = DataFiles(format=_label(fspec["format"], DATA_FORMAT_RE, "data.files.format", fmt_rule),
+                          label=_text(fspec, "label", "data.files", "Files", 40))
+    return DataSpec(app=app, format=fmt, volumes=tuple(volumes), files=files,
+                    identity_label=_text(spec, "identity_label", "data", "identity keys", 60),
+                    identity_help=_text(spec, "identity_help", "data", "", 300))
+
+
+def _check_data_rules(commands: dict[str, tuple[str, ...]], data: DataSpec) -> None:
+    """What the data commands need of each other and of ``data``."""
+    def need(message: str) -> ManifestError:
+        return ManifestError(f"slipway.yml: {message}")
+
+    has = set(commands)
+    if "dump" in has:
+        if data.app is None:
+            raise need("commands.dump needs data.app: the app's id (such as serversherpa), which snapshots are matched on")
+        if data.format is None:
+            raise need("commands.dump needs data.format: a label (such as pg-custom) for what dump writes and restore reads")
+        if "has_data" not in has and not any(v.holds in ("database", "files") for v in data.volumes):
+            raise need("commands.dump needs commands.has_data, or a data.volumes entry that holds: database or files, "
+                       "so Slipway can tell an instance with data from a new one")
+    if "restore" in has:
+        for other, why in (("dump", "Slipway restores only what it backed up"),
+                           ("data_up", "Slipway stops the app and starts only the data services before a restore"),
+                           ("stop", "Slipway stops the app before replacing its data")):
+            if other not in has:
+                raise need(f"commands.restore needs commands.{other}: {why}")
+    for key, other, why in (
+        ("verify_dump", "dump", "it checks the file dump writes"),
+        ("revision", "dump", "Slipway records the revision with each backup"),
+        ("has_data", "dump", "it tells Slipway whether there is data to back up"),
+        ("accepts", "revision", "it is given the revision that revision prints"),
+        ("after_import", "restore", "it runs after another instance's data is restored"),
+        ("seed", "dump", "Slipway must be able to tell an empty start"),
+        ("export_files", "dump", "Slipway backs up the files together with the database"),
+    ):
+        if key in has and other not in has:
+            raise need(f"commands.{key} needs commands.{other}: {why}")
+    if ("export_files" in has) != ("import_files" in has) or ("export_files" in has) != (data.files is not None):
+        raise need("commands.export_files and commands.import_files come together, with data.files: "
+                   "a snapshot taken here must be restorable here")
+
+
+def _codes(value: Any, where: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return default
+    if not isinstance(value, list) or len(value) > 20:
+        raise _err(where, "must be a list of exit codes")
+    out: list[int] = []
+    for i, code in enumerate(value):
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
+            raise _err(f"{where}[{i}]", "must be an exit code, 0-255")
+        if code in out:
+            raise _err(where, f"lists {code} twice")
+        out.append(code)
+    return tuple(out)
+
+
+def _admin_args(spec: dict[str, Any], where: str) -> tuple[str, ...]:
+    if spec.get("args") is None:
+        return ()
+    return _argv(spec["args"], f"{where}.args", limit=10)[0]
+
+
+def _first_admin(value: Any, taken: dict[str, str]) -> FirstAdmin:
+    where = "first_admin"
+    spec = _mapping(value, where)
+    _only(spec, ("help", "command", "fields", "password", "invite", "done_codes", "exists_codes", "messages"), where)
+
+    raw_fields = _mapping(spec.get("fields"), f"{where}.fields")
+    if not 1 <= len(raw_fields) <= 8:
+        raise _err(f"{where}.fields", "give 1 to 8 fields: what Slipway asks for the first admin")
+    fields = []
+    for name, fspec in raw_fields.items():
+        fwhere = f"{where}.fields.{name}"
+        if not isinstance(name, str) or not FIELD_RE.match(name):
+            raise _err(fwhere, "a field name is a lowercase letter, then lowercase letters, digits and '_', at most 31")
+        fspec = _mapping(fspec, fwhere)
+        _only(fspec, ("label", "kind", "help", "max"), fwhere)
+        kind = fspec.get("kind", "text")
+        if kind not in ("text", "email"):
+            raise _err(f"{fwhere}.kind", "must be text or email")
+        size = fspec.get("max", 254 if kind == "email" else 200)
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 254:
+            raise _err(f"{fwhere}.max", "must be a whole number from 1 to 254")
+        fields.append(AdminField(name=name, label=_text(fspec, "label", fwhere, name.replace("_", " ").capitalize(), 60),
+                                 kind=kind, help=_text(fspec, "help", fwhere, "", 200), max=size))
+    declared = {f.name for f in fields}
+
+    if spec.get("command") is None:
+        raise _err(where, "give command: the program that creates the first admin, then its arguments")
+    command, used = _argv(spec["command"], f"{where}.command", allowed=lambda s: s.startswith("admin."))
+    for i, arg in enumerate(command):
+        slot = whole_slot(arg)
+        if slot and slot.removeprefix("admin.") not in declared:
+            raise _err(f"{where}.command[{i}]", f"{{{slot}}} is not one of the fields ({', '.join(sorted(declared))})")
+    for f in fields:
+        if f"admin.{f.name}" not in used:
+            raise _err(f"{where}.fields.{f.name}", f"isn't used: put {{admin.{f.name}}} in first_admin.command")
+
+    password = None
+    if spec.get("password") is not None:
+        pwhere = f"{where}.password"
+        pspec = _mapping(spec["password"], pwhere)
+        _only(pspec, ("min_length", "stdin", "env", "args"), pwhere)
+        stdin = _bool(pspec.get("stdin", False), f"{pwhere}.stdin")
+        env = pspec.get("env")
+        if stdin and env is not None:
+            raise _err(pwhere, "give either stdin: true or env: VAR, not both")
+        if not stdin and env is None:
+            raise _err(pwhere, "give stdin: true (the password as one line on the command's stdin) "
+                               "or env: VAR (Slipway puts it in $VAR)")
+        if env is not None:
+            env = _str(env, f"{pwhere}.env", max_len=64)
+            if not PASSWORD_VAR_RE.match(env):
+                raise _err(f"{pwhere}.env", f"{env} must be uppercase letters, digits and '_', starting with a letter")
+            if env in _SHELL_VARS or env.startswith(("LD_", "DYLD_")):
+                raise _err(f"{pwhere}.env", f"{env} can't carry the password (the shell or loader reads it)")
+            if env in taken:
+                raise _err(f"{pwhere}.env", f"{env} is already set by {taken[env]}; give the password a variable of its own")
+        size = pspec.get("min_length", 8)
+        if isinstance(size, bool) or not isinstance(size, int) or not 8 <= size <= 128:
+            raise _err(f"{pwhere}.min_length", "must be a whole number from 8 to 128")
+        password = AdminPassword(min_length=size, env=env, args=_admin_args(pspec, pwhere))
+
+    invite = None
+    if spec.get("invite") is not None:
+        iwhere = f"{where}.invite"
+        ispec = _mapping(spec["invite"], iwhere)
+        _only(ispec, ("label", "args"), iwhere)
+        invite = AdminInvite(label=_text(ispec, "label", iwhere, "Email them a link to set their password", 60),
+                             args=_admin_args(ispec, iwhere))
+    if password is None and invite is None:
+        raise _err(where, "give password, invite or both: how the first admin signs in for the first time")
+
+    done = _codes(spec.get("done_codes"), f"{where}.done_codes", (0,))
+    if not done:
+        raise _err(f"{where}.done_codes", "must list at least one exit code")
+    exists = _codes(spec.get("exists_codes"), f"{where}.exists_codes", ())
+    both = sorted(set(done) & set(exists))
+    if both:
+        raise _err(where, f"exit code {both[0]} is in both done_codes and exists_codes")
+    if len(done) + len(exists) > 20:
+        raise _err(where, "done_codes and exists_codes hold at most 20 codes in all")
+    messages: dict[int, str] = {}
+    for code, text in _mapping(spec.get("messages"), f"{where}.messages").items():
+        mwhere = f"{where}.messages.{code}"
+        if isinstance(code, bool) or not isinstance(code, int) or not 1 <= code <= 255:
+            raise _err(f"{where}.messages", f"{code!r} is not an exit code from 1 to 255")
+        if code in done or code in exists:
+            what = "a done code" if code in done else "an exists code"
+            raise _err(mwhere, f"{code} is {what}; messages are for the codes that fail")
+        messages[code] = _str(text, mwhere, max_len=300)
+    return FirstAdmin(command=command, fields=tuple(fields), help=_text(spec, "help", where, "", 300), password=password,
+                      invite=invite, done_codes=done, exists_codes=exists, messages=messages)
+
+
+def _timeouts(value: Any, commands: dict[str, tuple[str, ...]], first_admin: FirstAdmin | None) -> dict[str, int]:
+    out = {}
+    for key, minutes in _mapping(value, "timeouts").items():
+        where = f"timeouts.{key}"
+        if key not in DEFAULT_TIMEOUTS:
+            raise _err(where, f"is not a command (allowed: {', '.join(DEFAULT_TIMEOUTS)})")
+        if key not in commands and not (key == "first_admin" and first_admin):
+            raise _err(where, f"slipway.yml declares no {key if key == 'first_admin' else 'commands.' + key}")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= MAX_TIMEOUT:
+            raise _err(where, f"must be a whole number of minutes from 1 to {MAX_TIMEOUT} (a day)")
+        out[key] = minutes
     return out
 
 
@@ -405,6 +886,9 @@ def check_template(template: str, where: str) -> None:
             continue
         if name is None:
             raise _err(where, "a lone '{' or '}' (write '{{' or '}}' for a brace)")
+        slot = _slot(name)
+        if slot is not None:  # a value filled at run time: only where _argv allows it, never in a template
+            raise _err(where, f"{{{name}}} can only be used in {_slot_places(slot)}")
         if name.startswith("slipway."):
             if name.removeprefix("slipway.") not in BUILTINS:
                 raise _err(where, f"{{{name}}} is not one of {', '.join('slipway.' + b for b in BUILTINS)}")
@@ -548,7 +1032,12 @@ class AppPlan:
     routes: list[dict[str, Any]]  # [{hostname, service, container}]
     projects: list[str]
     images: list[str]
-    commands: dict[str, list[str]]
+    # {name: {"argv": [...], "stream": "stdout" | "stdin" | None}}. An argument that is a slot is {"slot": "out" |
+    # "in" | "admin.<field>"}, filled in (and quoted) when the command runs; every other one is rendered text.
+    commands: dict[str, dict[str, Any]]
+    volumes: list[dict[str, str]] = field(default_factory=list)  # [{name, holds}], rendered
+    # {"argv": [...], "stream": None, "password_args": [...], "invite_args": [...]}, or None
+    first_admin: dict[str, Any] | None = None
 
 
 def check_instance_env(manifest: Manifest, env: dict[str, str]) -> None:
@@ -659,20 +1148,54 @@ def plan(
         if not IMAGE_RE.match(ref):
             raise ManifestError(f"images[{i}]: '{ref}' is not an image name with a tag, such as example-api:1a2b3c4d5e6f")
         images.append(ref)
-    commands = {
-        key: [render(a, builtins, usable, f"commands.{key}[{i}]", hidden=hidden, blocked=blocked) for i, a in enumerate(argv)]
-        for key, argv in manifest.commands.items()
-    }
-    for key, argv in commands.items():
-        program = argv[0]
+    def argv(templates: tuple[str, ...], where: str) -> list[Any]:
+        """Render a command; a slot stays an object for the deployer to fill in when it runs the command."""
+        out: list[Any] = []
+        for i, a in enumerate(templates):
+            slot = whole_slot(a)
+            out.append({"slot": slot} if slot else render(a, builtins, usable, f"{where}[{i}]", hidden=hidden, blocked=blocked))
+        return out
+
+    def program_ok(program: str, where: str) -> None:  # argv[0] is never a slot (parse refuses one)
         if "/" in program:
-            clean_repo_path(program, f"commands.{key}[0]")
-        elif not re.match(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", program):
-            raise ManifestError(f"commands.{key}[0]: '{program}' is not a program name or a path in the repository")
+            clean_repo_path(program, where)
+        elif not _PROGRAM.match(program):
+            raise ManifestError(f"{where}: '{program}' is not a program name or a path in the repository")
+
+    commands = {key: {"argv": argv(t, f"commands.{key}"), "stream": manifest.streams.get(key)}
+                for key, t in manifest.commands.items()}
+    for key, cmd in commands.items():
+        program_ok(cmd["argv"][0], f"commands.{key}[0]")
+    first_admin = None
+    if manifest.first_admin:
+        fa = manifest.first_admin
+        first_admin = {
+            "argv": argv(fa.command, "first_admin.command"), "stream": None,
+            "password_args": argv(fa.password.args, "first_admin.password.args") if fa.password else [],
+            "invite_args": argv(fa.invite.args, "first_admin.invite.args") if fa.invite else [],
+        }
+        program_ok(first_admin["argv"][0], "first_admin.command[0]")
+    volumes: list[dict[str, str]] = []
+    for i, vol in enumerate(manifest.data.volumes):
+        where = f"data.volumes[{i}].name"
+        name = render(vol.name, builtins, usable, where, hidden=hidden, blocked=blocked)
+        if not VOLUME_RE.match(name):
+            raise ManifestError(f"{where}: '{name}' is not a Docker volume name")
+        if any(v["name"] == name for v in volumes):
+            raise ManifestError(f"{where}: '{name}' is listed twice")
+        volumes.append({"name": name, "holds": vol.holds})
     for key in written:
         format_value(values[key], key)  # refuse a value the .env can't hold before anything runs
     return AppPlan(env=values, written=written, public_env=public, services=on, routes=routes, projects=projects, images=images,
-                   commands=commands)
+                   commands=commands, volumes=volumes, first_admin=first_admin)
+
+
+def command_argv(command: Any) -> list[Any] | None:
+    """A stored command's argv, in either form ``app_state["commands"]`` has held: a list (before data
+    commands) or ``{"argv": [...], "stream": ...}``. None when there is none."""
+    if isinstance(command, dict):
+        command = command.get("argv")
+    return list(command) if isinstance(command, list) and command else None
 
 
 def new_secrets(manifest: Manifest, existing: dict[str, str]) -> dict[str, str]:

@@ -3,6 +3,7 @@ grantable role choices and the admin GitHub unlink."""
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import uuid
@@ -462,3 +463,330 @@ async def test_users_page_offers_to_unlink_github(admin_client):
     assert '<span class="subtle">none</span>' in row.split("<td")[2]  # the Sign-in column
     assert (f"{active} They have no password or GitHub link, so they cannot sign in until you set one with Reset password."
             in _dialog(page, f"edit-{gh_only.id}"))
+
+
+# --------------------------------------------------------------- data safety in slipway.js (spec §15.6)
+
+BACKUPS_JSON = {
+    "backups": [
+        {"id": "b1", "name": "20261115T101500Z-1a2b3c4d", "reason": "pre_deploy", "status": "ready",
+         "taken_at": "2026-11-15T10:15:00+00:00", "db_bytes": 412 * 1024 * 1024, "has_files": True,
+         "files_bytes": 3 * 1024 ** 3, "format": "pg-custom", "revision_short": "0042_orders", "commit_sha": "abcdef1234567",
+         "release": "r", "deployment_id": "d1", "dirty_of": None, "created_by": None, "note": None,
+         "checked_at": "2026-11-15T10:20:00+00:00", "pinned": True,
+         "pinned_reason": "it is the roll back point of failed deployment 9f8e7d6c", "restorable": True,
+         "reason_text": None, "identity_note": None, "needs_reset_perm": False, "dirty_note": None},
+        {"id": "b2", "name": "20261114T101500Z-2b3c4d5e", "reason": "manual", "status": "missing",
+         "taken_at": "2026-11-14T10:15:00+00:00", "db_bytes": 10, "has_files": False, "files_bytes": None,
+         "format": "pg-custom", "revision_short": None, "commit_sha": None, "release": None, "deployment_id": None,
+         "dirty_of": "x", "created_by": "Ada", "note": "before <script>", "checked_at": None, "pinned": False,
+         "pinned_reason": None, "restorable": False, "reason_text": "Not on prod-01 any more (checked never)",
+         "identity_note": None, "needs_reset_perm": False,
+         "dirty_note": "Holds data changed by failed deployment 9f8e7d6c (abc1234)"},
+        {"id": "b3", "name": "20261113T101500Z-3c4d5e6f", "reason": "pre_restore", "status": "ready",
+         "taken_at": "2026-11-13T10:15:00+00:00", "db_bytes": 2048, "has_files": False, "files_bytes": None,
+         "format": "pg-custom", "revision_short": "0041", "commit_sha": "1111111aaaa", "release": None,
+         "deployment_id": None, "dirty_of": None, "created_by": None, "note": None, "checked_at": None, "pinned": False,
+         "pinned_reason": None, "restorable": True, "reason_text": None,
+         "identity_note": "Restoring it also puts back the field encryption key it was made with (FIELD_ENCRYPTION_KEY).",
+         "needs_reset_perm": True, "dirty_note": None},
+    ],
+    "keep": 5, "manual_max": 10, "folder": "/srv/shop/backups", "other_files": 2, "ram_backed": False,
+    "data_elsewhere": None, "warning": "A job is running for shop; showing what Slipway recorded",
+}
+
+BACKUPS_SCENARIO = """
+var el = h("div", { "data-load": "/api/v1/instances/abc/backups?check=true", "data-render": "backups",
+  "data-instance": "abc", "data-host": "prod-01", "data-files-label": "Uploads", "data-identity-label": "field encryption key",
+  "data-empty": "No backups yet.", "data-job-shas": '{"d1": "fedcba9"}', "data-revision-check": "", "data-has-files-cap": "",
+  "data-can-restore": "" __EXTRA__ });
+var html = "";
+Object.defineProperty(el, "innerHTML", { get: function () { return html; }, set: function (v) { html = v; } });
+document.body.appendChild(el);
+routes["GET /api/v1/instances/abc/backups"] = { status: 200, body: __BODY__ };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+done({ html: html, calls: fetchCalls });
+"""
+
+
+def _backups_html(tmp_path, body, extra: str = "") -> str:
+    scenario = BACKUPS_SCENARIO.replace("__BODY__", json.dumps(body)).replace("__EXTRA__", extra)
+    result = run_js(tmp_path, scenario)
+    assert result["calls"] == ["GET /api/v1/instances/abc/backups?check=true"]
+    return result["html"]
+
+
+def test_js_backups_renderer_builds_the_card_from_the_api(tmp_path):
+    import html as html_lib
+
+    out = _backups_html(tmp_path, BACKUPS_JSON)
+    text = html_lib.unescape(out)
+    assert "A job is running for shop; showing what Slipway recorded" in text  # the warning callout
+    assert "Before deploy fedcba9" in text and "Back up now · Ada" in text and "Before restore" in text
+    assert "Roll back point" in text and "with files" in text and "after failed deployment 9f8e7d6c" in text
+    assert "412 MiB + 3 GiB uploads" in text and "2 KiB" in text
+    assert "2026-11-15 10:15 UTC" in text and "abcdef1 · 0042_orders" in text
+    assert ">On host<" in text and ">Missing<" in text and ">Not checked<" in text
+    assert "Not on prod-01 any more (checked never)" in text  # instead of a Restore button
+    assert "&lt;script&gt;" in out and "<script>" not in out  # notes are escaped
+    # Without data:reset: the backup with other keys shows why, and nothing can be deleted.
+    assert "Restoring it puts back old field encryption key; that needs data:reset" in text
+    assert "Delete</button>" not in out and "Forget</button>" not in out
+    assert "2 other files in backups/ weren't made by Slipway and aren't listed." in text
+    assert "also hold the uploads" in text
+    fills = [json.loads(html_lib.unescape(m)) for m in re.findall(r'data-fill="([^"]*)"', out)]
+    assert [f["backup_id"] for f in fills] == ["b1"]
+    assert fills[0]["has_files"] is True and fills[0]["release"] == "abcdef1" and fills[0]["no_revision_check"] is False
+
+    out = html_lib.unescape(_backups_html(tmp_path, BACKUPS_JSON, ', "data-can-reset": "", "data-busy": ""'))
+    assert ">Forget</button>" in out and out.count(">Delete</button>") == 2
+    assert 'disabled title="This backup is pinned: it is the roll back point' in out
+    # While a job runs, Restore is off.
+    assert re.search(r'data-open="restore-backup"[^>]*disabled title="A job is running', out)
+
+    empty = _backups_html(tmp_path, {"backups": [], "other_files": 0})
+    assert "No backups yet." in empty and "<table" not in empty
+
+
+DIALOG_SCENARIO = """
+var input = h("input", { name: "confirm", "data-must-equal": "shop" });
+var submit = h("button", { type: "submit", disabled: "" });
+var files = h("input", { type: "checkbox", name: "files" });
+var tick = h("label", { "data-show-if": "needs_identity" }, [h("input", { type: "checkbox", name: "restore_identity", required: "" })]);
+var form = h("form", { "data-form": "POST /api/v1/instances/abc/data/restore", "data-then": "redirect:/deployments/{id}" }, [
+  h("input", { type: "hidden", name: "backup_id" }), h("span", { "data-slot": "name" }),
+  h("label", { "data-show-if": "has_files" }, [files]), tick, input, submit]);
+var dlg = h("dialog", { id: "restore-backup" }, [form]);
+var opener = h("button", { "data-open": "restore-backup",
+  "data-fill": JSON.stringify({ backup_id: "b1", name: "20261115T101500Z-1a2b3c4d", has_files: true, files: true, needs_identity: false }) });
+document.body.appendChild(dlg); document.body.appendChild(opener);
+document.dispatchEvent(new Event("DOMContentLoaded"));
+input.value = "left over";
+user("click", opener);
+var opened = { open: "open" in dlg.attrs, disabled: submit.disabled, name: form.querySelector("[data-slot=name]").textContent,
+  files: files.checked, tickHidden: tick.hidden, confirm: input.value };
+input.value = "Shop"; user("input", input);
+var wrongCase = submit.disabled;
+input.value = "shop"; user("input", input);
+var exact = submit.disabled;
+routes["POST /api/v1/instances/abc/data/restore"] = { status: 202, body: { id: "dep1" } };
+user("submit", form, { submitter: submit });
+await settle();
+done({ opened: opened, wrongCase: wrongCase, exact: exact, body: fetchBodies[0], hrefs: hrefs });
+"""
+
+
+def test_js_dialog_fill_and_the_typed_name(tmp_path):
+    result = run_js(tmp_path, DIALOG_SCENARIO)
+    assert result["opened"] == {"open": True, "disabled": True, "name": "20261115T101500Z-1a2b3c4d", "files": True,
+                                "tickHidden": True, "confirm": ""}
+    assert result["wrongCase"] is True and result["exact"] is False
+    # The hidden identity tick isn't sent; the rest is.
+    assert result["body"] == {"backup_id": "b1", "files": True, "confirm": "shop"}
+    assert result["hrefs"] == ["http://slipway.test/deployments/dep1"]
+
+
+SERIALIZE_SCENARIO = """
+var form = h("form", {}, [
+  h("input", { type: "radio", name: "start_from", value: "empty", "data-no-send": "", checked: "" }),
+  h("div", { "data-optional-group": "first_admin" }, [
+    h("input", { name: "first_admin.fields.email", type: "email", value: "__EMAIL__" }),
+    h("input", { name: "first_admin.fields.username", value: "__USER__" }),
+    h("input", { type: "hidden", name: "first_admin.mode", value: "password" }),
+    h("input", { name: "first_admin.password", type: "password", value: "" }),
+  ]),
+  h("input", { name: "confirm", value: "shop" }),
+]);
+document.body.appendChild(form);
+done({ body: window.slipway.serialize(form) });
+"""
+
+
+def test_js_serialize_nests_dotted_names_and_leaves_out_empty_optional_groups(tmp_path):
+    filled = run_js(tmp_path, SERIALIZE_SCENARIO.replace("__EMAIL__", "ada@example.com").replace("__USER__", "ada"))
+    assert filled["body"] == {"first_admin": {"fields": {"email": "ada@example.com", "username": "ada"}, "mode": "password"},
+                              "confirm": "shop"}
+    empty = run_js(tmp_path, SERIALIZE_SCENARIO.replace("__EMAIL__", "").replace("__USER__", ""))
+    assert empty["body"] == {"confirm": "shop"}
+
+
+THEN_SCENARIO = """
+location.assign = function (u) { hrefs.push("ASSIGN " + u); };
+var form = h("form", { "data-form": "POST /api/v1/instances/abc/snapshots", "data-then": "redirect:/deployments/{deployment.id}" }, [
+  h("input", { name: "name", value: "shop-1" }), h("button", { type: "submit" })]);
+var dl = h("form", { "data-form": "POST /api/v1/snapshots/s1/exports", "data-then": "download" }, [
+  h("input", { name: "passphrase", value: "x" }), h("button", { type: "submit" })]);
+document.body.appendChild(form); document.body.appendChild(dl);
+routes["POST /api/v1/instances/abc/snapshots"] = { status: 202, body: { snapshot: { id: "s1" }, deployment: { id: "d9" } } };
+routes["POST /api/v1/snapshots/s1/exports"] = { status: 201, body: { url: "/api/v1/snapshot-exports/tok", bytes: 3 * 1024 * 1024 * 1024 } };
+user("submit", form, { submitter: form.querySelector("button") });
+await settle();
+user("submit", dl, { submitter: dl.querySelector("button") });
+await settle();
+var s = window.slipway.statusBadge;
+done({ hrefs: hrefs, toasts: toasts(), badges: [s("running", "restore"), s("running", "deploy"), s("running"),
+  s("succeeded", "backup"), s("succeeded", "deploy"), s("failed", "reset")], sizes: [window.slipway.humanBytes(812 * 1024 * 1024),
+  window.slipway.humanBytes(1.9 * 1024 * 1024 * 1024), window.slipway.humanBytes(512)] });
+"""
+
+
+def test_js_then_redirects_by_nested_ids_and_downloads(tmp_path):
+    result = run_js(tmp_path, THEN_SCENARIO)
+    assert result["hrefs"] == ["http://slipway.test/deployments/d9", "ASSIGN http://slipway.test/api/v1/snapshot-exports/tok"]
+    assert "toast success|Download started (3 GiB)" in result["toasts"]
+    assert result["badges"] == [["Restoring", "warning spin"], ["Building", "warning spin"], ["Building", "warning spin"],
+                                ["Done", "success"], ["Deployed", "success"], ["Failed", "error"]]
+    assert result["sizes"] == ["812 MiB", "1.9 GiB", "512 bytes"]
+
+
+PASSPHRASE_SCENARIO = """
+var a = h("input", { id: "pa", name: "passphrase" }), b = h("input", { id: "pb" });
+var copy = h("button", { "data-passphrase-copy": "", hidden: "" });
+var gen = h("button", { "data-generate-passphrase": "#pa, #pb" });
+var form = h("form", {}, [a, b, gen, copy]);
+document.body.appendChild(form);
+user("click", gen);
+var first = a.value;
+user("click", gen);
+done({ a: a.value, b: b.value, first: first, copyHidden: copy.hidden });
+"""
+
+
+def test_js_generated_passphrases_are_24_base32_characters_in_groups(tmp_path):
+    result = run_js(tmp_path, PASSPHRASE_SCENARIO)
+    assert re.fullmatch(r"([A-Z2-7]{4}-){5}[A-Z2-7]{4}", result["a"]) and result["a"] == result["b"]
+    assert result["first"] != result["a"] and result["copyHidden"] is False
+
+
+APP_FORM = """
+var TREE = __TREE__;
+function build(n) { return typeof n === "string" ? n : h(n.tag, n.attrs, n.children.map(build)); }
+var form = build(TREE);
+document.body.appendChild(form);
+routes["GET /api/v1/repositories/__REPO__/branches"] = { status: 200, body: ["main"] };
+routes["GET /api/v1/repositories/__REPO__/manifest"] = { status: 200, body: { manifest: __MANIFEST__ } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+var fs = form.querySelector("[data-app-data]");
+done({ hidden: fs.hidden, start: form.querySelector("[data-app-start]").hidden, seed: form.querySelector("[data-app-seed]").hidden,
+       admin: form.querySelector("[data-app-admin]").hidden, body: window.slipway.serialize(form) });
+"""
+
+
+async def test_js_instance_form_shows_the_data_fieldset_for_a_manifest_with_data(admin_client, tmp_path):
+    from tests.test_data_api import MANIFEST
+
+    repo_id = await _add_repo(91, "shop", detected_config={"manifest": True, "files": ["slipway.yml"]})
+    await _host(admin_client)
+    page = (await admin_client.get(f"/instances/new?repo={repo_id}")).text
+    tree = json.dumps(_form_tree(page))
+    plain = {**MANIFEST, "capabilities": [], "data": {**MANIFEST["data"], "volumes": []}, "first_admin": None}
+    for man, shown in ((MANIFEST, True), (plain, False)):
+        scenario = APP_FORM.replace("__TREE__", tree).replace("__REPO__", repo_id).replace("__MANIFEST__", json.dumps(man))
+        result = run_js(tmp_path, scenario)
+        assert result["hidden"] is (not shown), result
+        if shown:
+            # A new instance may start from a snapshot (seed), gets a first admin and starter content.
+            assert result["start"] is False and result["seed"] is False and result["admin"] is False
+            assert result["body"]["keep_backups"] == 5 and result["body"]["seed_content"] is True
+            assert "seed_snapshot_id" not in result["body"] and "seed_from" not in result["body"]
+        else:
+            assert "keep_backups" not in result["body"] and "seed_content" not in result["body"]
+
+
+# The Data fieldset's seed choice (§10.7, §15.4): an edit sends seed_snapshot_id only when the user changes it,
+# and "A snapshot" is offered only when one is usable (a select of disabled options has no value).
+SEED_FORM = """
+var TREE = __TREE__;
+function build(n) { return typeof n === "string" ? n : h(n.tag, n.attrs, n.children.map(build)); }
+var form = build(TREE);
+document.body.appendChild(form);
+routes["GET /api/v1/repositories/__REPO__/branches"] = { status: 200, body: ["main"] };
+routes["GET /api/v1/repositories/__REPO__/manifest"] = { status: 200, body: { manifest: __MANIFEST__ } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+var fs = form.querySelector("[data-app-data]");
+var radio = function (v) { return fs.querySelector('[name="seed_from"][value="' + v + '"]'); };
+var select = fs.querySelector("[data-app-snapshot]");
+var before = { body: window.slipway.serialize(form), snapshotOff: radio("snapshot").disabled,
+  emptyOff: radio("empty").disabled,
+  snapshotOn: radio("snapshot").checked, options: select.querySelectorAll("option").map(function (o) { return o.textContent; }),
+  value: select.value };
+if (__PICK_EMPTY__) {
+  radio("snapshot").checked = false; radio("empty").checked = true; user("change", radio("empty"));
+}
+done({ before: before, body: window.slipway.serialize(form) });
+"""
+
+
+def _seed_form(page: str, repo_id: str, pick_empty: bool = False) -> str:
+    from tests.test_data_api import MANIFEST
+
+    return (SEED_FORM.replace("__TREE__", json.dumps(_form_tree(page))).replace("__REPO__", repo_id)
+            .replace("__MANIFEST__", json.dumps(MANIFEST)).replace("__PICK_EMPTY__", "true" if pick_empty else "false"))
+
+
+async def test_js_editing_a_seeded_instance_sends_the_seed_only_when_it_changes(make_client, monkeypatch, tmp_path):
+    from slipway.models import Host, Repository
+    from tests.test_data_api import ADMIN, SHOP_YML, client_with, clients, github_serving, ready_snapshot, seed
+
+    c = await clients(make_client)
+    github_serving(monkeypatch, {"slipway.yml": SHOP_YML})
+    await seed()
+    async with get_sessionmaker()() as db:
+        host = await db.scalar(select(Host))
+        repo = await db.scalar(select(Repository))
+    sid = await ready_snapshot(c["admin"], "uat-1")
+    body = {"name": "UAT two", "repository_id": str(repo.id), "host_id": str(host.id), "build_source": "app",
+            "deploy": False, "seed_snapshot_id": str(sid), "first_admin": ADMIN, "keep_backups": 7}
+    r = await c["maintainer"].post("/api/v1/instances", json=body)
+    assert r.status_code == 201, r.text
+    iid = r.json()["id"]
+
+    # A writer without data:reset sees the saved snapshot (read-only) and can still save the instance.
+    writer = await client_with(make_client, "writer@example.com", ["instances:read", "instances:write", "repos:read", "hosts:read"])
+    page = (await writer.get(f"/instances/{iid}/edit")).text
+    result = run_js(tmp_path, _seed_form(page, str(repo.id)))
+    assert result["before"]["snapshotOn"] is True and result["before"]["snapshotOff"] is True
+    assert result["before"]["value"] == str(sid) and result["before"]["options"][0].startswith("uat-1")
+    assert "seed_snapshot_id" not in result["body"] and result["body"]["keep_backups"] == 7
+    # Empty can't be picked either: the PATCH would leave the seed as it is (fixcheck F).
+    assert result["before"]["emptyOff"] is True
+    assert "Changing what it starts with needs the data:reset permission" in page
+    # Without data:read the saved seed is listed by its name only (no repository, source or keys).
+    [listed] = json.loads(html.unescape(re.search(r"data-snapshots='([^']*)'", page).group(1)))
+    assert listed == {"id": str(sid), "name": "uat-1", "app": listed["app"], "status": "ready", "brief": True}
+    r = await writer.patch(f"/api/v1/instances/{iid}", json=result["body"])
+    assert r.status_code == 200, r.text
+    assert r.json()["seed_snapshot"]["name"] == "uat-1"
+
+    # A maintainer's untouched save keeps it too; choosing Empty clears it.
+    page = (await c["maintainer"].get(f"/instances/{iid}/edit")).text
+    untouched = run_js(tmp_path, _seed_form(page, str(repo.id)))
+    assert "seed_snapshot_id" not in untouched["body"] and untouched["before"]["emptyOff"] is False
+    cleared = run_js(tmp_path, _seed_form(page, str(repo.id), pick_empty=True))
+    assert cleared["body"]["seed_snapshot_id"] is None
+
+
+async def test_js_a_snapshot_is_offered_only_when_one_is_usable(make_client, monkeypatch, tmp_path):
+    from slipway.models import Repository
+    from tests.test_data_api import clients, ready_snapshot, seed
+
+    c = await clients(make_client)
+    await seed()
+    async with get_sessionmaker()() as db:
+        repo = await db.scalar(select(Repository))
+        repo.detected_config = {"manifest": True, "files": ["slipway.yml"]}  # the form opens in app mode
+        await db.commit()
+    await ready_snapshot(c["admin"], "fork-1", repository="acme/fork")
+    await ready_snapshot(c["admin"], "unknown-1", repository=None)
+    # The maintainer has data:reset but not snapshots:download: both snapshots are listed, disabled.
+    page = (await c["maintainer"].get(f"/instances/new?repo={repo.id}")).text
+    result = run_js(tmp_path, _seed_form(page, str(repo.id)))
+    assert len(result["before"]["options"]) == 2 and result["before"]["value"] == ""
+    assert result["before"]["snapshotOff"] is True and "seed_snapshot_id" not in result["body"]
+    # The admin may download, so the same snapshots are usable.
+    page = (await c["admin"].get(f"/instances/new?repo={repo.id}")).text
+    result = run_js(tmp_path, _seed_form(page, str(repo.id)))
+    assert result["before"]["snapshotOff"] is False

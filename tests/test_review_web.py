@@ -480,8 +480,9 @@ prop("disabled", function () { return "disabled" in this.attrs; }, function (v) 
 prop("hidden", function () { return "hidden" in this.attrs; }, function (v) { if (v) this.attrs.hidden = ""; else delete this.attrs.hidden; });
 prop("form", function () { return this.parentNode ? this.parentNode.closest("form") : null; });
 prop("selectedOptions", function () {
+  // As in a browser: with none selected, the first option that isn't disabled (none when all are).
   var opts = this.querySelectorAll("option"), sel = opts.filter(function (o) { return o.selected; });
-  return sel.length ? sel.slice(0, 1) : opts.slice(0, 1);
+  return sel.length ? sel.slice(0, 1) : opts.filter(function (o) { return !("disabled" in o.attrs); }).slice(0, 1);
 });
 prop("value", function () {
   if (this.tagName === "SELECT") { var o = this.selectedOptions[0]; return o ? o.value : ""; }
@@ -494,9 +495,16 @@ prop("value", function () {
 prop("textContent", function () { return this._text + this.children.map(function (c) { return c.textContent; }).join(""); },
   function (v) { this._text = String(v); this.children.slice().forEach(function (c) { c.remove(); }); });
 prop("innerHTML", function () { return ""; }, function (v) {
-  var self = this, re = /<option ?(selected)?[^>]*>([^<]*)<\/option>/g, m;
+  // <option> tags only, with their value, selected and disabled attributes.
+  var self = this, re = /<option([^>]*)>([^<]*)<\/option>/g, m;
   this.textContent = "";
-  while ((m = re.exec(v))) { var o = new El("option", m[1] ? { selected: "" } : {}, [m[2]]); self.appendChild(o); }
+  while ((m = re.exec(v))) {
+    var attrs = {}, a, are = /([\w-]+)(?:="([^"]*)")?/g;
+    while ((a = are.exec(m[1]))) attrs[a[1]] = a[2] === undefined ? "" : a[2].replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+    var o = new El("option", attrs, [m[2]]);
+    if ("selected" in attrs) o.selected = true;
+    self.appendChild(o);
+  }
 });
 prop("defaultChecked", function () { return "checked" in this.attrs; });
 prop("defaultValue", function () { return this.attrs.value || ""; });

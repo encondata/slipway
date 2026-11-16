@@ -18,6 +18,7 @@ os.environ.update(
     SLIPWAY_GITHUB_CLIENT_SECRET="test-secret",
     SLIPWAY_BASE_URL="http://testserver",
     SLIPWAY_ALLOW_SIGNUP="false",
+    SLIPWAY_STORAGE_DIR=str(_tmp / "storage"),  # stored snapshots stay inside the test run's temp folder
 )
 
 import httpx  # noqa: E402

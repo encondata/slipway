@@ -8,6 +8,10 @@
 # Set other env.example values (SS_KIOSK_SIGNING_DIGESTS, SS_ANTHROPIC_API_KEY,
 # SS_SMTP_HOST and the rest of the SS_SMTP_* keys...) as environment variables on
 # the Slipway instance. With mailpit off, ss-stack needs SS_SMTP_HOST; learn needs wiki.
+#
+# The data section and the data commands let Slipway back up the database and the
+# uploaded files before every change, restore them, reset them and seed new
+# instances from snapshots. docs/manifest.md describes every key.
 version: 1
 name: ServerSherpa
 env_file: deploy/stack/env.example
@@ -37,8 +41,8 @@ secrets:
   POSTGRES_PASSWORD: hex
   SPACES_SECRET_KEY: hex
   SS_JWT_SECRET: hex
-  SS_TOTP_ENCRYPTION_KEY: fernet
-  SS_PASSWORD_PEPPER: hex
+  SS_TOTP_ENCRYPTION_KEY: {kind: fernet, identity: true}   # 2FA seeds in the database are encrypted with it
+  SS_PASSWORD_PEPPER:     {kind: hex, identity: true}      # password hashes are peppered with it
   SS_WIKI_SERVICE_TOKEN: hex
 
 services:
@@ -69,7 +73,56 @@ images:
   - "serversherpa-learn:{STACK_IMAGE_TAG}"
   - "serversherpa-status:{STACK_IMAGE_TAG}"
 
+data:
+  app: serversherpa                       # never change it: snapshots seed only an app with the same id
+  format: pg-custom                       # pg_dump -Fc --no-owner --no-acl (ss-stack pgdump)
+  volumes:
+    - {name: "ss-{STACK_ENV}-db_pgdata",           holds: database}
+    - {name: "ss-{STACK_ENV}-storage_seaweeddata", holds: files}
+    - {name: "ss-{STACK_ENV}-status_status-data",  holds: other}
+  files: {format: serversherpa-objects-v1, label: Uploaded files}
+  identity_label: sign-in keys
+  identity_help: People sign in with the passwords and 2FA codes they had when the data was made.
+
 commands:
-  build: [deploy/stack/ss-stack, build, "{slipway.env_dir}"]
-  start: [deploy/stack/ss-stack, up, "{slipway.env_dir}"]
-  stop:  [deploy/stack/ss-stack, down, "{slipway.env_dir}"]
+  build:        [deploy/stack/ss-stack, build, "{slipway.env_dir}"]
+  start:        [deploy/stack/ss-stack, up, "{slipway.env_dir}"]
+  stop:         [deploy/stack/ss-stack, down, "{slipway.env_dir}"]
+  has_data:     [deploy/stack/ss-stack, has-data, "{slipway.env_dir}"]
+  data_up:      [deploy/stack/ss-stack, data, "{slipway.env_dir}"]
+  # pgdump, not dump: dump names and prunes its own files, and Slipway does that here.
+  dump:         [deploy/stack/ss-stack, pgdump, "{slipway.env_dir}", "{slipway.out}"]
+  verify_dump:  [deploy/stack/ss-stack, verify-dump, "{slipway.env_dir}", "{slipway.in}"]
+  revision:     [deploy/stack/ss-stack, revision, "{slipway.env_dir}"]
+  accepts:      [deploy/stack/ss-stack, accepts, "{slipway.env_dir}", "{slipway.in}"]
+  restore:      [deploy/stack/ss-stack, restore, "{slipway.env_dir}", "{slipway.in}"]
+  export_files: [deploy/stack/ss-stack, export-objects, "{slipway.env_dir}", "{slipway.out}"]
+  import_files: [deploy/stack/ss-stack, import-objects, "{slipway.env_dir}", "{slipway.in}"]
+  after_import: [deploy/stack/ss-stack, clear-sessions, "{slipway.env_dir}"]
+  seed:         [deploy/stack/ss-stack, seed, "{slipway.env_dir}"]
+
+# ss-stack admin runs serversherpa bootstrap-admin itself.
+first_admin:
+  help: The first deploy creates this person as ServerSherpa's first super admin. The password is never emailed.
+  command: [deploy/stack/ss-stack, admin, "{slipway.env_dir}", --email, "{admin.email}",
+            --first-name, "{admin.first_name}", --last-name, "{admin.last_name}",
+            --role, super_admin, --link-minutes, "240"]
+  fields:
+    first_name: {label: First name, max: 100}
+    last_name:  {label: Last name, max: 100}
+    email:      {label: Email, kind: email}
+  password: {min_length: 8, stdin: true, args: [--password-stdin]}
+  invite:   {label: Email them a link to set their password, args: [--invite]}
+  done_codes: [0]
+  exists_codes: [10]
+  messages:
+    2: ServerSherpa refused the request (usage error); see the log.
+    3: The password is shorter than ServerSherpa's password policy allows.
+    4: ServerSherpa has no global role super_admin.
+    5: ServerSherpa can't send email, so it can't send an invite. Set a password instead, or configure SS_SMTP_HOST (or turn on mailpit).
+    6: ServerSherpa failed while creating the account; see the api container's logs.
+    7: A person with that email exists in ServerSherpa without an account; give them one in the portal, or use another email.
+    8: ServerSherpa refused the email address (it refuses .local and .test domains).
+
+# Minutes; the rest keep Slipway's defaults.
+timeouts: {restore: 120, export_files: 120, import_files: 120}

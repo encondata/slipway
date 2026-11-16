@@ -37,10 +37,10 @@ curl -fsSL https://raw.githubusercontent.com/encondata/slipway/main/install.sh |
 
 It asks where to install (default `~/slipway`, or `/mnt/user/slipway` on Unraid) and the address people
 will use, clones the repository, writes `.env` with fresh secrets and an administrator account, builds the
-image and starts Slipway with PostgreSQL. The database lives in `data/postgres` inside the install folder
-(set `SLIPWAY_DATA_DIR` in `.env` to move it). Run the same command again to update: it keeps `.env` and the
-data, and only prints the admin password while it still works. `SLIPWAY_DIR`, `SLIPWAY_BASE_URL`,
-`SLIPWAY_PORT` and `SLIPWAY_ADMIN_EMAIL` answer the questions up front; `SLIPWAY_REPO` and
+image and starts Slipway with PostgreSQL. The database lives in `data/postgres` inside the install folder and
+stored snapshots in `data/files` (set `SLIPWAY_DATA_DIR` in `.env` to move both). Run the same command again to
+update: it keeps `.env` and the data, and only prints the admin password while it still works. `SLIPWAY_DIR`,
+`SLIPWAY_BASE_URL`, `SLIPWAY_PORT` and `SLIPWAY_ADMIN_EMAIL` answer the questions up front; `SLIPWAY_REPO` and
 `SLIPWAY_BRANCH` pick another source. Slipway serves plain HTTP on port 8000 for a TLS reverse proxy.
 GitHub sign-in needs an OAuth app: the installer's `.env` says where to put its ID and secret.
 
@@ -50,6 +50,7 @@ GitHub sign-in needs an OAuth app: the installer's `.env` says where to put its 
 cp .env.example .env
 docker compose run --rm --no-deps -e SLIPWAY_SKIP_MIGRATIONS=1 slipway slipway generate-secrets   # paste all three values into .env
 # edit .env: SLIPWAY_BASE_URL, SLIPWAY_ADMIN_EMAIL/PASSWORD, GitHub OAuth app
+mkdir -p data/files && sudo chown 10001:10001 data/files && sudo chmod 700 data/files   # stored snapshots
 docker compose up -d --build
 ```
 
@@ -67,6 +68,15 @@ takes the client IP from `X-Forwarded-For` for rate limiting and the audit log. 
 (`127.0.0.1`) behind a proxy and every client shares the proxy's IP, so anyone's failed logins slow
 everyone down. Never use `*`: any client could then forge its IP. If the proxy runs on the same machine,
 publish Slipway on loopback only (`"127.0.0.1:${SLIPWAY_PORT:-8000}:8000"` in docker-compose.yml).
+The proxy must also accept request bodies as large as the biggest snapshot you will upload (up to
+`SLIPWAY_SNAPSHOT_MAX_BYTES`, 20 GiB by default), for example `client_max_body_size 20g;` in nginx.
+
+**Backing up Slipway itself:** back up `data/postgres` and `data/files` together (stop the stack first, or
+dump the database with `pg_dump`), **and** keep `SLIPWAY_ENCRYPTION_KEY` somewhere safe. Stored snapshots in
+`data/files` are encrypted under keys that only the database holds, encrypted in turn with that key: without
+the key, they can't be opened. `data/files` must belong to uid 10001 with mode 700 (the installer sets this; by
+hand: `sudo chown 10001:10001 data/files && sudo chmod 700 data/files`). If it isn't writable, snapshots are
+unavailable and say why, while deploys carry on.
 
 **First admin:** whichever comes first becomes admin:
 - `SLIPWAY_ADMIN_EMAIL`/`SLIPWAY_ADMIN_PASSWORD` on an empty database. The password must be at least 10
@@ -230,7 +240,7 @@ and asks for the settings it names, and shows its optional services. The manifes
 
 An app's commands run on the host as trusted code, like a compose file. See
 [docs/examples/serversherpa.slipway.yml](docs/examples/serversherpa.slipway.yml) for a full manifest, and
-`slipway/services/manifest.py` for the format.
+[docs/manifest.md](docs/manifest.md) for the whole format.
 
 Every deployment, whatever its build source, runs as numbered **steps** shown on the deployment page, each
 starting a section of the log. **Retry** runs a failed deployment's commit again (`POST
@@ -324,11 +334,20 @@ Interactive API docs: `/api/docs`.
 | `repos:sync`, `deployments:create`, `instances:operate` (start/stop/restart) | ✓ | ✓ | ✓ | |
 | `hosts:write`, `instances:write`, `audit:read`, `users:read`, `roles:read` | ✓ | ✓ | | |
 | `users:write`, `roles:write`, `settings:write` | ✓ | | | |
+| `data:read` (backups and snapshots: names, sizes, dates) | ✓ | ✓ | ✓ | ✓ |
+| `data:backup` (back up now, take snapshots), `data:restore` (restore same-key backups, roll back) | ✓ | ✓ | ✓ | |
+| `data:reset` (reset data, seed from snapshots, restore old keys, delete backups and snapshots, overrides), `snapshots:upload` | ✓ | ✓ | | |
+| `snapshots:download` (passphrase-encrypted downloads; seeding another repository's instances) | ✓ | | | |
 
 `hosts:write` and `instances:write` are privileged. Whoever holds them controls SSH credentials and
 container mounts, which effectively means root on those hosts. Pinning a host key on first contact
 needs `hosts:write`; later health checks only need `hosts:read`. Through Slipway, environment variable values
 are only readable with `instances:write`.
+
+`data:*` does not include `snapshots:*`. `snapshots:upload` is privileged because a snapshot's database runs as
+SQL inside the app it seeds; `snapshots:download` because a snapshot holds a whole database and its identity
+keys. A snapshot's app name is a guard against mistakes, not against attackers: deploy access together with push
+access already means root on the host.
 
 **Compose instances run repository-defined containers as root.** Slipway runs the compose file from the
 deployed branch as is (bind mounts, `privileged`, host namespaces and so on), ignoring the instance's port
