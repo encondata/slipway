@@ -1,13 +1,14 @@
-/* Slipway UI — layout follows the mockups; colours follow the Slipway logo (navy, blue, teal). */
+/* Slipway UI: layout follows the mockups; colours follow the HackSpaceLabs H: navy ink, sky blue for
+   actions, and its warm bands (amber, orange, red) for accents and the sidebar art. */
 
 :root {
-  --primary: #0166ED;
-  --primary-hover: #0152C4;
-  --primary-soft: #E5EFFE;
-  --primary-text: #0152C4;
-  --logo-ink: #032651;
-  --logo-blue: #0166ED;
-  --logo-teal: #0DBBA2;
+  --primary: #0B74A6;
+  --primary-hover: #095F88;
+  --primary-soft: #E3F4FB;
+  --primary-text: #0A6593;
+  --logo-ink: #0B3B66;
+  --logo-blue: #1AA7D8;
+  --logo-teal: #F37021;
   --bg: #FAFAFA;
   --surface: #FFFFFF;
   --surface-muted: #F8FAFC;
@@ -29,19 +30,19 @@
   --neutral-soft: #F1F5F9;
   --neutral-text: #475569;
   --sidebar-bg: #FFFFFF;
-  --nav-active-bg: #E5EFFE;
-  --nav-active-text: #0152C4;
+  --nav-active-bg: #E3F4FB;
+  --nav-active-text: #0B3B66;
   --code-bg: #0F172A;
   --code-text: #E2E8F0;
   --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 1px 3px rgba(15, 23, 42, .06);
   --shadow-lg: 0 12px 32px rgba(15, 23, 42, .14);
   --radius-card: 14px;
   --radius-button: 10px;
-  --mt-back: #CFE0FB;
-  --mt-peak-a: #93BCF9;
-  --mt-peak-b: #0166ED;
-  --mt-mid: #5B9AF5;
-  --mt-shade: rgba(1, 82, 196, .40);
+  --mt-back: #CFEEF8;
+  --mt-peak-a: #FBB034;
+  --mt-peak-b: #E1251B;
+  --mt-mid: #1AA7D8;
+  --mt-shade: rgba(11, 59, 102, .22);
   --font: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color-scheme: light;
@@ -49,11 +50,11 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --primary-soft: rgba(1, 102, 237, .18);
-    --primary-text: #6AA8FF;
+    --primary-soft: rgba(26, 167, 216, .16);
+    --primary-text: #4CC3EC;
     --logo-ink: #F1F5F9;
-    --logo-blue: #3D8BFF;
-    --logo-teal: #14C9AE;
+    --logo-blue: #38B6E6;
+    --logo-teal: #F8963F;
     --bg: #0E0E10;
     --surface: #18181B;
     --surface-muted: #1C1C20;
@@ -72,26 +73,26 @@
     --neutral-soft: #27272A;
     --neutral-text: #A1A1AA;
     --sidebar-bg: #121214;
-    --nav-active-bg: linear-gradient(90deg, rgba(1, 102, 237, .55), rgba(3, 38, 81, .45));
+    --nav-active-bg: linear-gradient(90deg, rgba(11, 116, 166, .60), rgba(11, 59, 102, .50));
     --nav-active-text: #FFFFFF;
     --code-bg: #0B0B0D;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4);
     --shadow-lg: 0 16px 40px rgba(0, 0, 0, .55);
-    --mt-back: #0A1A33;
-    --mt-peak-a: #0B3570;
-    --mt-peak-b: #0166ED;
-    --mt-mid: #082B5C;
-    --mt-shade: rgba(61, 139, 255, .32);
+    --mt-back: #0B2540;
+    --mt-peak-a: #F37021;
+    --mt-peak-b: #B81F1A;
+    --mt-mid: #0B4E78;
+    --mt-shade: rgba(26, 167, 216, .28);
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --primary-soft: rgba(1, 102, 237, .18);
-  --primary-text: #6AA8FF;
+  --primary-soft: rgba(26, 167, 216, .16);
+  --primary-text: #4CC3EC;
   --logo-ink: #F1F5F9;
-  --logo-blue: #3D8BFF;
-  --logo-teal: #14C9AE;
+  --logo-blue: #38B6E6;
+  --logo-teal: #F8963F;
   --bg: #0E0E10;
   --surface: #18181B;
   --surface-muted: #1C1C20;
@@ -110,16 +111,16 @@
   --neutral-soft: #27272A;
   --neutral-text: #A1A1AA;
   --sidebar-bg: #121214;
-  --nav-active-bg: linear-gradient(90deg, rgba(1, 102, 237, .55), rgba(3, 38, 81, .45));
+  --nav-active-bg: linear-gradient(90deg, rgba(11, 116, 166, .60), rgba(11, 59, 102, .50));
   --nav-active-text: #FFFFFF;
   --code-bg: #0B0B0D;
   --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   --shadow-lg: 0 16px 40px rgba(0, 0, 0, .55);
-  --mt-back: #0A1A33;
-  --mt-peak-a: #0B3570;
-  --mt-peak-b: #0166ED;
-  --mt-mid: #082B5C;
-  --mt-shade: rgba(61, 139, 255, .32);
+  --mt-back: #0B2540;
+  --mt-peak-a: #F37021;
+  --mt-peak-b: #B81F1A;
+  --mt-mid: #0B4E78;
+  --mt-shade: rgba(26, 167, 216, .28);
   color-scheme: dark;
 }
 
@@ -285,9 +286,10 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
 .btn:hover { background: var(--surface-hover); text-decoration: none; }
 .btn:disabled, .btn[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
 .btn-primary {
-  background: linear-gradient(180deg, #0F6FEF, var(--primary-hover));
+  /* White labels stay above 4.5:1 across the whole gradient (5.2:1 at the top, 7:1 at the bottom). */
+  background: linear-gradient(180deg, var(--primary), var(--primary-hover));
   border-color: var(--primary-hover); color: #fff;
-  box-shadow: 0 1px 2px rgba(1, 82, 196, .3), inset 0 1px 0 rgba(255, 255, 255, .18);
+  box-shadow: 0 1px 2px rgba(9, 95, 136, .3), inset 0 1px 0 rgba(255, 255, 255, .18);
 }
 .btn-primary:hover { background: var(--primary-hover); }
 .btn-danger { color: var(--error-text); border-color: color-mix(in srgb, var(--error) 35%, var(--border)); }

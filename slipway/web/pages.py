@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
+import time
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -72,7 +74,38 @@ def fmt_duration(seconds: float | None) -> str:
 
 
 templates.env.filters.update(timeago=timeago, dt=fmt_dt, duration=fmt_duration, shquote=shlex.quote)
-templates.env.globals.update(Perm=Perm, version=__version__)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+_asset_stamp: tuple[float, str] = (0.0, "")
+
+
+def asset_version() -> str:
+    """The ``?v=`` of the stylesheet, scripts and favicon: changes whenever one of the static files does,
+    so browsers fetch the new ones after an update instead of keeping what they cached. Rechecked at
+    most every 10 seconds."""
+    global _asset_stamp
+    now = time.monotonic()
+    if _asset_stamp[1] and now - _asset_stamp[0] < 10:
+        return _asset_stamp[1]
+    stamp = hashlib.sha256(__version__.encode())
+    try:
+        paths = sorted(STATIC_DIR.rglob("*"))
+    except OSError:
+        paths = []
+    for path in paths:
+        try:  # a file replaced during an update can vanish between the listing and here
+            if not path.is_file():
+                continue
+            st = path.stat()
+        except OSError:
+            continue
+        stamp.update(f"{path.relative_to(STATIC_DIR)}:{st.st_size}:{st.st_mtime_ns}".encode())
+    _asset_stamp = (now, stamp.hexdigest()[:12])
+    return _asset_stamp[1]
+
+
+templates.env.globals.update(Perm=Perm, version=__version__, asset_version=asset_version)
 
 
 # ------------------------------------------------------------- OAuth errors
