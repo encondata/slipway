@@ -60,6 +60,50 @@ async def test_every_page_renders_for_admin(admin_client, monkeypatch):
     assert (await admin_client.get("/hosts/00000000-0000-0000-0000-000000000000")).status_code == 404
 
 
+def test_no_emoji_in_the_interface():
+    """The interface uses icons from icons.svg, never emoji, in templates, scripts or page code."""
+    import re
+    from pathlib import Path
+
+    import slipway
+
+    emoji = re.compile("[\U0001F000-\U0001FAFF☀-⛿⬀-⯿️‍]")
+    root = Path(slipway.__file__).parent
+    found = [
+        f"{path.relative_to(root)}:{n}"
+        for path in sorted(root.rglob("*")) if path.suffix in {".html", ".js", ".css", ".py"}
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if emoji.search(line)
+    ]
+    assert not found, f"emoji in {found}"
+
+
+async def test_overview_has_no_greeting(admin_client):
+    page = (await admin_client.get("/")).text
+    assert "<h1>Overview</h1>" in page
+    assert not any(g in page for g in ("Good morning", "Good afternoon", "Good evening"))
+
+
+async def test_repository_details_open_in_place(admin_client):
+    """Each repository row has its details right below it: closed (README not fetched) until clicked, and
+    open on load for ?repo=, even when the filter would hide that repository."""
+    repo_id = await _seed_repo()
+    host = (await admin_client.post("/api/v1/hosts", json={"name": "prod-01", "hostname": "10.0.0.5", "username": "deploy"})).json()
+    await admin_client.post("/api/v1/instances", json={"name": "web prod", "repository_id": repo_id, "host_id": host["id"], "deploy": False})
+
+    closed = (await admin_client.get("/repositories")).text
+    assert f'data-expand="repo-details-{repo_id}"' in closed
+    assert f'<tr class="repo-details" id="repo-details-{repo_id}" hidden>' in closed
+    assert f'data-load-later="/api/v1/repositories/{repo_id}/readme"' in closed
+    assert f'data-load="/api/v1/repositories/{repo_id}/readme"' not in closed
+    assert 'id="details"' not in closed  # no panel at the bottom of the page any more
+    assert "web prod" in closed  # the repository's instances are in its details row
+
+    opened = (await admin_client.get(f"/repositories?repo={repo_id}&show=unconfigured")).text
+    assert f'<tr class="repo-details" id="repo-details-{repo_id}" >' in opened
+    assert f'data-load="/api/v1/repositories/{repo_id}/readme"' in opened
+    assert 'aria-expanded="true"' in opened
+
+
 async def test_malformed_page_params_are_friendly(admin_client):
     assert (await admin_client.get("/repositories?repo=")).status_code == 200
     assert (await admin_client.get("/instances/new?repo=not-a-uuid")).status_code == 200

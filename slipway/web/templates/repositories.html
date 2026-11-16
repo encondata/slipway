@@ -3,6 +3,51 @@
 {% block title %}Repositories{% endblock %}
 {% block content %}
 {% set can_instances = auth.can(Perm.INSTANCES_READ) %}
+{% macro details(r, instances, open, can_instances) %}
+<div class="repo-details-body">
+  <div class="row wrap between" style="align-items:center; gap: 12px">
+    <span class="row" style="gap: 8px"><span class="mono subtle">{{ r.full_name }}</span>{% if r.archived %}<span class="badge warning plain">Archived</span>{% endif %}</span>
+    <div class="actions">
+      <a class="btn btn-sm" href="{{ r.html_url }}" target="_blank" rel="noopener">{{ icon("external", "i-sm") }} View on GitHub</a>
+      {% if auth.can(Perm.REPOS_SYNC) %}<button class="btn btn-sm" type="button" data-api="POST /api/v1/repositories/{{ r.id }}/detect" data-success="Configuration re-detected" data-then="reload">{{ icon("sync", "i-sm") }} Re-detect</button>{% endif %}
+      {% if auth.can(Perm.INSTANCES_WRITE) and not r.archived %}<a class="btn btn-sm btn-primary" href="/instances/new?repo={{ r.id }}">{{ icon("rocket", "i-sm") }} Deploy</a>{% endif %}
+    </div>
+  </div>
+  <div class="grid grid-2" style="gap: 16px; margin-top: 14px">
+    <div class="card" style="box-shadow:none">
+      <div class="card-head"><span class="head-icon">{{ icon("file") }}</span><h3>README</h3></div>
+      <div class="card-body"><pre class="code" style="max-height: 320px; background: var(--surface-muted); color: var(--text)" {{ 'data-load' if open else 'data-load-later' }}="/api/v1/repositories/{{ r.id }}/readme" data-render="readme">Loading…</pre></div>
+    </div>
+    <div class="stack" style="gap: 16px">
+      <div class="card" style="box-shadow:none">
+        <div class="card-head"><span class="head-icon">{{ icon("instances") }}</span><h3>Detected configuration</h3></div>
+        <div class="card-body row wrap">
+          {% if r.detected_at %}
+            <span class="badge {{ 'success' if r.has_dockerfile }}">Dockerfile</span>
+            <span class="badge {{ 'success' if r.compose_file }}">{{ r.compose_file or "Compose file" }}</span>
+            <span class="subtle">Checked {{ r.detected_at|timeago }} on {{ r.default_branch }}</span>
+          {% else %}<span class="muted">Not checked yet.</span>{% endif %}
+        </div>
+      </div>
+      {% if can_instances %}
+      <div class="card" style="box-shadow:none">
+        <div class="card-head"><span class="head-icon">{{ icon("box") }}</span><h3>Instances ({{ instances|length }})</h3></div>
+        <div class="card-body">
+          {% for i in instances %}
+            <div class="row between" style="padding: 6px 0">
+              <a href="/instances/{{ i.id }}"><strong>{{ i.name }}</strong></a>
+              <span class="row"><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span>{% if auth.can(Perm.HOSTS_READ) %}<span class="muted">{{ i.host.name }}</span>{% endif %}{{ badge("instance", i.status) }}</span>
+            </div>
+          {% else %}
+            <p class="muted">No instances of this repository yet.</p>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endmacro %}
 <div class="page-head">
   <div>
     <h1>Repositories</h1>
@@ -43,9 +88,9 @@
   <div class="table-wrap"><table class="table">
     <thead><tr><th>Repository</th><th>Visibility</th><th>Default Branch</th><th>Docker Ready</th>{% if can_instances %}<th>Last Deploy</th><th>Status</th>{% endif %}<th class="num">Actions</th></tr></thead>
     <tbody>
-    {% for r in repos %}{% set s = summaries[r.id] %}
-      <tr class="{{ 'selected' if selected and selected.id == r.id }}">
-        <td><a class="primary-cell" href="?repo={{ r.id }}&show={{ show }}{% if q %}&q={{ q|urlencode }}{% endif %}" style="color:inherit">{{ repo_icon(r) }}<span class="truncate" style="max-width: 280px"><strong>{{ r.name }}</strong><small>{{ r.description or r.full_name }}</small></span></a></td>
+    {% for r in repos %}{% set s = summaries[r.id] %}{% set open = selected and selected.id == r.id %}
+      <tr class="repo-row {{ 'selected' if open }}" data-expand="repo-details-{{ r.id }}" data-repo="{{ r.id }}" aria-expanded="{{ 'true' if open else 'false' }}">
+        <td><a class="primary-cell" href="?repo={{ r.id }}&show={{ show }}{% if q %}&q={{ q|urlencode }}{% endif %}" data-expand="repo-details-{{ r.id }}" aria-controls="repo-details-{{ r.id }}" style="color:inherit">{{ icon("chevron-right", "i-sm expand-chevron") }}{{ repo_icon(r) }}<span class="truncate" style="max-width: 280px"><strong>{{ r.name }}</strong><small>{{ r.description or r.full_name }}</small></span></a></td>
         <td class="nowrap">{{ icon("lock" if r.is_private else "globe", "i-sm") }} {{ r.visibility|title }}</td>
         <td><span class="chip">{{ icon("branch", "i-sm") }} {{ r.default_branch }}</span></td>
         <td class="nowrap">{% if r.deployable %}<span style="color: var(--success)">{{ icon("check", "i-sm") }}</span> {{ "Compose" if r.compose_file and not r.has_dockerfile else "Yes" }}{% elif r.detected_at %}<span class="muted">No</span>{% else %}<span class="subtle">Unknown</span>{% endif %}</td>
@@ -54,11 +99,12 @@
         <td>{{ badge("repo", s.state) }}</td>
         {% endif %}
         <td class="actions-cell">
-          {% if auth.can(Perm.INSTANCES_WRITE) and not r.archived %}
-            {% if s.count %}<a class="btn btn-sm" href="?repo={{ r.id }}&show={{ show }}">View Details</a>
-            {% else %}<a class="btn btn-sm {{ 'btn-primary' if r.deployable }}" href="/instances/new?repo={{ r.id }}">{{ icon("box", "i-sm") }} Create Instance</a>{% endif %}
-          {% else %}<a class="btn btn-sm" href="?repo={{ r.id }}&show={{ show }}">View Details</a>{% endif %}
+          {% if auth.can(Perm.INSTANCES_WRITE) and not r.archived and not s.count %}<a class="btn btn-sm {{ 'btn-primary' if r.deployable }}" href="/instances/new?repo={{ r.id }}">{{ icon("box", "i-sm") }} Create Instance</a>
+          {% else %}<a class="btn btn-sm" href="?repo={{ r.id }}&show={{ show }}" data-expand="repo-details-{{ r.id }}" aria-controls="repo-details-{{ r.id }}">Details</a>{% endif %}
         </td>
+      </tr>
+      <tr class="repo-details" id="repo-details-{{ r.id }}" {{ '' if open else 'hidden' }}>
+        <td colspan="{{ 7 if can_instances else 5 }}">{{ details(r, repo_instances[r.id], open, can_instances) }}</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -73,54 +119,4 @@
   {% endif %}
 </section>
 
-{% if selected %}
-<section class="card" id="details">
-  <div class="card-head" style="align-items:center">
-    <span class="head-icon">{{ icon("repositories", "i-lg") }}</span>
-    <div>
-      <h2 class="row">{{ selected.name }} <span class="badge plain">{{ selected.visibility|title }}</span>{% if selected.archived %}<span class="badge warning plain">Archived</span>{% endif %}</h2>
-      <p>{{ selected.description or selected.full_name }}</p>
-    </div>
-    <span class="spacer"></span>
-    <div class="actions">
-      <a class="btn" href="{{ selected.html_url }}" target="_blank" rel="noopener">{{ icon("external") }} View on GitHub</a>
-      {% if auth.can(Perm.REPOS_SYNC) %}<button class="btn" data-api="POST /api/v1/repositories/{{ selected.id }}/detect" data-success="Configuration re-detected" data-then="reload">{{ icon("sync") }} Re-detect</button>{% endif %}
-      {% if auth.can(Perm.INSTANCES_WRITE) and not selected.archived %}<a class="btn btn-primary" href="/instances/new?repo={{ selected.id }}">{{ icon("rocket") }} Deploy</a>{% endif %}
-    </div>
-  </div>
-  <div class="card-body grid grid-2" style="gap: 18px">
-    <div class="card" style="box-shadow:none">
-      <div class="card-head"><span class="head-icon">{{ icon("file") }}</span><h3>README</h3></div>
-      <div class="card-body"><pre class="code" style="max-height: 320px; background: var(--surface-muted); color: var(--text)" data-load="/api/v1/repositories/{{ selected.id }}/readme" data-render="readme">Loading…</pre></div>
-    </div>
-    <div class="stack" style="gap: 18px">
-      <div class="card" style="box-shadow:none">
-        <div class="card-head"><span class="head-icon">{{ icon("instances") }}</span><h3>Detected configuration</h3></div>
-        <div class="card-body row wrap">
-          {% if selected.detected_at %}
-            <span class="badge {{ 'success' if selected.has_dockerfile }}">Dockerfile</span>
-            <span class="badge {{ 'success' if selected.compose_file }}">{{ selected.compose_file or "Compose file" }}</span>
-            <span class="subtle">Checked {{ selected.detected_at|timeago }} on {{ selected.default_branch }}</span>
-          {% else %}<span class="muted">Not checked yet.</span>{% endif %}
-        </div>
-      </div>
-      {% if can_instances %}
-      <div class="card" style="box-shadow:none">
-        <div class="card-head"><span class="head-icon">{{ icon("box") }}</span><h3>Instances ({{ selected_instances|length }})</h3></div>
-        <div class="card-body">
-          {% for i in selected_instances %}
-            <div class="row between" style="padding: 6px 0">
-              <a href="/instances/{{ i.id }}"><strong>{{ i.name }}</strong></a>
-              <span class="row"><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span>{% if auth.can(Perm.HOSTS_READ) %}<span class="muted">{{ i.host.name }}</span>{% endif %}{{ badge("instance", i.status) }}</span>
-            </div>
-          {% else %}
-            <p class="muted">No instances of this repository yet.</p>
-          {% endfor %}
-        </div>
-      </div>
-      {% endif %}
-    </div>
-  </div>
-</section>
-{% endif %}
 {% endblock %}
