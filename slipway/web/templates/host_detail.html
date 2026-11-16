@@ -88,6 +88,17 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
   </table></div>
   {% else %}<div class="card-body"><p class="muted">Nothing runs here yet.</p></div>{% endif %}
 </section>
+
+{% set can_claim = auth.can(Perm.INSTANCES_WRITE) and claim_repos %}
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("box", "i-lg") }}</span>
+    <div><h2>Unmanaged containers</h2><p>Live from <code>docker ps</code> on {{ host.name }}: compose projects and containers Slipway did not deploy.{% if can_claim %} Claim one to deploy it from a repository from now on.{% endif %}</p></div>
+    <span class="spacer"></span>{% if host.is_pinned %}<button class="btn btn-sm" data-reload-target="#unmanaged">{{ icon("sync", "i-sm") }} Refresh</button>{% endif %}</div>
+  <div class="card-body" id="unmanaged" {% if host.is_pinned %}data-load="/api/v1/hosts/{{ host.id }}/unmanaged" data-render="unmanaged" {% if can_claim %}data-can-claim{% endif %}{% endif %}>
+    {% if host.is_pinned %}<p class="muted">Loading…</p>{% else %}<p class="muted">Verify the connection first.</p>{% endif %}
+  </div>
+</section>
+{% if can_claim %}{% include "_claim_dialog.html" %}{% endif %}
 {% endif %}
 
 {% if auth.can(Perm.HOSTS_WRITE) %}

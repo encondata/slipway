@@ -29,6 +29,9 @@ LogReader = Annotated[AuthContext, require(Perm.INSTANCES_READ, Perm.LOGS_READ)]
 
 # Settings that decide where and how an instance runs; fixed once anything was deployed.
 _PLACEMENT_FIELDS = ("host_id", "build_source", "compose_file", "dockerfile_path", "build_context")
+# A claimed instance runs on its host from the start, but its paths in the repository can still be
+# corrected until Slipway first deploys it.
+CLAIM_EDITABLE_FIELDS = frozenset({"compose_file", "dockerfile_path", "build_context"})
 IN_PROGRESS = "A deployment is in progress for this instance; wait for it to finish"
 ENV_UNREADABLE = (
     "The stored environment variables can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY. "
@@ -77,14 +80,23 @@ async def _active_deployment(db: DB, instance_id: uuid.UUID) -> uuid.UUID | None
     )
 
 
-async def _ever_deployed(db: DB, instance: Instance) -> bool:
-    """True once something may exist on the host: any status but CREATED, or a deployment that started."""
-    if instance.status != InstanceStatus.CREATED:
-        return True
+async def deployment_started(db: AsyncSession, instance: Instance) -> bool:
     started = await db.scalar(
         select(Deployment.id).where(Deployment.instance_id == instance.id, Deployment.started_at.is_not(None)).limit(1)
     )
     return started is not None
+
+
+async def _ever_deployed(db: DB, instance: Instance) -> bool:
+    """True once something may exist on the host: any status but CREATED, or a deployment that started."""
+    if instance.status != InstanceStatus.CREATED:
+        return True
+    return await deployment_started(db, instance)
+
+
+async def claim_paths_editable(db: AsyncSession, instance: Instance) -> bool:
+    """A claimed instance that no deployment has started on yet: its repository paths may change."""
+    return instance.claim_pending and not await deployment_started(db, instance)
 
 
 async def queue_deployment(db: DB, instance: Instance, user: User) -> Deployment:
@@ -192,14 +204,17 @@ async def get_env(instance_id: uuid.UUID, ctx: Writer, db: DB) -> dict[str, str]
 async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Writer, request: Request, db: DB) -> InstanceOut:
     instance = await _get(db, instance_id)
     data = body.model_dump(exclude_unset=True)
-    if not any(data.get(f) is not None and data[f] != getattr(instance, f) for f in _PLACEMENT_FIELDS):
+    changing = {f for f in _PLACEMENT_FIELDS if data.get(f) is not None and data[f] != getattr(instance, f)}
+    if not changing:
         return await _apply_update(db, instance, body, data, ctx, request)
     # Hold the instance's deploy lock until the commit, so no deployment starts in between.
     try:
         async with deployer.runner.exclusive(instance.id):
             if await _active_deployment(db, instance.id) is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
-            if await _ever_deployed(db, instance):
+            if await _ever_deployed(db, instance) and not (
+                changing <= CLAIM_EDITABLE_FIELDS and await claim_paths_editable(db, instance)
+            ):
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST,
                     "The host and build settings can't change once an instance has been deployed. "
