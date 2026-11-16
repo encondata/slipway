@@ -325,12 +325,10 @@ async def overview(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
         "today": len(today_deps),
         "today_failed": sum(1 for d in today_deps if d.status == DeploymentStatus.FAILED),
     }
-    hour = datetime.now().hour
-    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
     return await render(
         request, db, "overview.html", ctx,
         stats=stats, repos=repos[:5], hosts=hosts[:5], recent=recent, summaries=summaries,
-        steps=steps, setup_done=all(done for _, done, _ in steps), greeting=greeting,
+        steps=steps, setup_done=all(done for _, done, _ in steps),
     )
 
 
@@ -372,11 +370,14 @@ async def repositories(request: Request, db: DB, ctx: PageAuth, q: str = "", sho
         rows = [r for r in rows if summaries[r.id]["count"]]
     elif show == "unconfigured":
         rows = [r for r in rows if not summaries[r.id]["count"]]
+    # ?repo= opens that repository's details on load; the others open in place when clicked.
     selected = next((r for r in all_repos if r.id == repo_id), None) if repo_id else None
-    selected_instances = (
-        (await db.scalars(select(Instance).where(Instance.repository_id == selected.id))).all()
-        if selected and can_instances else []
-    )
+    if selected and selected not in rows:  # a link to a repository the filter hides still shows it
+        rows.insert(0, selected)
+    repo_instances: dict[uuid.UUID, list[Instance]] = defaultdict(list)
+    if can_instances:
+        for inst in (await db.scalars(select(Instance).order_by(Instance.name))).all():
+            repo_instances[inst.repository_id].append(inst)
     stats = {
         "total": len(all_repos),
         "deployable": sum(1 for r in all_repos if r.deployable),
@@ -385,7 +386,7 @@ async def repositories(request: Request, db: DB, ctx: PageAuth, q: str = "", sho
     }
     return await render(
         request, db, "repositories.html", ctx, repos=rows, summaries=summaries, stats=stats,
-        q=q, show=show, selected=selected, selected_instances=selected_instances,
+        q=q, show=show, selected=selected, repo_instances=repo_instances,
     )
 
 

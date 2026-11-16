@@ -353,6 +353,15 @@ table.table { width: 100%; border-collapse: collapse; }
 .table tbody tr:hover td { background: var(--surface-hover); }
 .table tr.selected td { background: var(--primary-soft); }
 .table tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--primary-text); }
+/* Rows that open their details right below them (repositories). */
+.table tr[data-expand] { cursor: pointer; }
+.table .expand-chevron { flex: none; color: var(--text-muted); transition: transform .15s ease; }
+.table tr[aria-expanded="true"] .expand-chevron { transform: rotate(90deg); color: var(--primary-text); }
+.table tr.repo-row.selected td { border-bottom-color: transparent; }
+.table tr.repo-details > td { padding: 4px 14px 18px; background: var(--primary-soft); box-shadow: inset 3px 0 0 var(--primary-text); cursor: default; }
+.table tbody tr.repo-details:hover > td { background: var(--primary-soft); }
+.table tr.repo-details .card { background: var(--surface); }
+@media (prefers-reduced-motion: reduce) { .table .expand-chevron { transition: none; } }
 .table .primary-cell { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .table .primary-cell strong { display: block; font-weight: 650; }
 .table .primary-cell small { display: block; color: var(--text-muted); font-size: 12.5px; }

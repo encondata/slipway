@@ -747,6 +747,46 @@
     if (btn) { const el = $(btn.dataset.reloadTarget); if (el) load(el); }
   });
 
+  // ------------------------------------------------- rows that open in place
+  // <tr data-expand="details-id"> opens the row with that id right below it. Clicks on the row's own links and
+  // buttons do what they say, except ones marked data-expand too; ctrl/cmd/shift-click still follows the link.
+  // Content marked data-load-later is fetched the first time its row opens.
+  function setExpanded(row, open) {
+    const details = document.getElementById(row.dataset.expand);
+    if (!details) return;
+    details.hidden = !open;
+    row.classList.toggle("selected", open);
+    row.setAttribute("aria-expanded", open ? "true" : "false");
+    $$(`[aria-controls="${row.dataset.expand}"]`, row).forEach((el) => el.setAttribute("aria-expanded", open ? "true" : "false"));
+    if (open) {
+      $$("[data-load-later]", details).forEach((el) => {
+        el.dataset.load = el.dataset.loadLater;
+        el.removeAttribute("data-load-later");
+        load(el);
+      });
+    }
+  }
+  document.addEventListener("click", (ev) => {
+    const row = ev.target.closest("tr[data-expand]");
+    if (!row || ev.defaultPrevented || ev.button !== 0) return;
+    const target = ev.target.closest("a, button, input, select, textarea, label, summary");
+    if (target && !target.hasAttribute("data-expand")) return;
+    if (target && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey)) return;
+    if (window.getSelection && String(window.getSelection()).length) return; // selecting text, not opening
+    ev.preventDefault();
+    const open = row.getAttribute("aria-expanded") !== "true";
+    setExpanded(row, open);
+    // Keep ?repo= (or whatever the row carries) in the address bar, so a reload or a shared link opens the same row.
+    if (row.dataset.repo) {
+      const url = new URL(location.href);
+      const still = $$("tr[data-expand][aria-expanded=true][data-repo]");
+      const shown = open ? row : still[still.length - 1];
+      if (shown) url.searchParams.set("repo", shown.dataset.repo);
+      else url.searchParams.delete("repo");
+      history.replaceState(null, "", url);
+    }
+  });
+
   // --------------------------------------------------------- claim dialog
   function fillRows(rep, rows) {
     $$(".repeater-row", rep).forEach((r) => r.remove());

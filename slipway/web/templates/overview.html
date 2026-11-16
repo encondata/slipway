@@ -8,8 +8,7 @@
 {% set can_deps = auth.can(Perm.DEPLOYMENTS_READ) %}
 <div class="page-head">
   <div>
-    <h1>{{ greeting }}, {{ user.display_name.split(" ")[0] }} 👋</h1>
-    <p class="lede">Here's what's happening with your apps on Slipway.</p>
+    <h1>Overview</h1>
   </div>
   <div class="actions">
     {% if auth.can(Perm.REPOS_SYNC) and user.github %}
