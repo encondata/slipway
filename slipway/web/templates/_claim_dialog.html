@@ -29,6 +29,11 @@
         <label for="claim-name">Instance name</label>
         <input class="input" id="claim-name" name="name" required maxlength="100">
       </div>
+      <div class="field">
+        <label for="claim-dir">Folder on the host <span class="subtle">(optional)</span></label>
+        <input class="input mono" id="claim-dir" name="deploy_dir" placeholder="{{ host.deploy_root }}/&lt;instance name&gt;" autocapitalize="off" spellcheck="false">
+        <span class="help">Where Slipway keeps this instance's releases and settings. Leave it empty for the host's deploy root.{% if (host.os_info or '').startswith('Unraid') %} On Unraid, use a folder under <code>/mnt/user</code>.{% endif %}</span>
+      </div>
 
       <div class="stack" style="gap: 12px" data-show-when="build_source=compose">
         <div class="field">

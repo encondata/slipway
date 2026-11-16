@@ -92,7 +92,8 @@
           {% for k in (instance.env or {}).keys()|sort %}<span class="chip mono">{{ k }}</span> {% else %}<span class="muted">None</span>{% endfor %}
           {%- endif -%}
         </dd>
-        {% if can_hosts %}<dt>{{ icon("hosts", "i-sm") }} Path on host</dt><dd class="mono">{{ instance.host.deploy_root }}/{{ instance.slug }}</dd>{% endif %}
+        {% if can_hosts %}<dt>{{ icon("hosts", "i-sm") }} Folder on host</dt><dd><span class="mono">{{ folder }}</span>
+          {%- if folder_in_ram %} <span class="badge warning" title="Unraid clears it when it restarts">Cleared at restart</span> <span class="subtle">Unraid keeps only <code>/mnt</code> and <code>/boot</code>; {% if auth.can(Perm.INSTANCES_WRITE) %}<a href="/instances/{{ instance.id }}/edit">set a folder under /mnt/user</a>{% else %}ask for a folder under /mnt/user{% endif %} and Slipway moves the files.</span>{% endif %}</dd>{% endif %}
       </dl>
     </div>
   </section>

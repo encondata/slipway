@@ -553,6 +553,21 @@
         : `Dockerfile (${(dockerfile && dockerfile.value) || "Dockerfile"})`);
       set("host", host ? host.dataset.label : "");
       set("name", data.name);
+      const dirInput = field("deploy_dir");
+      if (dirInput) {
+        // The default folder is <deploy root>/<slug>; a saved instance keeps its slug when renamed.
+        const slug = dirInput.dataset.slug || (data.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63);
+        const root = host && host.dataset.root ? host.dataset.root.replace(/\/+$/, "") : "";
+        const fallback = root ? `${root}/${slug || "<name>"}` : "";
+        if (!dirInput.dataset.slug || !dirInput.placeholder) {
+          dirInput.placeholder = fallback;
+          $$("[data-folder-default]", form).forEach((n) => { n.textContent = fallback || "the host's deploy root / instance name"; });
+        }
+        const folder = dirInput.value.trim() || dirInput.placeholder;
+        set("folder", folder);
+        const inRam = Boolean(host && host.dataset.unraid && folder && !/^\/(mnt|boot)(\/|$)/.test(folder));
+        $$("[data-unraid-warning]", form).forEach((n) => { n.hidden = !inRam; });
+      }
       set("env", Object.keys(data.env || {}).length + " variable(s)");
       const overrides = (data.port_overrides || []).map((o) => `${o.service} ${o.host} → ${o.container}`);
       set("ports", compose ? (overrides.length ? `Compose file, with ${overrides.join(", ")}` : "Defined by compose file") : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");

@@ -37,7 +37,7 @@ from slipway.models import (
     Role,
     User,
 )
-from slipway.services import switchyard
+from slipway.services import deployer, switchyard
 from slipway.services.auth import AuthContext
 from slipway.services.users import user_count
 from slipway.web.oauth import safe_next
@@ -399,7 +399,10 @@ async def host_detail(request: Request, db: DB, ctx: PageAuth, host_id: uuid.UUI
     claim_repos = (
         (await _form_context(db))["repos"] if ctx.can(Perm.INSTANCES_WRITE) and ctx.can(Perm.INSTANCES_READ) else []
     )
-    return await render(request, db, "host_detail.html", ctx, host=host, instances=instances, claim_repos=claim_repos)
+    return await render(
+        request, db, "host_detail.html", ctx, host=host, instances=instances, claim_repos=claim_repos,
+        root_in_ram=deployer.ram_backed(host, host.deploy_root),
+    )
 
 
 @router.get("/instances")
@@ -437,10 +440,19 @@ async def instance_detail(request: Request, db: DB, ctx: PageAuth, instance_id: 
     deployments = (await db.scalars(
         select(Deployment).options(NO_LOG).where(Deployment.instance_id == instance.id).order_by(Deployment.created_at.desc()).limit(10)
     )).all() if ctx.can(Perm.DEPLOYMENTS_READ) else []
+    folder = _folder(instance)
     return await render(
         request, db, "instance_detail.html", ctx, instance=instance, deployments=deployments,
         env_unreadable=await env_unreadable(db, instance),
+        folder=folder, folder_in_ram=bool(folder) and deployer.ram_backed(instance.host, folder),
     )
+
+
+def _folder(instance: Instance) -> str:
+    try:
+        return deployer.instance_dir(instance)
+    except deployer.DeployError:
+        return ""
 
 
 @router.get("/instances/{instance_id}/edit")
@@ -463,7 +475,7 @@ async def edit_instance(request: Request, db: DB, ctx: PageAuth, instance_id: uu
     return await render(
         request, db, "instance_form.html", ctx, instance=instance, env=instance.env or {},
         env_unreadable=await env_unreadable(db, instance), selected_repo=instance.repository, locked=locked,
-        paths_locked=paths_locked, **context,
+        paths_locked=paths_locked, folder=_folder(instance), **context,
     )
 
 

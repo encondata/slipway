@@ -55,6 +55,9 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     dockerfile_path: Mapped[str] = mapped_column(String(255), default="Dockerfile")
     build_context: Mapped[str] = mapped_column(String(255), default=".")
     compose_file: Mapped[str] = mapped_column(String(255), default="docker-compose.yml")
+    # The instance's own folder on the host (releases, shared settings, ``current``). None: a folder
+    # named after the slug in the host's deploy root, which moves with that root.
+    deploy_dir: Mapped[str | None] = mapped_column(String(255))
 
     env: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
     ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list)  # [{host, container, protocol}]

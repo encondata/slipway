@@ -346,6 +346,8 @@ class _InstanceFields(BaseModel):
     dockerfile_path: Annotated[str, Field(max_length=255), NoNul] | None = None
     build_context: Annotated[str, Field(max_length=255), NoNul] | None = None
     compose_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    # The instance's own folder on the host; "" goes back to <host deploy root>/<slug>.
+    deploy_dir: Annotated[str, Field(max_length=255), NoNul] | None = None
     env: dict[EnvKey, EnvValue] | None = Field(None, max_length=500)
     ports: list[PortMapping] | None = Field(None, max_length=100)
     volumes: list[VolumeMapping] | None = Field(None, max_length=100)
@@ -362,6 +364,11 @@ class _InstanceFields(BaseModel):
                 raise ValueError(f"{r.hostname} is listed twice")
             seen.add(r.hostname)
         return v
+
+    @field_validator("deploy_dir")
+    @classmethod
+    def _deploy_dir(cls, v: str | None) -> str | None:
+        return v if not v or not v.strip() else deployer.clean_instance_dir(v)
 
     @field_validator("port_overrides")
     @classmethod
@@ -406,6 +413,13 @@ class InstanceUpdate(_InstanceFields):
     clear_env: bool = False
 
 
+def _folder(i: Instance) -> str:
+    try:
+        return deployer.instance_dir(i)
+    except deployer.DeployError:
+        return ""
+
+
 class InstanceOut(Out):
     id: uuid.UUID
     name: str
@@ -430,6 +444,8 @@ class InstanceOut(Out):
     published_ports: list[dict[str, Any]]
     # The compose project name Slipway uses (a claimed project keeps its own).
     compose_project: str
+    deploy_dir: str | None = None
+    folder: str = ""  # where the instance's files are on the host
     routes: list[dict[str, Any]] = []
     proxy_entries: list[dict[str, Any]] = []
     # What the instance was claimed from, when it was claimed (see POST /hosts/{id}/claim).
@@ -463,6 +479,8 @@ class InstanceOut(Out):
             port_overrides=i.port_overrides or [],
             published_ports=i.published_ports or [],
             compose_project=i.compose_project,
+            deploy_dir=i.deploy_dir,
+            folder=_folder(i),
             routes=i.routes or [],
             proxy_entries=i.proxy_entries or [],
             claim=i.claim,
@@ -496,6 +514,8 @@ class ClaimIn(BaseModel):
     dockerfile_path: Annotated[str, Field(max_length=255), NoNul] | None = None
     build_context: Annotated[str, Field(max_length=255), NoNul] | None = None
     compose_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    # The instance's own folder on the host; default <host deploy root>/<slug>.
+    deploy_dir: Annotated[str, Field(max_length=255), NoNul] | None = None
     ports: list[PortMapping] | None = Field(None, max_length=100)  # Dockerfile mode; default: the container's
     volumes: list[VolumeMapping] | None = Field(None, max_length=100)  # Dockerfile mode; default: the container's
     auto_ports: bool | None = None
@@ -514,6 +534,11 @@ class ClaimIn(BaseModel):
     @classmethod
     def _ctx(cls, v: str | None) -> str | None:
         return None if v is None else deployer.clean_relative_path(v, allow_dot=True)
+
+    @field_validator("deploy_dir")
+    @classmethod
+    def _claim_deploy_dir(cls, v: str | None) -> str | None:
+        return None if not v or not v.strip() else deployer.clean_instance_dir(v)
 
 
 class ClaimOut(InstanceOut):

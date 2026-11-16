@@ -130,8 +130,9 @@ async def _deployed_instances(db: DB, host: Host) -> list[Instance]:
         Instance.current_commit_sha.is_not(None),
         Instance.last_deployed_at.is_not(None),
     )
-    stmt = select(Instance).where(Instance.host_id == host.id, ever_deployed).order_by(Instance.name)
-    return list(await db.scalars(stmt))
+    # Instances given a folder of their own don't live under the deploy root and stay where they are.
+    stmt = select(Instance).where(Instance.host_id == host.id, ever_deployed, Instance.deploy_dir.is_(None))
+    return list(await db.scalars(stmt.order_by(Instance.name)))
 
 
 async def _deploying(db: DB, instances: list[Instance]) -> bool:

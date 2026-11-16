@@ -95,11 +95,24 @@ async def test_move_refuses_when_the_target_is_taken(tmp_path, fake_docker):  # 
     env, _ = fake_docker
     old = _layout(tmp_path / "opt")
     (tmp_path / "srv" / "web-prod").mkdir(parents=True)
+    (tmp_path / "srv" / "web-prod" / "notes.txt").write_text("someone else's")
     host, inst = _on(tmp_path / "opt")
     save = _Saved()
     with pytest.raises(deployer.DeployError, match="already exists"):
         await deployer.move_deploy_root(host, [inst], str(tmp_path / "srv"), save=save, connect=_local(LocalRemote(env)))
     assert save.calls == 0 and (old / "current").is_symlink()
+    assert (tmp_path / "srv" / "web-prod" / "notes.txt").exists()
+
+
+async def test_move_into_an_empty_folder_made_in_advance(tmp_path, fake_docker):  # noqa: F811
+    env, _ = fake_docker
+    _layout(tmp_path / "opt")
+    (tmp_path / "srv" / "web-prod").mkdir(parents=True)  # e.g. an Unraid share folder made first
+    host, inst = _on(tmp_path / "opt")
+    save = _Saved()
+    await deployer.move_deploy_root(host, [inst], str(tmp_path / "srv"), save=save, connect=_local(LocalRemote(env)))
+    assert save.calls == 1 and (tmp_path / "srv" / "web-prod" / "current").is_symlink()
+    assert not (tmp_path / "opt" / "web-prod").exists()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads the locked file")

@@ -5,7 +5,9 @@ Pipeline for one deployment:
 1. Check the repository by its GitHub id, then resolve the branch to a commit SHA.
 2. Download the source tarball on the Slipway server (the GitHub token never reaches the host)
    and refuse it if the build context, Dockerfile or compose file path is a link.
-3. Upload it over SFTP and unpack into ``<deploy_root>/<slug>/releases/<sha12>-<deployment>``.
+3. Upload it over SFTP and unpack into ``<folder>/releases/<sha12>-<deployment>``, where the
+   instance's folder is ``Instance.deploy_dir`` or else ``<host deploy root>/<slug>``. Slipway marks
+   the folder as the instance's (``.slipway-instance``) and refuses one holding other files.
 4. Write ``shared/.env`` (mode 600) from the instance's encrypted environment variables.
    Compose mode writes them to ``shared/slipway.env`` and builds ``shared/.env`` on the host
    from the repository's ``.env`` followed by Slipway's values, so Slipway's values win. (A repository
@@ -126,6 +128,36 @@ def clean_deploy_root(value: str) -> str:
     return norm
 
 
+# Folders an instance's own folder may never be, or be inside of: the system's, and the roots that hold
+# other data (Unraid's shares and disks among them). ``rm`` runs inside an instance's folder, so this
+# keeps a typo from pointing it at one of them.
+_RESERVED_DIRS = frozenset({
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/media", "/mnt", "/opt", "/proc", "/root",
+    "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var", "/var/lib", "/mnt/user", "/mnt/user0", "/mnt/cache",
+    "/mnt/disks", "/mnt/remotes", "/mnt/addons", "/mnt/rootshare", "/mnt/user/appdata", "/mnt/user/system",
+    "/mnt/user/domains", "/mnt/user/isos",
+})
+_RESERVED_TREES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/sbin", "/sys", "/usr", "/var/lib/docker")
+_DISK_RE = re.compile(r"^/mnt/(?:disk\d+|cache[\w-]*|pool[\w-]*)$")
+
+
+def clean_instance_dir(value: str) -> str:
+    """An instance's own folder: absolute, safe, and not a system folder or a root that holds other data."""
+    try:
+        norm = clean_deploy_root(value)
+    except ValueError:
+        raise ValueError("The folder must be an absolute path such as /mnt/user/appdata/my-app") from None
+    if norm in _RESERVED_DIRS or _DISK_RE.match(norm) or any(_inside(norm, t) for t in _RESERVED_TREES):
+        raise ValueError(f"{norm} is a system folder or holds other data; give the instance a folder of its own, "
+                         "such as /mnt/user/appdata/my-app")
+    return norm
+
+
+def ram_backed(host: Host, path: str) -> bool:
+    """On Unraid only /boot and /mnt survive a restart; the rest of the filesystem lives in RAM."""
+    return (host.os_info or "").startswith("Unraid") and not (_inside(path, "/mnt") or _inside(path, "/boot"))
+
+
 def clean_env(env: dict[str, str]) -> dict[str, str]:
     for key, value in env.items():
         if not ENV_KEY_RE.match(key):
@@ -174,8 +206,15 @@ def render_compose_env(env: dict[str, str]) -> str:
 
 @dataclass(frozen=True)
 class InstancePaths:
+    """An instance's folder on its host, ``root/slug``: ``slug`` is the folder's own name (for a folder
+    the instance was given, not necessarily the instance's slug)."""
+
     root: str
     slug: str
+
+    @classmethod
+    def of(cls, base: str) -> InstancePaths:
+        return cls(posixpath.dirname(base), posixpath.basename(base))
 
     @property
     def base(self) -> str:
@@ -219,10 +258,61 @@ class InstancePaths:
         return f"{self.releases}/{sha[:12]}-{deployment_id.hex[:8]}"
 
 
-def paths_for(instance: Instance) -> InstancePaths:
+def instance_dir(instance: Instance, host: Host | None = None) -> str:
+    """The instance's folder on its host: ``deploy_dir``, or ``<host deploy root>/<slug>``."""
     if not SLUG_RE.match(instance.slug):
         raise DeployError(f"Invalid instance slug {instance.slug!r}")
-    return InstancePaths(clean_deploy_root(instance.host.deploy_root), instance.slug)
+    try:
+        if instance.deploy_dir:
+            return clean_instance_dir(instance.deploy_dir)
+        return f"{clean_deploy_root((host or instance.host).deploy_root)}/{instance.slug}"
+    except ValueError as exc:
+        raise DeployError(str(exc)) from exc
+
+
+def paths_for(instance: Instance) -> InstancePaths:
+    return InstancePaths.of(instance_dir(instance))
+
+
+MARKER_FILE = ".slipway-instance"
+# What Slipway puts in an instance's folder; nothing else in it is ever removed.
+SLIPWAY_ENTRIES = ("releases", "shared", "current", MARKER_FILE)
+DIR_MARK = "slipway-dir:"
+
+
+def take_dir_command(instance: Instance) -> str:
+    """Create the instance's folder or accept it, and mark it as the instance's.
+
+    A folder is accepted when it is new or empty, already marked as this instance's, or holds only
+    what Slipway puts there (a folder from before the marker). Otherwise prints a ``DIR_MARK`` line
+    and fails, before anything is written.
+    """
+    paths = paths_for(instance)
+    base, marker, me = q(paths.base), q(f"{paths.base}/{MARKER_FILE}"), q(str(instance.id))
+    keep = " ".join(f"-e {q(n)}" for n in SLIPWAY_ENTRIES)
+    return (
+        f"mkdir -p -- {base} 2>/dev/null; [ -d {base} ] && [ -w {base} ] || {{ echo {q(DIR_MARK + ' not-writable')}; exit 1; }}; "
+        f"if [ -f {marker} ]; then owner=$(head -n 1 {marker}); "
+        f'[ "$owner" = {me} ] || {{ echo "{DIR_MARK} owner $owner"; exit 1; }}; '
+        f"else other=$(ls -A {base} | grep -v -x {keep} | head -n 5 | tr '\\n' ' '); "
+        f'[ -z "$other" ] || {{ echo "{DIR_MARK} other $other"; exit 1; }}; fi; '
+        f"printf '%s\\n' {me} > {marker}"
+    )
+
+
+def take_dir_error(instance: Instance, output: str) -> DeployError:
+    paths, host = paths_for(instance), instance.host
+    line = next((ln.split(DIR_MARK, 1)[1].strip() for ln in output.splitlines() if DIR_MARK in ln), "")
+    if line.startswith("owner"):
+        return DeployError(f"{paths.base} on {host.name} belongs to another Slipway instance; give this one its own folder")
+    if line.startswith("other"):
+        found = line.removeprefix("other").strip()
+        return DeployError(f"{paths.base} on {host.name} already holds files that are not Slipway's ({found}); "
+                           "choose an empty or new folder")
+    return DeployError(
+        f"Slipway can't create or write to {paths.base} on {host.name} as {host.username}. On the host, run: "
+        f"sudo mkdir -p {q(paths.base)} && sudo chown {q(host.username)} {q(paths.base)}"
+    )
 
 
 def _project_dir(instance: Instance, release_dir: str) -> str:
@@ -573,6 +663,9 @@ async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_sess
         status, output = await remote.run(remove_dir_command(instance), check=False, timeout=600)
     if status == 0:
         return None
+    left = left_behind(output)
+    if left is not None:
+        return f"Kept {paths.base} on {instance.host.name}: it also holds files Slipway did not put there ({left})"
     detail = clean_text(output.strip().splitlines()[-1])[:200] if output.strip() else ""
     return f"Could not remove {paths.base} on {instance.host.name}; delete it by hand" + (f" ({detail})" if detail else "")
 
@@ -593,12 +686,20 @@ def _inside(path: str, directory: str) -> bool:
     return path == directory or path.startswith(directory + "/")
 
 
+Move = tuple[Instance, InstancePaths, InstancePaths]
+
+
 def check_move(instances: list[Instance], old_root: str, new_root: str) -> None:
     """Raise DeployError when the instances' directories can't move from ``old_root`` to ``new_root``."""
-    for inst in instances:
-        old, new = InstancePaths(old_root, inst.slug).base, InstancePaths(new_root, inst.slug).base
+    _check_moves([(inst, InstancePaths(old_root, inst.slug), InstancePaths(new_root, inst.slug)) for inst in instances],
+                 new_root)
+
+
+def _check_moves(moves: list[Move], target: str) -> None:
+    for inst, old_paths, new_paths in moves:
+        old, new = old_paths.base, new_paths.base
         if _inside(new, old) or _inside(old, new):
-            raise DeployError(f"{new_root} overlaps {old}, which holds {inst.name}; choose a folder outside it")
+            raise DeployError(f"{target} overlaps {old}, which holds {inst.name}; choose a folder outside it")
         if _claim_dir_inside(inst, old) or _claim_dir_inside(inst, new):
             raise DeployError(
                 f"The directory {inst.name} was claimed from overlaps {old} or {new}; choose another folder"
@@ -610,13 +711,21 @@ def _moving(paths: InstancePaths) -> str:
     return f"{paths.root}/.{paths.slug}.moving"
 
 
-def move_prepare_command(new_root: str, slugs: list[str]) -> str:
-    """Create the new root and check nothing is in the way; on failure prints a MOVE_MARK line."""
-    r = q(new_root)
-    parts = [f"mkdir -p -- {r} 2>/dev/null; [ -d {r} ] && [ -w {r} ] || {{ echo {q(MOVE_MARK + ' not-writable')}; exit 1; }}"]
-    for slug in slugs:
-        base = f"{new_root}/{slug}"
-        parts.append(f"if [ -e {q(base)} ] || [ -L {q(base)} ]; then echo {q(f'{MOVE_MARK} exists {base}')}; exit 1; fi")
+def move_prepare_command(new: list[InstancePaths]) -> str:
+    """Create the new folders' parents and check nothing is in the way; on failure prints a MOVE_MARK line.
+
+    A new folder may already exist if it is empty (made in advance, say); it is removed so the copy
+    can take its name.
+    """
+    parts = []
+    for root in dict.fromkeys(p.root for p in new):
+        r = q(root)
+        parts.append(f"mkdir -p -- {r} 2>/dev/null; [ -d {r} ] && [ -w {r} ] || "
+                     f"{{ echo {q(f'{MOVE_MARK} not-writable {root}')}; exit 1; }}")
+    for p in new:
+        base = q(p.base)
+        parts.append(f"if [ -L {base} ] || {{ [ -e {base} ] && ! rmdir -- {base} 2>/dev/null; }}; "
+                     f"then echo {q(f'{MOVE_MARK} exists {p.base}')}; exit 1; fi")
     return "; ".join(parts)
 
 
@@ -667,11 +776,29 @@ def bind_sources_command(instance: Instance) -> str:
     )
 
 
+LEFT_MARK = "slipway-left:"
+
+
 def _remove_base_command(paths: InstancePaths) -> str:
-    return (
-        f"rm -rf -- {q(paths.base)} 2>/dev/null || {_root_rm(q(paths.root), q(paths.slug))}; "
-        f"test ! -e {q(paths.base)}"
+    """Remove what Slipway put in the folder, then the folder if nothing else is in it.
+
+    Files someone else put there stay: the command then prints ``LEFT_MARK`` and their names, and
+    fails. Files containers wrote as root are removed through a throwaway container.
+    """
+    base = q(paths.base)
+    parts = [f"[ -e {base} ] || [ -L {base} ] || exit 0; cd {base} || exit 1"]
+    for name in ("releases", "shared"):
+        parts.append(f"{{ rm -rf -- {name} 2>/dev/null || {_root_rm(base, name)} >/dev/null 2>&1; }}")
+    parts.append(f"rm -f -- current {MARKER_FILE}; cd / && rmdir -- {base} 2>/dev/null")
+    parts.append(
+        f"if [ -e {base} ]; then echo \"{LEFT_MARK} $(ls -A {base} | head -n 5 | tr '\\n' ' ')\"; exit 1; fi"
     )
+    return "; ".join(parts)
+
+
+def left_behind(output: str) -> str | None:
+    """The names ``_remove_base_command`` reported as not Slipway's, or None."""
+    return next((ln.split(LEFT_MARK, 1)[1].strip() for ln in output.splitlines() if LEFT_MARK in ln), None)
 
 
 def _last_line(output: str) -> str:
@@ -696,16 +823,39 @@ async def move_deploy_root(
     old_root, new_root = clean_deploy_root(host.deploy_root), clean_deploy_root(new_root)
     check_move(instances, old_root, new_root)
     moves = [(inst, InstancePaths(old_root, inst.slug), InstancePaths(new_root, inst.slug)) for inst in instances]
+    return await _move_dirs(host, moves, new_root, save=save, connect=connect)
+
+
+async def move_instance_dir(
+    instance: Instance,
+    new_dir: str,
+    *,
+    save: Callable[[], Awaitable[None]],
+    connect: ConnectFactory = ssh.open_session,
+) -> list[str]:
+    """Move one instance's folder to ``new_dir`` (any folder of its own on the host), as ``move_deploy_root`` does."""
+    try:
+        new = InstancePaths.of(clean_instance_dir(new_dir))
+    except ValueError as exc:
+        raise DeployError(str(exc)) from exc
+    moves: list[Move] = [(instance, paths_for(instance), new)]
+    _check_moves(moves, new.base)
+    return await _move_dirs(instance.host, moves, new.base, save=save, connect=connect)
+
+
+async def _move_dirs(
+    host: Host, moves: list[Move], target: str, *, save: Callable[[], Awaitable[None]], connect: ConnectFactory,
+) -> list[str]:
     notes: list[str] = []
     async with connect(ssh.SSHTarget.from_host(host)) as remote:
-        status, output = await remote.run(
-            move_prepare_command(new_root, [inst.slug for inst in instances]), check=False, timeout=60
-        )
+        status, output = await remote.run(move_prepare_command([new for _, _, new in moves]), check=False, timeout=60)
         if status:
             if f"{MOVE_MARK} not-writable" in output:
+                where = next((ln.split(" not-writable ", 1)[1].strip() for ln in output.splitlines()
+                              if f"{MOVE_MARK} not-writable " in ln), target)
                 raise DeployError(
-                    f"Slipway can't create or write to {new_root} on {host.name} as {host.username}. On the host, run: "
-                    f"sudo mkdir -p {q(new_root)} && sudo chown {q(host.username)} {q(new_root)}"
+                    f"Slipway can't create or write to {where} on {host.name} as {host.username}. On the host, run: "
+                    f"sudo mkdir -p {q(where)} && sudo chown {q(host.username)} {q(where)}"
                 )
             taken = next((line.split(" exists ", 1)[1] for line in output.splitlines() if f"{MOVE_MARK} exists " in line), "")
             raise DeployError(
@@ -726,7 +876,7 @@ async def move_deploy_root(
                 if status:
                     detail = _last_line(output)
                     raise DeployError(
-                        f"Could not copy {old.base} to {new_root} on {host.name}"
+                        f"Could not copy {old.base} to {new.base} on {host.name}"
                         + (f" ({detail})" if detail else "") + ". Nothing was changed."
                     )
                 if f"{MOVE_MARK} absent" in output:
@@ -739,7 +889,7 @@ async def move_deploy_root(
                 status, output = await remote.run(command, check=False, timeout=120)
                 if status:
                     detail = _last_line(output)
-                    raise DeployError(f"Could not move the copies into {new_root}" + (f" ({detail})" if detail else "")
+                    raise DeployError(f"Could not move the copies into {target}" + (f" ({detail})" if detail else "")
                                       + ". Nothing was changed.")
             await save()
         except BaseException:
@@ -763,6 +913,10 @@ async def move_deploy_root(
                 notes.append(f"Could not remove {old.base} ({exc}); delete it by hand.")
                 continue
             if status:
+                left = left_behind(output)
+                if left is not None:
+                    notes.append(f"Kept {old.base}: it also holds files Slipway did not put there ({left}).")
+                    continue
                 detail = _last_line(output)
                 notes.append(f"Could not remove {old.base}; delete it by hand" + (f" ({detail})." if detail else "."))
     return notes
@@ -1253,6 +1407,14 @@ async def _install(
     upload = f"{paths.releases}/.upload-{deployment_id.hex}.tar.gz"
     compose = instance.build_source == BuildSource.COMPOSE
     claimed_running = stopped_claimed = False  # the claimed container ran / this deploy stopped it
+    status, output = await remote.run(take_dir_command(instance), check=False, timeout=60)
+    if status:
+        raise take_dir_error(instance, output)
+    if ram_backed(instance.host, paths.base):
+        await sink.line(
+            f"Warning: {instance.host.name} runs Unraid, which clears {paths.base} when it restarts. Set the instance's "
+            "folder (or the host's deploy root) to a path under /mnt/user, such as /mnt/user/appdata; Slipway moves the files."
+        )
     await remote.run(f"mkdir -p {q(paths.releases)} {q(paths.shared)}")
     try:
         await remote.put(tarball, upload)
