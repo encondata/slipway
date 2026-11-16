@@ -153,6 +153,8 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         env=body.env or {},
         ports=[p.model_dump() for p in body.ports or []],
         volumes=[v.model_dump() for v in body.volumes or []],
+        auto_ports=True if body.auto_ports is None else body.auto_ports,
+        port_overrides=[o.model_dump() for o in body.port_overrides or []],
         status=InstanceStatus.CREATED,
         created_by_id=ctx.user.id,
     )
@@ -224,6 +226,10 @@ async def _apply_update(
         instance.ports = [p.model_dump() for p in body.ports]
     if body.volumes is not None:
         instance.volumes = [v.model_dump() for v in body.volumes]
+    if body.auto_ports is not None:
+        instance.auto_ports = body.auto_ports
+    if body.port_overrides is not None:
+        instance.port_overrides = [o.model_dump() for o in body.port_overrides]
     changed = sorted(k for k in data if k not in ("env", "clear_env"))
     # Stored values that can't be decrypted are kept, since the old key may still recover them, and the
     # deploy guard keeps refusing to run without them. Only re-entered variables (a non-empty env) or

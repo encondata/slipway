@@ -443,7 +443,8 @@
       set("host", host ? host.dataset.label : "");
       set("name", data.name);
       set("env", Object.keys(data.env || {}).length + " variable(s)");
-      set("ports", compose ? "Defined by compose file" : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");
+      const overrides = (data.port_overrides || []).map((o) => `${o.service} ${o.host} → ${o.container}`);
+      set("ports", compose ? (overrides.length ? `Compose file, with ${overrides.join(", ")}` : "Defined by compose file") : (data.ports || []).map((p) => `${p.host} → ${p.container} (${(p.protocol || "tcp").toUpperCase()})`).join(", ") || "None");
       set("volumes", compose ? "Defined by compose file" : (data.volumes || []).map((v) => `${v.source} → ${v.target}`).join(", ") || "None");
     };
     form.addEventListener("input", update);
