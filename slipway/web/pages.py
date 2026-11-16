@@ -310,12 +310,10 @@ async def overview(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
         "today": len(today_deps),
         "today_failed": sum(1 for d in today_deps if d.status == DeploymentStatus.FAILED),
     }
-    hour = datetime.now().hour
-    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
     return await render(
         request, db, "overview.html", ctx,
         stats=stats, repos=repos[:5], hosts=hosts[:5], recent=recent, summaries=summaries,
-        steps=steps, setup_done=all(done for _, done, _ in steps), greeting=greeting,
+        steps=steps, setup_done=all(done for _, done, _ in steps),
     )
 
 
