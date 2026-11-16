@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Settings of {{ env.name }}{% endblock %}
+
+{% macro env_row(k="", v="") -%}
+<div class="repeater-row env">
+  <input class="input mono" data-k value="{{ k }}" placeholder="KEY" aria-label="Variable name">
+  <input class="input mono" data-v value="{{ v }}" placeholder="value" type="password" autocomplete="off" aria-label="Variable value">
+  <span class="row" style="gap:2px">
+    <button class="icon-btn" type="button" data-reveal title="Show / hide">{{ icon("search", "i-sm") }}</button>
+    <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+  </span>
+</div>
+{%- endmacro %}
+
+{% block content %}
+{% set traffic = env.traffic or {} %}
+{% set dns = traffic.get("dns") %}
+<div class="page-head">
+  <div>
+    <div class="breadcrumb"><a href="/environments">Environments</a>{{ icon("chevron-right", "i-sm") }}<a href="/environments/{{ env.id }}">{{ env.name }}</a>{{ icon("chevron-right", "i-sm") }}<span>Settings</span></div>
+    <h1>Settings of {{ env.name }}</h1>
+    <p class="lede">{{ env.repository.full_name }} · <span class="mono">{{ env.branch }}</span> · <span class="mono">{{ env.manifest_file }}</span>. Changes reach each slot with its next deploy.</p>
+  </div>
+</div>
+
+{% if not can_write %}<div class="callout">{{ icon("info") }}<span>{% if env.is_deleted %}{{ env.name }} was deleted: its settings are shown as they were.{% else %}Read only: changing these needs the environments:write permission.{% endif %}</span></div>{% endif %}
+
+<form class="stack" method="post" action="/js-required" data-form="PATCH /api/v1/environments/{{ env.id }}" data-then="reload"
+      data-success="Saved. The next deploy to each slot uses these settings."
+      data-app-form data-repo-select="#edit-repo" data-branch-select="#edit-branch" data-settings-field="settings" data-services-field="services"
+      data-settings='{{ (env.app_settings or {})|tojson }}' data-services='{{ env.app_services|tojson }}' data-fallback='{{ fallback|tojson }}'>
+  <fieldset class="plain-fieldset stack" {{ '' if can_write else 'disabled' }}>
+  <input type="radio" name="build_source" value="app" checked hidden data-no-send>
+  <select id="edit-repo" hidden disabled><option value="{{ env.repository_id }}" selected data-full-name="{{ env.repository.full_name }}">{{ env.repository.full_name }}</option></select>
+  <select id="edit-branch" hidden disabled><option selected>{{ env.branch }}</option></select>
+  <input type="hidden" name="manifest_file" value="{{ env.manifest_file }}" disabled>
+
+  <section class="card">
+    <div class="card-head"><span class="head-icon accent">{{ icon("settings", "i-lg") }}</span><div><h2>Settings</h2><p>The settings, optional services and variables of slipway.yml at the head of <span class="mono">{{ env.branch }}</span>.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <input type="hidden" name="settings" data-type="json">
+      <input type="hidden" name="services" data-type="json">
+      <div data-app-status><p class="muted">Reading slipway.yml…</p></div>
+      <div class="form-grid" data-app-settings></div>
+      <div class="field" data-app-services-field hidden>
+        <span class="label-text">Optional services</span>
+        <div class="row" style="flex-wrap: wrap; gap: 8px 20px" data-app-services></div>
+      </div>
+      <div data-app-summary></div>
+      <div class="field">
+        <span class="label-text">Environment variables</span>
+        {% if env_unreadable %}<div class="callout warning">{{ icon("alert") }}<span>The stored variables could not be decrypted (wrong <code>SLIPWAY_ENCRYPTION_KEY</code>?). Saving here replaces them with what you enter.</span></div>{% endif %}
+        {% if can_write %}
+        <div class="repeater" id="env-vars" data-repeater="env" data-kind="map">
+          {% for k, v in env_vars|dictsort %}{{ env_row(k, v) }}{% endfor %}
+          <template>{{ env_row() }}</template>
+        </div>
+        <div><button class="btn btn-sm" type="button" data-add-row="#env-vars">{{ icon("plus", "i-sm") }} Add variable</button></div>
+        {% else %}
+        <div>{% for k in (env.env or {}).keys()|sort %}<span class="chip mono">{{ k }}</span> {% else %}<span class="muted">None</span>{% endfor %}</div>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><span class="head-icon">{{ icon("globe", "i-lg") }}</span><div><h2>Traffic</h2><p>How the public names reach the slots.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      {% if env.hostnames %}
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Public name</th><th>Follows</th><th>TLS</th></tr></thead>
+        <tbody>{% for h in env.hostnames %}
+          {%- set chosen = (env.route_tls or {}).get(h.hostname, "") %}
+          <tr><td class="mono">{{ h.hostname }}</td><td>{{ "The data server" if h.follows == "server" else "The live slot" }}</td>
+            <td><select class="input" data-map="route_tls" data-map-key="{{ h.hostname }}" aria-label="TLS for {{ h.hostname }}">
+              <option value="" {{ 'selected' if not chosen }}>Switchyard's default ({{ default_tls }})</option>
+              {% for value, label in tls_modes %}<option value="{{ value }}" {{ 'selected' if chosen == value }}>{{ label }}</option>{% endfor %}
+            </select></td></tr>
+        {% endfor %}</tbody>
+      </table></div>
+      {% endif %}
+      <div class="field">
+        <span class="label-text">Switch</span>
+        <div class="row wrap" style="gap: 8px 20px">
+          <label class="check"><input type="radio" name="traffic.switch" value="switchyard" {{ 'checked' if traffic.get("switch") == "switchyard" }} {{ 'disabled' if not switchyard_configured and traffic.get("switch") != "switchyard" }}><span>Switchyard{% if traffic_address %} <span class="subtle mono">({{ traffic_address }})</span>{% endif %}</span></label>
+          <label class="check"><input type="radio" name="traffic.switch" value="none" {{ 'checked' if traffic.get("switch", "none") == "none" }} {{ 'disabled' if two }}><span>None{% if two %} <span class="subtle">(Blue/Green moves its names in Switchyard)</span>{% endif %}</span></label>
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" name="dns_on" data-no-send {{ 'checked' if dns }} {{ 'disabled' if not cloudflare and not dns }}><span>Publish DNS records in Cloudflare{% if cloudflare %} <span class="subtle">({{ cloudflare.zone }})</span>{% else %} <span class="subtle">(set it up in Settings → Integrations first)</span>{% endif %}</span></label>
+      <div class="form-grid" data-show-when="dns_on=on" {{ '' if dns else 'hidden' }}>
+        <div class="field">
+          <label for="edit-dns-address">Address</label>
+          <input class="input mono" id="edit-dns-address" name="traffic.dns.address" value="{{ (dns or {}).get('address') or '' }}" placeholder="{{ cloudflare.public_ip if cloudflare else '' }}" autocomplete="off" spellcheck="false">
+          <span class="help">Empty uses the public IP set in Settings → Integrations.</span>
+        </div>
+        <label class="check" style="align-self: end"><input type="checkbox" name="traffic.dns.proxied" {{ 'checked' if (dns or {}).get('proxied', cloudflare.proxied if cloudflare else False) }}><span>Proxied</span></label>
+      </div>
+      {% if dns %}<label class="check" data-show-when="dns_on=" hidden><input type="checkbox" name="traffic.forget_lost_zone"><span>Forget the records whose zone is gone <span class="subtle">(when the Cloudflare zone was deleted or moved to another account, its records went with it; Slipway deletes nothing)</span></span></label>{% endif %}
+      {% if two %}<label class="check"><input type="checkbox" name="auto_activate" {{ 'checked' if env.auto_activate }}><span><strong>Activate automatically when the smoke test passes</strong></span></label>{% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><span class="head-icon">{{ icon("database", "i-lg") }}</span><div><h2>Data</h2><p>The data owner's backups and starter content.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="field">
+        <label for="edit-keep-backups">Backups to keep</label>
+        <input class="input" id="edit-keep-backups" name="keep_backups" type="number" min="1" max="100" style="max-width: 140px" value="{{ owner.keep_backups if owner and owner.keep_backups else 5 }}">
+      </div>
+      {% if owner and not owner.current_commit_sha %}
+      <label class="check"><input type="checkbox" name="seed_content" {{ 'checked' if owner.seed_content }}><span><strong>Add starter content</strong> <span class="subtle">(at the first Activate)</span></span></label>
+      {% endif %}
+    </div>
+  </section>
+  </fieldset>
+
+  {% if can_write %}
+  <div class="row" style="gap: 8px; justify-content: flex-end">
+    <a class="btn" href="/environments/{{ env.id }}">Cancel</a>
+    <button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button>
+  </div>
+  {% endif %}
+</form>
+{% endblock %}

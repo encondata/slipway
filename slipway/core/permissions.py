@@ -34,6 +34,10 @@ class Perm(StrEnum):
     DATA_RESET = "data:reset"
     SNAPSHOTS_UPLOAD = "snapshots:upload"
     SNAPSHOTS_DOWNLOAD = "snapshots:download"
+    ENVIRONMENTS_READ = "environments:read"
+    ENVIRONMENTS_WRITE = "environments:write"
+    ENVIRONMENTS_DELETE = "environments:delete"
+    TRAFFIC_SWITCH = "traffic:switch"
 
 
 PERMISSION_DESCRIPTIONS: dict[str, str] = {
@@ -78,6 +82,16 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
         "Download snapshots as passphrase-encrypted files, and seed instances of another repository from them "
         "(privileged: a snapshot holds a whole database and its identity keys)"
     ),
+    Perm.ENVIRONMENTS_READ: "View environments, their slots, traffic and DNS records",
+    Perm.ENVIRONMENTS_WRITE: (
+        "Create and configure environments and add slots (privileged: like instances:write, an environment "
+        "runs its branch's slipway.yml commands on every host it uses)"
+    ),
+    Perm.ENVIRONMENTS_DELETE: "Remove slots and delete environments (the name must be typed)",
+    Perm.TRAFFIC_SWITCH: (
+        "Move an environment's traffic to a slot (activate, switch back), publish its names (Switchyard and DNS), "
+        "claim records, resolve a stuck switch and discard a failed idle slot"
+    ),
 }
 
 ALL_PERMISSIONS: list[str] = [p.value for p in Perm]
@@ -90,6 +104,7 @@ _READ_ALL = [
     Perm.ANALYTICS_READ,
     Perm.LOGS_READ,
     Perm.DATA_READ,
+    Perm.ENVIRONMENTS_READ,
 ]
 
 SYSTEM_ROLES: dict[str, dict[str, object]] = {
@@ -99,7 +114,8 @@ SYSTEM_ROLES: dict[str, dict[str, object]] = {
     },
     "maintainer": {
         "description": (
-            "Manages hosts, instances, deployments and their data. Cannot manage users or roles, or download snapshots."
+            "Manages hosts, instances, environments, deployments and their data. Cannot manage users or roles, "
+            "or download snapshots."
         ),
         "permissions": [
             *_READ_ALL,
@@ -112,13 +128,19 @@ SYSTEM_ROLES: dict[str, dict[str, object]] = {
             Perm.DATA_RESTORE,
             Perm.DATA_RESET,
             Perm.SNAPSHOTS_UPLOAD,
+            Perm.ENVIRONMENTS_WRITE,
+            Perm.ENVIRONMENTS_DELETE,
+            Perm.TRAFFIC_SWITCH,
             Perm.USERS_READ,
             Perm.ROLES_READ,
             Perm.AUDIT_READ,
         ],
     },
     "developer": {
-        "description": "Deploys and operates existing instances, and backs up and restores their data.",
+        "description": (
+            "Deploys and operates existing instances and environments, switches environments' traffic, "
+            "and backs up and restores their data."
+        ),
         "permissions": [
             *_READ_ALL,
             Perm.REPOS_SYNC,
@@ -126,10 +148,13 @@ SYSTEM_ROLES: dict[str, dict[str, object]] = {
             Perm.DEPLOYMENTS_CREATE,
             Perm.DATA_BACKUP,
             Perm.DATA_RESTORE,
+            Perm.TRAFFIC_SWITCH,
         ],
     },
     "viewer": {
-        "description": "Read-only access to repositories, hosts, instances, deployments, backups and snapshots.",
+        "description": (
+            "Read-only access to repositories, hosts, instances, environments, deployments, backups and snapshots."
+        ),
         "permissions": list(_READ_ALL),
     },
 }

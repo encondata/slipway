@@ -627,3 +627,32 @@ a.badge:hover { text-decoration: none; }
 @media (max-width: 560px) {
   .table.backups td.actions-cell .subtle { max-width: 200px; }
 }
+
+/* Environments (phase 3): slot chips, the Traffic card, the New environment flow */
+.slot-chip.live { background: var(--success-soft); color: var(--success-text); border-color: transparent; }
+.slot-chip.data { background: var(--primary-soft); color: var(--primary-text); border-color: transparent; }
+.env-chip { margin-left: 6px; font-size: 12px; padding: 1px 8px; background: var(--primary-soft); color: var(--primary-text); border-color: transparent; }
+.member-banner a { font-weight: 650; }
+.plain-list { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 13.5px; }
+.plain-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.plan-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; }
+.plan-list li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.plan-list li.blocked { color: var(--error-text); }
+.error-text { color: var(--error-text); font-weight: 600; }
+.table.traffic td { vertical-align: middle; }
+.table.traffic td .subtle { white-space: normal; }
+.flow-stepper { list-style: none; margin: 0; padding: 0; }
+.flow-stepper .step.done { color: var(--text); }
+.flow-stepper .step.done b { background: var(--primary-soft); border-color: var(--primary); color: var(--primary-text); }
+.flow-stepper .step[aria-current="step"] { color: var(--primary-text); font-weight: 650; }
+.env-flow[data-env-flow] .flow-step:not(.current) { display: none; }
+.env-flow [aria-invalid="true"] { border-color: var(--error); box-shadow: 0 0 0 3px var(--error-soft); }
+.flow-foot { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.flow-foot .spacer { flex: 1; }
+.advanced summary { cursor: pointer; font-weight: 600; color: var(--text-muted); font-size: 13.5px; }
+@media (max-width: 720px) {
+  .flow-stepper { gap: 8px; }
+  .flow-stepper .line { display: none; }
+  .flow-stepper .step { font-size: 13px; }
+}
+.card > [data-load] > p.callout { margin: 0 20px 18px; }

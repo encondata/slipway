@@ -23,6 +23,7 @@ from slipway.models import (
     Backup,
     BackupStatus,
     BuildSource,
+    DataMode,
     Deployment,
     DeploymentKind,
     DeploymentStatus,
@@ -60,7 +61,7 @@ from slipway.schemas import (
     instance_outs,
     seeding_needs_download,
 )
-from slipway.services import audit, data, deployer, manifest, snapshots, ssh, switchyard
+from slipway.services import audit, data, deployer, environments, jobs, manifest, snapshots, ssh, switchyard
 from slipway.services.auth import AuthContext
 from slipway.services.github import GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
@@ -96,10 +97,62 @@ ALREADY_CREATED = "The first admin was already created; change their password in
 
 
 def confirmed(instance: Instance, confirm: str | None) -> None:
-    """Typed confirmation (§13): the instance's name exactly, case and spaces included. Checked first."""
-    if confirm != instance.name:
-        raise HTTPException(UNPROCESSABLE,
-                            f"Type the instance's name, {instance.name}, exactly to confirm")
+    """Typed confirmation (§13): the instance's name exactly, case and spaces included. Checked first.
+
+    For a member of an environment it is the environment's name (phase 3 D20), the name people see on the
+    environment page (``data.confirm_name``)."""
+    name = data.confirm_name(instance)
+    if confirm != name:
+        what = "environment's" if instance.environment_id is not None else "instance's"
+        raise HTTPException(UNPROCESSABLE, f"Type the {what} name, {name}, exactly to confirm")
+
+
+def _env_name(instance: Instance) -> str:
+    """The name of the environment ``instance`` is a member of (its selectin-loaded row)."""
+    env = data.loaded_environment(instance)
+    return env.name if env is not None else "its environment"
+
+
+def member_text(instance: Instance) -> str:
+    """Why a member's own settings can't change on the instance (phase 3 §11)."""
+    return (f"{instance.name} is the {instance.slot} slot of environment {_env_name(instance)}: change it on the "
+            "environment")
+
+
+async def _refuse_shared_data(db: AsyncSession, instance: Instance) -> None:
+    """An app slot in mode ``server`` has no data of its own: its environment's lives on the data server (§7.3).
+    409 with ``data_shared_reason``. The data owner, mode ``slot`` slots and standalone instances pass."""
+    if instance.environment_id is None:
+        return
+    env = await environments.environment_of(db, instance)
+    if not data.is_shared_slot(instance, env):
+        return
+    owner = await environments.owner_of(db, instance)
+    raise HTTPException(status.HTTP_409_CONFLICT,
+                        data.data_shared_reason(instance, environment=env,
+                                                owner=owner if owner is not instance else None))
+
+
+async def _app_job_owner(db: AsyncSession, instance: Instance) -> tuple[Instance, Instance]:
+    """Create it now and Add starter content: (the instance the job is queued on, the instance the app runs in).
+    In mode ``server`` the job is the data owner's whether it is asked on an app slot or on the data server, and
+    the app runs on the active slot, or with none on the lead slot (phase 3 §7.3, deployer ``_on_lead``); 409
+    when no app slot has been deployed. Elsewhere both are the instance itself."""
+    env = await environments.environment_of(db, instance) if instance.environment_id is not None else None
+    if env is None or env.data_mode == DataMode.SLOT:
+        return instance, instance
+    members = await environments.members(db, env)
+    owner = environments.owner_in(env, members)
+    if owner is None:
+        await _refuse_shared_data(db, instance)
+        return instance, instance
+    lead = environments.lead_slot(env, members)
+    if lead is None or lead.slot not in environments.APP_SLOTS or not lead.current_commit_sha:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"No app slot of {env.name} has been deployed yet: deploy one first")
+    if environments.stale_of(lead):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Deploy to {lead.slot} first: it was stopped when the data was "
+                                                      "restored")
+    return owner, lead
 
 
 def need(ctx: AuthContext, *permissions: str, message: str | None = None) -> None:
@@ -114,7 +167,8 @@ def _snapshots_error(exc: snapshots.SnapshotsError) -> HTTPException:
 
 
 async def _check_hostnames(db: AsyncSession, routes: list[Any] | None, instance_id: uuid.UUID | None) -> None:
-    """Answer 409 when another instance already has one of these hostnames."""
+    """Answer 409 when another instance, or a live environment (phase 3 §11), already has one of these
+    hostnames."""
     wanted = {r.hostname for r in routes or []}
     if not wanted:
         return
@@ -123,6 +177,17 @@ async def _check_hostnames(db: AsyncSession, routes: list[Any] | None, instance_
         taken = wanted & {r.get("hostname") for r in other_routes or []}
         if taken:
             raise HTTPException(status.HTTP_409_CONFLICT, f"{sorted(taken)[0]} is already a hostname of instance {name}")
+    held = await environments.environment_with_hostname(db, wanted)
+    if held:
+        raise HTTPException(status.HTTP_409_CONFLICT, held)
+
+
+async def _check_slug_free(db: AsyncSession, slug: str) -> None:
+    """``<env>-blue``, ``-green`` and ``-data`` are reserved for every live environment (§3.2)."""
+    reserved = await environments.reserved_slug(db, slug)
+    if reserved is not None:
+        env, slot = reserved
+        raise HTTPException(status.HTTP_409_CONFLICT, environments.reserved_text(slug, env, slot))
 
 
 async def _check_folder(db: AsyncSession, host: Host, folder: str, instance_id: uuid.UUID | None) -> None:
@@ -202,6 +267,9 @@ async def claim_paths_editable(db: AsyncSession, instance: Instance) -> bool:
 
 
 BUSY = "A job is already running for this instance; wait for it to finish"
+# What a change that isn't a job holds in the runner (phase 3 §8.2): the instance's id, or both keys of its
+# environment. A module name, because some handlers have a local ``data``.
+_runner_keys = data.runner_keys
 
 
 async def queue_deployment(
@@ -213,56 +281,22 @@ async def queue_deployment(
     ``refs`` are the rows the job points at (``backup_id``, ``restore_backup_id``, ``snapshot_id``). A retry
     takes its kind, options, references and commit from the job it retries (``deployer.retry_values``), with
     ``options`` added on top. Jobs that run the live release copy the live release's commit.
+
+    ``jobs.queue_job`` (phase 3 §8.5) does the work: a standalone instance meets exactly the checks it met
+    before; an environment member also meets its environment's fences. Its refusal becomes the HTTP answer.
     """
-    if deployer.runner.is_deleting(instance.id):
-        raise HTTPException(status.HTTP_409_CONFLICT, "This instance is being deleted")
-    running = await data.active_job(db, instance.id)
-    if running is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, data.busy_text(running))
-    if not instance.host.is_pinned:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Host {instance.host.name} has not been verified yet; run a connection check first",
-        )
-    values: dict[str, Any] = {"kind": kind, "branch": instance.branch, "previous_sha": instance.current_commit_sha,
-                              **refs}
-    if retry_of is not None:
-        values.update(await deployer.retry_values(db, retry_of))
-    values["options"] = {**(values.get("options") or {}), **(options or {})}
-    kind = values["kind"]
-    if retry_of is None and kind != DeploymentKind.DEPLOY:
-        # A data job runs the live release: it records that release's commit (§6.4).
-        live = data.live_state(instance)
-        if live and live.get("sha"):
-            values["commit_sha"] = str(live["sha"])
-            source = await db.get(Deployment, data._uuid(live.get("deployment"))) if live.get("deployment") else None
-            if source is not None:
-                values.update(commit_message=source.commit_message, commit_author=source.commit_author)
-    opts = values["options"]
-    # The job settles the conditional steps itself when it starts; this list is what the page shows meanwhile.
-    steps = deployer.steps_for(
-        instance, kind, snapshot=values.get("snapshot_id") is not None and kind != DeploymentKind.SNAPSHOT,
-        files=bool(opts.get("files")), stop_app=bool(opts.get("stop_app")) and instance.status == InstanceStatus.RUNNING,
-        stopped=bool(opts.get("restop")) and kind in data.DATA_ONLY_KINDS, start_over=bool(opts.get("start_over")),
-        rollback_of=data._uuid(opts.get("rollback_of")), seed=bool(opts.get("seed")) and kind == DeploymentKind.RESET,
-    ) if kind != DeploymentKind.DEPLOY else deployer.new_steps(instance)
-    dep = Deployment(instance_id=instance.id, triggered_by_id=user.id, log="",
-                     retry_of_id=retry_of.id if retry_of else None, steps=steps, **values)
-    db.add(dep)
     try:
-        await db.flush()
-    except IntegrityError as exc:
-        # ux_deployments_one_active: another request queued a job for this instance at the same moment.
-        await db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, BUSY) from exc
-    return dep
+        return await jobs.queue_job(db, instance=instance, user=user, kind=kind, retry_of=retry_of,
+                                    options=options, **refs)
+    except jobs.JobRefused as exc:
+        raise HTTPException(exc.status, exc.text) from exc
 
 
 async def _submit(db: AsyncSession, dep: Deployment, instance: Instance) -> DeploymentOut:
     """Commit the queued job (with its audit record), start it, and answer with it."""
     await db.commit()
     await db.refresh(dep)
-    deployer.runner.submit(dep.id, instance.id)
+    deployer.runner.submit(dep.id, data.job_keys(dep, instance))
     return await deployment_out(db, dep)
 
 
@@ -300,6 +334,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     if await db.scalar(select(Instance).where(Instance.slug == slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"An instance named '{slug}' already exists")
+    await _check_slug_free(db, slug)
     await _check_hostnames(db, body.routes, None)
     await _check_folder(db, host, _folder_of(host, slug, body.deploy_dir or None), None)
     if not body.branch and not repo.default_branch_usable:
@@ -365,7 +400,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
     dep = await queue_deployment(db, instance, ctx.user) if body.deploy else None
     await db.commit()
     if dep is not None:
-        deployer.runner.submit(dep.id, instance.id)
+        deployer.runner.submit(dep.id, data.job_keys(dep, instance))
     return await instance_out(db, instance)  # a new instance's env was just set, so it is readable
 
 
@@ -390,6 +425,11 @@ async def get_env(instance_id: uuid.UUID, ctx: Writer, db: DB) -> dict[str, str]
 async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Writer, request: Request, db: DB) -> InstanceOut:
     instance = await _get(db, instance_id)
     data = body.model_dump(exclude_unset=True)
+    if instance.environment_id is not None:
+        # A member's settings, secrets, data and names belong to its environment (§11): only its name and
+        # whether Slipway may pick free ports stay editable here.
+        if any(k not in ("name", "auto_ports") for k in data):
+            raise HTTPException(status.HTTP_409_CONFLICT, member_text(instance))
     await _check_seed_update(db, ctx, instance, data)
     changing = {f for f in _PLACEMENT_FIELDS if data.get(f) is not None and data[f] != getattr(instance, f)}
     if body.deploy_dir is not None and (body.deploy_dir or None) != instance.deploy_dir:
@@ -400,7 +440,7 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
         return await _apply_update(db, instance, body, data, ctx, request)
     # Hold the instance's deploy lock until the commit, so no deployment starts in between.
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             if await _active_deployment(db, instance.id) is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
             if await _ever_deployed(db, instance) and not (
@@ -429,7 +469,7 @@ async def _change_folder(
         result.append(await _apply_update(db, instance, body, data, ctx, request))
 
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             if await _active_deployment(db, instance.id) is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
             if new == old or not await _ever_deployed(db, instance):
@@ -520,10 +560,14 @@ async def delete_instance(instance_id: uuid.UUID, ctx: Writer, request: Request,
     Answers 204, or 200 with ``{"ok": true, "warning": "..."}`` when files had to be left on the host.
     """
     instance = await _get(db, instance_id)
+    if instance.environment_id is not None:
+        env = _env_name(instance)
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Delete {env} instead" if instance.slot == "data"
+                            else f"Remove the slot from {env} instead")
     warning: str | None = None
     report: dict[str, Any] = {}  # the backups kept on the host (names and SHA-256s) and their folder
     try:
-        async with deployer.runner.exclusive(instance.id, deleting=True):
+        async with deployer.runner.exclusive(_runner_keys(instance), deleting=True):
             if instance.status == InstanceStatus.DEPLOYING or await _active_deployment(db, instance.id) is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
             if purge and await _ever_deployed(db, instance):
@@ -580,6 +624,8 @@ async def _remove_proxy_entries(instance: Instance) -> str | None:
 async def sync_proxy(instance_id: uuid.UUID, ctx: Writer, request: Request, db: DB) -> dict[str, Any]:
     """Publish the instance's hostnames in Switchyard now, as a deploy does at its end."""
     instance = await _get(db, instance_id)
+    if instance.environment_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{_env_name(instance)}'s names are published by the environment")
     if instance.status == InstanceStatus.CREATED and not instance.proxy_entries:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Deploy the instance first: its ports are not published yet")
     await db.commit()  # release the DB connection during the HTTP calls
@@ -607,6 +653,8 @@ async def deploy(
     ``override_hold`` and ``take_over_lock`` (data:reset), ``skip_revision_check`` (data:restore)."""
     body = body or DeployIn()
     instance = await _get(db, instance_id)
+    if instance.environment_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Deploy {_env_name(instance)} from its page: Slipway picks the slot")
     if body.override_hold or body.take_over_lock:
         need(ctx, Perm.DATA_RESET)
     if body.skip_revision_check:
@@ -642,11 +690,24 @@ async def control(
         confirmed(instance, body.confirm)
     if instance.status in (InstanceStatus.CREATED, InstanceStatus.DEPLOYING):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Instance is {instance.status}")
+    env = await environments.environment_of(db, instance)
+    if env is not None and action in ("start", "restart") and instance.slot in environments.APP_SLOTS \
+            and environments.stale_of(instance):
+        # A slot a data job left stopped can't run the data as it is now (D16): deploy to it instead.
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"Deploy to {instance.slot} first: it was stopped when the data was restored")
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             running = await data.active_job(db, instance.id)
             if running is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, _running_text(running))
+            if env is not None:
+                busy = await jobs.busy_job(db, env, data.env_keys(env.id, None))
+                if busy is not None:
+                    raise HTTPException(status.HTTP_409_CONFLICT, environments.busy_text(env, busy))
+            # The data's fields are the data owner's (phase 3 D3): its hold and the time of the last start.
+            owner = await environments.owner_of(db, instance) if env is not None else instance
+            owner = owner if owner is not None else instance
             if action in ("start", "restart"):
                 held = await data.hold_text(db, instance)
                 if held and not body.override_hold:
@@ -655,22 +716,26 @@ async def control(
                     # The hold goes at once; the dirty state (and its roll back point) stays (§8.4).
                     audit.record(db, "instance.hold_override", actor=ctx.user, target=instance, request=request,
                                  summary=f"{action.title()} {instance.name} while its data was held",
-                                 details={"hold": instance.data_dirty, "action": action})
-                    instance.data_dirty = {**(instance.data_dirty or {}), "hold": False}
+                                 details={"hold": owner.data_dirty, "action": action})
+                    owner.data_dirty = {**(owner.data_dirty or {}), "hold": False}
             command = deployer.control_command(instance, action)
+            owner_id = owner.id
             await db.commit()  # release the DB connection during SSH
             try:
                 output = await deployer.run_on_instance(instance, command)
             except ssh.SSHError as exc:
                 raise _ssh_error(exc) from exc
             values: dict[str, Any] = {"status": InstanceStatus.STOPPED if action == "stop" else InstanceStatus.RUNNING}
-            if action in ("start", "restart"):
+            if action in ("start", "restart") and owner_id == instance.id:
                 values["last_control_at"] = utcnow()  # a retry backs up what was written since (§8.1)
             # A deployment may have started meanwhile; it records the status itself.
             await db.execute(
                 update(Instance).where(Instance.id == instance.id, Instance.status != InstanceStatus.DEPLOYING)
                 .values(**values)
             )
+            if action in ("start", "restart") and owner_id != instance.id:
+                # A start of any app slot counts for the data owner's retry rule (§7.5).
+                await db.execute(update(Instance).where(Instance.id == owner_id).values(last_control_at=utcnow()))
             audit.record(db, f"instance.{action}", actor=ctx.user, target=instance,
                          summary=f"{action.title()} {instance.name}", request=request)
             await db.commit()
@@ -945,7 +1010,7 @@ async def _check_on_host(db: AsyncSession, instance: Instance, rows: list[Backup
     host = instance.host.name
     busy = f"A job is running for {instance.name}; showing what Slipway recorded"
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             if await data.active_job(db, instance.id) is not None:
                 return busy, None
             await db.commit()  # release the DB connection during SSH
@@ -969,6 +1034,7 @@ async def list_backups(instance_id: uuid.UUID, ctx: DataReader, db: DB, check: b
     ``check=true`` checks their files on the host first (when no job is running).
     """
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     _require_app(instance)
     rows = list((await db.scalars(
         select(Backup).where(Backup.instance_id == instance.id).order_by(Backup.taken_at.desc())
@@ -1008,6 +1074,7 @@ async def back_up_now(
     """Back up now (kind ``backup``): a manual backup, kept until deleted by hand."""
     body = body or BackupCreate()
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     await data.require_data_job(db, instance, DeploymentKind.BACKUP)
     if body.files and "files" not in data.capabilities(instance):
         raise HTTPException(status.HTTP_409_CONFLICT, f"{data.live_sha7(instance)}'s slipway.yml has no export_files "
@@ -1039,13 +1106,14 @@ async def delete_backup(
     backup that isn't on the host any more is just forgotten. Answers 204, or 200 with a warning when its
     files changed on the host and were left there."""
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     _require_app(instance)
     row = await _backup(db, instance, backup_id)
     host = instance.host.name
     left: str | None = None
     forgotten = False
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             running = await data.active_job(db, instance.id)
             if running is not None:
                 raise HTTPException(status.HTTP_409_CONFLICT, _running_text(running))
@@ -1113,6 +1181,7 @@ async def restore_backup(
     if body.restore_identity:
         need(ctx, Perm.DATA_RESET)
     confirmed(instance, body.confirm)
+    await _refuse_shared_data(db, instance)
     await data.require_data_job(db, instance, DeploymentKind.RESTORE)
     row = await _backup(db, instance, body.backup_id)
     if body.files and not row.has_files:
@@ -1143,6 +1212,7 @@ async def reset_data(instance_id: uuid.UUID, body: ResetIn, ctx: Resetter, reque
     empty (with an optional first admin and starter content) or from a snapshot."""
     instance = await _get(db, instance_id)
     confirmed(instance, body.confirm)
+    await _refuse_shared_data(db, instance)
     await data.require_data_job(db, instance, DeploymentKind.RESET)
     man = data.live_manifest(instance)
     where = f"release {data.live_sha7(instance)}'s slipway.yml"
@@ -1151,8 +1221,9 @@ async def reset_data(instance_id: uuid.UUID, body: ResetIn, ctx: Resetter, reque
         snap = await db.get(Snapshot, body.snapshot_id)
         if snap is None:
             raise not_found("Snapshot")
-        check_seed(ctx, snap, name=instance.name, repository=instance.repository.full_name, man=man,
-                   env=instance.env, where=where)
+        env_row = data.loaded_environment(instance)
+        check_seed(ctx, snap, name=data.confirm_name(instance), repository=instance.repository.full_name, man=man,
+                   env=env_row.env if env_row is not None else instance.env, where=where)
     elif man.get("first_admin") and body.first_admin is None:
         row = await _first_admin_row(db, instance)
         if row is None or row.status != FirstAdminStatus.PENDING:
@@ -1177,6 +1248,7 @@ async def start_over(instance_id: uuid.UUID, body: ConfirmIn, ctx: Resetter, req
     """Start over (a reset of a never-live instance): back up, then delete what its failed first deploys made."""
     instance = await _get(db, instance_id)
     confirmed(instance, body.confirm)
+    await _refuse_shared_data(db, instance)
     await data.require_data_job(db, instance, DeploymentKind.RESET, start_over=True)
     release = await db.scalar(select(Deployment.id).where(
         Deployment.instance_id == instance.id, Deployment.kind == DeploymentKind.DEPLOY,
@@ -1204,6 +1276,7 @@ async def take_snapshot(
     """Take a snapshot (kind ``snapshot``): the database, files and identity keys, kept encrypted on Slipway.
     ``stop_app`` (instances:operate too) stops the app while the data is exported."""
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     if body.stop_app:
         need(ctx, Perm.INSTANCES_OPERATE)
     try:
@@ -1247,6 +1320,7 @@ async def take_snapshot(
 @router.get("/{instance_id}/first-admin")
 async def get_first_admin(instance_id: uuid.UUID, ctx: Reader, db: DB) -> FirstAdminOut:
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     row = await _first_admin_row(db, instance)
     if row is None:
         raise not_found("First admin")
@@ -1268,6 +1342,7 @@ async def put_first_admin(
     this needs instances:write. On a live app with none pending it creates another account: data:reset and the
     typed name."""
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     if instance.build_source != BuildSource.APP:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only app instances (slipway.yml) have a first admin")
     row = await _first_admin_row(db, instance)
@@ -1287,7 +1362,7 @@ async def put_first_admin(
         password = row.password  # a change of the fields keeps the stored password
     check_first_admin(man, body, where=where, password=password)
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             await _exclusively(instance, db)
             action = await _set_first_admin(db, instance, body, password, ctx.user)
             audit.record(db, "instance.first_admin", actor=ctx.user, target=instance, request=request,
@@ -1305,13 +1380,14 @@ async def put_first_admin(
 async def delete_first_admin(instance_id: uuid.UUID, ctx: Writer, request: Request, db: DB) -> Response:
     """Drop a first admin that hasn't been created yet."""
     instance = await _get(db, instance_id)
+    await _refuse_shared_data(db, instance)
     row = await _first_admin_row(db, instance)
     if row is None:
         raise not_found("First admin")
     if row.status != FirstAdminStatus.PENDING:
         raise HTTPException(status.HTTP_409_CONFLICT, ALREADY_CREATED)
     try:
-        async with deployer.runner.exclusive(instance.id):
+        async with deployer.runner.exclusive(_runner_keys(instance)):
             await _exclusively(instance, db)
             audit.record(db, "instance.first_admin", actor=ctx.user, target=instance, request=request,
                          summary=f"Dropped the first admin of {instance.name}",
@@ -1325,14 +1401,16 @@ async def delete_first_admin(instance_id: uuid.UUID, ctx: Writer, request: Reque
 
 @router.post("/{instance_id}/first-admin/run", status_code=202)
 async def create_first_admin_now(instance_id: uuid.UUID, ctx: Deployer, request: Request, db: DB) -> DeploymentOut:
-    """Create it now (kind ``admin``): run the first_admin command for the pending first admin."""
-    instance = await _get(db, instance_id)
+    """Create it now (kind ``admin``): run the first_admin command for the pending first admin. In mode
+    ``server`` the job is the data owner's, asked from it or from an app slot (phase 3 §7.3): it runs on the
+    active slot, or with none on the lead slot."""
+    instance, runs_on = await _app_job_owner(db, await _get(db, instance_id))
     await data.require_data_job(db, instance, DeploymentKind.ADMIN)
     row = await _first_admin_row(db, instance)
     if row is None or row.status != FirstAdminStatus.PENDING:
         raise HTTPException(status.HTTP_409_CONFLICT, f"No first admin is waiting to be created in {instance.name}")
-    if instance.status != InstanceStatus.RUNNING:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"{instance.name} isn't running: start it, then create the first admin")
+    if runs_on.status != InstanceStatus.RUNNING:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{runs_on.name} isn't running: start it, then create the first admin")
     dep = await queue_deployment(db, instance, ctx.user, kind=DeploymentKind.ADMIN)
     audit.record(db, "instance.first_admin_run", actor=ctx.user, target=instance, request=request,
                  summary=f"Create the first admin of {instance.name}", details={"deployment": str(dep.id)})
@@ -1341,9 +1419,12 @@ async def create_first_admin_now(instance_id: uuid.UUID, ctx: Deployer, request:
 
 @router.post("/{instance_id}/content/run", status_code=202)
 async def add_starter_content(instance_id: uuid.UUID, ctx: Deployer, request: Request, db: DB) -> DeploymentOut:
-    """Add starter content (kind ``content``) after a seed step ended in a warning."""
-    instance = await _get(db, instance_id)
+    """Add starter content (kind ``content``) after a seed step ended in a warning. In mode ``server`` the job is
+    the data owner's, as for Create it now."""
+    instance, runs_on = await _app_job_owner(db, await _get(db, instance_id))
     await data.require_data_job(db, instance, DeploymentKind.CONTENT)
+    if runs_on.status != InstanceStatus.RUNNING:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{runs_on.name} isn't running: start it, then add the starter content")
     if not instance.content_pending:
         raise HTTPException(status.HTTP_409_CONFLICT, f"{instance.name} has no starter content waiting to be added")
     dep = await queue_deployment(db, instance, ctx.user, kind=DeploymentKind.CONTENT)

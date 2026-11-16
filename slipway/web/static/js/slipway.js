@@ -19,6 +19,12 @@
  *   <input data-repeat-of="name">, data-required-when="field=value"
  *   <form data-upload="/api/v1/snapshots/upload">          (raw file upload with progress)
  *   <button data-generate-passphrase="#a, #b">, <section data-poll-reload="5000">
+ *
+ * Environments (phase 3 §12.6):
+ *   <select data-map="route_tls" data-map-key="api.example.com">  (body.route_tls["api.example.com"] = value, when set)
+ *   <div data-load=... data-lazy>                           (loaded when its dialog opens, not with the page)
+ *   <div data-render="traffic_plan">                        (the Traffic card's rows, or with data-mode="list" Activate's plan)
+ *   <form data-env-flow>                                    (the New environment flow, wireEnvFlow)
  */
 (function () {
   "use strict";
@@ -183,6 +189,12 @@
       const v = coerce(el);
       if ((v === "" || v === null) && el.dataset.keepEmpty === undefined) return;
       put(out, el.name, v);
+    });
+    // A map whose keys may hold dots (hostnames): <select data-map="route_tls" data-map-key="api.example.com">.
+    $$("[data-map]", form).forEach((el) => {
+      if (el.disabled || el.closest("[hidden]")) return;
+      const map = out[el.dataset.map] = out[el.dataset.map] || {};
+      if (el.value) map[el.dataset.mapKey] = el.value;
     });
     // An optional group the user left empty (such as a first admin when starting from a snapshot) isn't sent.
     $$("[data-optional-group]", form).forEach((group) => {
@@ -352,6 +364,7 @@
     if (values) fill(dlg, values);
     $$("[data-must-equal]", dlg).forEach((i) => { i.value = ""; }); // the name is typed again for each action
     $$("form", dlg).forEach((form) => { form.dispatchEvent(new Event("change")); syncRequired(form); checkMustEqual(form); });
+    $$("[data-lazy][data-load]", dlg).forEach(load); // e.g. Activate's plan, read when the dialog opens
     dlg.showModal();
     const f = $("input:not([type=hidden]), textarea, select", dlg);
     if (f) f.focus();
@@ -463,6 +476,7 @@
   const RUNNING = {
     deploy: "Building", restore: "Restoring", reset: "Resetting", rollback: "Rolling back", backup: "Backing up",
     snapshot: "Taking snapshot", admin: "Creating admin", content: "Adding content",
+    activate: "Activating", publish: "Publishing", discard: "Discarding", remove_slot: "Removing", teardown: "Deleting",
   };
   function statusBadge(status, kind) {
     const known = STATUS[status];
@@ -576,7 +590,98 @@
       el.innerHTML = parts.join("");
     },
     readme(el, data) { el.textContent = (data && data.content) || "This repository has no README."; },
+    // GET /environments/{id}/traffic/plan (§10.7): the Traffic card's rows, or (data-mode="list") the Activate
+    // dialog's plan list, whose blockers keep the dialog's button disabled. Nothing is changed by reading it.
+    traffic_plan(el, data) {
+      el.innerHTML = trafficPlanHtml(data, el.dataset);
+      const form = el.closest && el.closest("form");
+      const submit = form && $("[data-plan-submit]", form);
+      if (submit) submit.disabled = planBlockers(data).length > 0;
+    },
   };
+
+  // What each planned change shows as (traffic.Change.action for Switchyard, its status for DNS).
+  const SWITCH_STATE = {
+    none: ["Up to date", "success"], create: ["Will create", "primary"], update: ["Will update", "warning"],
+    delete: ["Will delete", "warning"], forget: ["Will forget", ""],
+  };
+  const DNS_STATE = {
+    ok: ["Up to date", "success"], create: ["Will create", "primary"], update: ["Will update", "warning"],
+    covered: ["Covered", ""], claimable: ["Not Slipway's", "warning"], conflict: ["Blocked", "error"],
+    delete: ["Will delete", "warning"], forget: ["Will forget", ""], adopt: ["Will record", "primary"],
+  };
+
+  function planBlockers(data) {
+    return [].concat((data && data.switch && data.switch.blockers) || [], (data && data.dns && data.dns.blockers) || []);
+  }
+
+  function trafficPlanHtml(data, ds) {
+    const routes = (data && data.routes) || [];
+    const sw = data && data.switch, dns = data && data.dns;
+    const env = ds.env || "", canClaim = ds.canClaim !== undefined;
+    const byName = (plan) => {
+      const out = {};
+      ((plan && plan.changes) || []).forEach((c) => { out[c.hostname] = c; });
+      return out;
+    };
+    const swc = byName(sw), dnsc = byName(dns);
+    const blockedBy = (plan, host) => ((plan && plan.blockers) || []).filter((b) => String(b).indexOf(host) >= 0);
+    const badge = (pair, title) => `<span class="badge ${pair[1]}"${title ? ` title="${esc(title)}"` : ""}>${esc(pair[0])}</span>`;
+    const upstream = (c) => {
+      const up = c && c.before && (c.before.upstreams || [])[0];
+      return up && up.host ? `${up.host}:${up.port}` : "";
+    };
+    const named = [];
+    const blockers = planBlockers(data);
+
+    if (ds.mode === "list") {
+      // Activate's dialog: what the switch writes, and anything that stops it.
+      const items = [];
+      ((sw && sw.changes) || []).filter((c) => c.action !== "none").forEach((c) => {
+        items.push(`<li><span class="mono">${esc(c.hostname)}</span> ${badge(SWITCH_STATE[c.action] || [c.action, ""])} <span class="subtle">${esc(c.summary || c.upstream || "")}</span></li>`);
+      });
+      ((dns && dns.changes) || []).filter((c) => c.status === "create" || c.status === "update").forEach((c) => {
+        items.push(`<li><span class="mono">${esc(c.hostname)}</span> ${badge(["DNS: " + DNS_STATE[c.status][0], DNS_STATE[c.status][1]])}</li>`);
+      });
+      blockers.forEach((b) => items.push(`<li class="blocked">${badge(["Blocked", "error"])} ${esc(b)}</li>`));
+      if (!items.length) items.push('<li class="subtle">Every name already points where Activate would point it.</li>');
+      return `<ul class="plan-list">${items.join("")}</ul>` +
+        (blockers.length ? '<p class="error-text" style="margin: 0">Slipway changed nothing. Fix these in Switchyard or Cloudflare, then open this again.</p>' : "");
+    }
+
+    const rows = routes.map((r) => {
+      const s = swc[r.hostname], d = dnsc[r.hostname];
+      const sb = blockedBy(sw, r.hostname), db = blockedBy(dns, r.hostname);
+      sb.concat(db).forEach((b) => { if (named.indexOf(b) < 0) named.push(b); });
+      let swCell;
+      if (!sw) swCell = '<span class="subtle">Not used</span>';
+      else if (sb.length) swCell = `${badge(["Blocked", "error"], sb.join("\n"))} <span class="subtle">${esc(sb.join("; "))}</span>`;
+      else if (s) swCell = badge(SWITCH_STATE[s.action] || [s.action, ""], s.summary);
+      else swCell = '<span class="subtle">Not planned</span>';
+      let dnsCell;
+      if (!dns) dnsCell = '<span class="subtle">Off</span>';
+      else if (db.length && !d) dnsCell = `${badge(["Blocked", "error"], db.join("\n"))} <span class="subtle">${esc(db.join("; "))}</span>`;
+      else if (d) {
+        const state = DNS_STATE[d.status] || [d.status || d.action, ""];
+        dnsCell = badge(state, d.summary);
+        if (d.status === "conflict" && d.summary) dnsCell += ` <span class="subtle">${esc(d.summary)}</span>`;
+        if (d.status === "claimable" && canClaim) {
+          const body = esc(JSON.stringify({ hostname: r.hostname }));
+          dnsCell += ` <button class="btn btn-sm" type="button" data-api="POST /api/v1/environments/${esc(env)}/dns/claim" data-body="${body}" data-then="reload" data-success="Claimed ${esc(r.hostname)}">Claim</button>`;
+        }
+      } else dnsCell = '<span class="subtle">Not planned</span>';
+      const scheme = r.tls_mode === "off" ? "http" : "https";
+      return `<tr data-name="${esc(r.hostname)}"><td><a class="mono" href="${scheme}://${esc(r.hostname)}" target="_blank" rel="noopener">${esc(r.hostname)}</a></td>` +
+        `<td>${r.follows === "server" ? "Data server" : "Live slot"}</td>` +
+        `<td class="mono subtle">${esc(upstream(s) || "—")}</td><td>${swCell}</td><td>${dnsCell}</td></tr>`;
+    });
+    const other = blockers.filter((b) => named.indexOf(b) < 0);
+    const head = other.length
+      ? `<div class="card-body"><div class="callout error">${other.map((b) => esc(b)).join("<br>")}</div></div>` : "";
+    if (!rows.length) return head + '<div class="card-body"><p class="muted" style="margin: 0">No public names yet: they come from slipway.yml with the first deploy.</p></div>';
+    return head + '<div class="table-wrap"><table class="table traffic"><thead><tr><th>Name</th><th>Follows</th><th>Now</th>' +
+      `<th>Switchyard</th><th>DNS</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+  }
 
   const BACKUP_WHY = {
     pre_deploy: "Before deploy", pre_retry: "Before retry", pre_restore: "Before restore", pre_reset: "Before reset",
@@ -925,6 +1030,16 @@
       `<div class="form-grid">${fields}</div>${mode}${password}`;
   }
 
+  // The capabilities the Data fieldset has a field for: backups to keep (a dump), what the data starts with (a
+  // restore), the first admin and starter content. Any other (data.attach, data.server, bluegreen,
+  // revision checks) shows nothing.
+  // A slipway.yml phase 2 could read (none of data.attach, data.server, bluegreen) keeps phase 2's rule: the
+  // fieldset shows for any capability, with Backups to keep (I1).
+  const DATA_FIELD_CAPS = ["backup", "seed", "first_admin", "starter_content"];
+  const PHASE3_CAPS = ["attach", "server", "bluegreen"];
+  const phase3Caps = (caps) => caps.some((c) => PHASE3_CAPS.includes(c));
+  const hasDataFields = (caps) => (phase3Caps(caps) ? caps.some((c) => DATA_FIELD_CAPS.includes(c)) : caps.length > 0);
+
   function appData(fs, form) {
     const parse = (v) => { try { return JSON.parse(v); } catch (e) { return null; } };
     const snaps = parse(fs.dataset.snapshots) || [];
@@ -1014,7 +1129,10 @@
     return (m) => {
       man = m;
       const caps = (m && m.capabilities) || [];
-      fs.hidden = !caps.length;
+      fs.hidden = !hasDataFields(caps);
+      const keep = $('[name="keep_backups"]', fs);
+      const keepField = keep && (keep.closest(".field") || keep);
+      if (keepField) keepField.hidden = phase3Caps(caps) && !caps.includes("backup");
       if (start) start.hidden = !(caps.includes("seed") && (neverLive || !editing));
       fillSnapshots();
       if (first && saved && radio("snapshot")) { radio("snapshot").checked = true; first = false; }
@@ -1035,7 +1153,9 @@
     const status = $("[data-app-status]", box), settingsBox = $("[data-app-settings]", box);
     const servicesField = $("[data-app-services-field]", box), servicesBox = $("[data-app-services]", box);
     const summary = $("[data-app-summary]", box);
-    const settingsInput = $('[name="app_settings"]', box), servicesInput = $('[name="app_services"]', box);
+    // The environment pages send them as settings and services (data-settings-field, data-services-field).
+    const settingsInput = $(`[name="${box.dataset.settingsField || "app_settings"}"]`, box);
+    const servicesInput = $(`[name="${box.dataset.servicesField || "app_services"}"]`, box);
     const parse = (v) => { try { return JSON.parse(v); } catch (e) { return null; } };
     const saved = parse(box.dataset.settings) || {};
     // The instance's saved choice (null: each optional service's default) and what was ticked or unticked
@@ -1086,6 +1206,7 @@
         ${m.env_file ? `<dt>Defaults</dt><dd class="mono">${esc(m.env_file)}</dd>` : ""}</dl>`;
       sync();
       showData(m);
+      box.dispatchEvent(new CustomEvent("slipway:manifest", { detail: m }));
       form.dispatchEvent(new Event("change"));
     };
 
@@ -1095,6 +1216,7 @@
       status.innerHTML = html;
       sync();
       showData(null);
+      box.dispatchEvent(new CustomEvent("slipway:manifest", { detail: null }));
     };
 
     const load = async () => {
@@ -1142,7 +1264,9 @@
       const [name, values] = spec.split("=");
       const checked = $(`[name="${name}"]:checked`, form);
       const field = checked || $(`[name="${name}"]:not([type=radio])`, form);
-      return Boolean(field) && values.split("|").includes(field.value);
+      // An unticked checkbox has no value: "x=on" holds only while it is ticked.
+      const value = field && field.type === "checkbox" && !field.checked ? "" : field && field.value;
+      return Boolean(field) && values.split("|").includes(value);
     };
     const update = () => {
       targets.forEach((el) => { el.hidden = !holds(el.dataset.showWhen); });
@@ -1151,6 +1275,370 @@
     };
     form.addEventListener("change", update);
     update();
+  }
+
+  // ------------------------------------------------- the New environment flow (phase 3 §12.3)
+  // The step that holds each field a refusal of POST /environments names ({detail, field}, §9.1).
+  const FIELD_STEP = {
+    name: 1, repository_id: 1, branch: 1, manifest_file: 1,
+    data_mode: 2,
+    hosts: 3, "hosts.blue": 3, "hosts.green": 3, "hosts.data": 3,
+    settings: 4, services: 4, env: 4,
+    hostnames: 5, route_tls: 5, traffic: 5, "traffic.switch": 5, "traffic.dns": 5, auto_activate: 5,
+    keep_backups: 6, seed_snapshot_id: 6, seed_content: 6, first_admin: 6,
+  };
+  const FLOW_STEPS = 7;
+  const NAME_RE = /^[a-z][a-z0-9-]{0,24}[a-z0-9]$/;
+
+  function fieldStep(field) {
+    if (!field) return 0;
+    if (FIELD_STEP[field]) return FIELD_STEP[field];
+    return FIELD_STEP[String(field).split(".")[0]] || 0;
+  }
+
+  // Like api(), but answers {status, data, text} instead of throwing, so the flow can tell a refusal (4xx) from
+  // an answer that never came (status 0) or a server error (5xx): after those, a create may have happened.
+  async function request(method, url, body) {
+    const opts = { method, headers: { Accept: "application/json", "X-CSRF-Token": csrf() }, credentials: "same-origin" };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    let res;
+    try { res = await fetch(url, opts); } catch (err) {
+      return { status: 0, data: null, text: "Slipway didn't answer" + (err && err.message ? ` (${err.message})` : "") };
+    }
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* non-JSON */ }
+    if (res.status === 401) location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
+    return { status: res.status, data, text: errorText(data) || res.statusText || "Request failed" };
+  }
+
+  // The field a refusal is about: {detail, field} from validate_create, or the first location of a 422.
+  function refusalField(res) {
+    const d = res.data;
+    if (d && typeof d.field === "string") return d.field;
+    if (d && Array.isArray(d.detail) && d.detail[0]) return (d.detail[0].loc || []).filter((x) => x !== "body").join(".");
+    return "";
+  }
+
+  // What the check and the create send (EnvironmentCreate): the form's fields, reshaped. ``planning`` is set for
+  // the checks before the Data step: a first admin the manifest needs is filled with placeholders, so the check
+  // can answer the plan (the Traffic step's names) before the Data step is filled in. Nothing is written by a check.
+  function flowBody(root, planning, manifest) {
+    const raw = serialize(root);
+    const shape = ($('[name="shape"]:checked', root) || {}).value || "single";
+    const two = shape === "bluegreen";
+    const keep = Boolean(($('[name="keep_data"]', root) || {}).checked);
+    const mode = two || keep ? "server" : "slot";
+    const chosen = raw.hosts || {};
+    const hosts = {};
+    ["blue", "green", "data"].forEach((slot) => {
+      if (slot === "green" && !two) return;
+      if (slot === "data" && mode !== "server") return;
+      if (chosen[slot]) hosts[slot] = chosen[slot];
+    });
+    const traffic = raw.traffic || {};
+    const dnsOn = Boolean(($('[name="dns_on"]', root) || {}).checked);
+    const dns = traffic.dns || {};
+    const body = {
+      name: raw.name || "", repository_id: raw.repository_id || "", branch: raw.branch, manifest_file: raw.manifest_file,
+      data_mode: mode, hosts, settings: raw.settings || {}, env: raw.env || {}, route_tls: raw.route_tls || {},
+      auto_activate: two && Boolean(raw.auto_activate),
+      traffic: { switch: traffic.switch || (two ? "switchyard" : "none"),
+                 dns: dnsOn ? Object.assign({}, dns.address ? { address: dns.address } : {}, { proxied: Boolean(dns.proxied) }) : null },
+    };
+    if (raw.services !== undefined) body.services = raw.services;
+    ["keep_backups", "seed_snapshot_id", "seed_content", "first_admin"].forEach((k) => { if (raw[k] !== undefined) body[k] = raw[k]; });
+    Object.keys(body).forEach((k) => { if (body[k] === undefined || body[k] === "") delete body[k]; });
+    const fa = manifest && manifest.first_admin;
+    if (planning && fa && !body.first_admin && !body.seed_snapshot_id) {
+      const fields = {};
+      (fa.fields || []).forEach((f) => { fields[f.name] = f.kind === "email" ? "admin@example.com" : "A"; });
+      body.first_admin = fa.password
+        ? { fields, mode: "password", password: "x".repeat(Math.max(8, fa.password.min_length || 8)) }
+        : { fields, mode: "invite" };
+    }
+    return body;
+  }
+
+  function wireEnvFlow(root) {
+    const sections = $$("[data-step]", root).sort((a, b) => Number(a.dataset.step) - Number(b.dataset.step));
+    const tabs = $$("[data-step-tab]", root);
+    const live = $("[data-flow-live]", root);
+    const back = $("[data-flow-back]", root), next = $("[data-flow-next]", root);
+    const deploy = $("[data-flow-deploy]", root), restart = $("[data-flow-restart]", root);
+    const result = $("[data-flow-result]", root), message = $("[data-flow-message]", root), open = $("[data-flow-open]", root);
+    const modeInput = $('[name="data_mode"]', root);
+    const ds = root.dataset;
+    // unsure: a create got no answer or a 5xx, so it may have happened. created: the environment exists and only
+    // its first deployment is left to start (the page is locked on Review).
+    const state = { current: 1, plan: null, manifest: null, unsure: false, created: null, name: "", busy: false };
+    root._flow = state;
+
+    const stepName = (n) => (sections[n - 1] && sections[n - 1].dataset.stepName) || String(n);
+    const say = (text, link, href) => {
+      if (!result) return;
+      result.hidden = !text;
+      if (message) message.textContent = text || "";
+      if (open) { open.hidden = !link; open.textContent = link || ""; if (href) open.setAttribute("href", href); }
+    };
+    const stepError = (n, text) => {
+      const box = sections[n - 1] && $("[data-step-error]", sections[n - 1]);
+      if (box) { box.textContent = text || ""; box.hidden = !text; }
+    };
+    const clearMarks = () => $$('[aria-invalid="true"]', root).forEach((el) => el.setAttribute("aria-invalid", "false"));
+    const mark = (field) => {
+      if (!field) return;
+      const el = $(`[name="${field}"]`, root) || $(`[data-field="${field}"]`, root) ||
+        $(`[data-field="${String(field).split(".")[0]}"]`, root);
+      if (el) { el.setAttribute("aria-invalid", "true"); if (el.focus) el.focus(); }
+    };
+
+    function go(n) {
+      state.current = Math.max(1, Math.min(FLOW_STEPS, n));
+      sections.forEach((sec, i) => { sec.classList.toggle("current", i + 1 === state.current); });
+      tabs.forEach((tab) => {
+        const k = Number(tab.dataset.stepTab);
+        tab.setAttribute("aria-current", k === state.current ? "step" : "false");
+        tab.classList.toggle("done", k < state.current);
+        tab.classList.toggle("active", k === state.current);
+      });
+      if (live) live.textContent = `Step ${state.current} of ${FLOW_STEPS}: ${stepName(state.current)}`;
+      if (back) back.disabled = state.current === 1 || Boolean(state.created);
+      if (next) next.hidden = state.current === FLOW_STEPS;
+      if (deploy) deploy.hidden = state.current !== FLOW_STEPS;
+      if (state.current === 5) fillTraffic();
+      if (state.current === FLOW_STEPS) fillReview();
+    }
+
+    // The step's own checks, before Slipway is asked: {field, text} or null.
+    function clientCheck(n) {
+      const body = flowBody(root, false, state.manifest);
+      if (n === 1) {
+        if (!NAME_RE.test(body.name || "")) return { field: "name", text: "Use 2-26 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit" };
+        if (!body.repository_id) return { field: "repository_id", text: "Choose a repository" };
+        if (!body.branch) return { field: "branch", text: "Choose a branch" };
+      }
+      if (n === 3) {
+        if (!body.hosts.blue) return { field: "hosts.blue", text: "Choose a host for blue" };
+        if ((($('[name="shape"]:checked', root) || {}).value) === "bluegreen" && !body.hosts.green) {
+          return { field: "hosts.green", text: "Choose a host for green" };
+        }
+        if (body.data_mode === "server" && !body.hosts.data) return { field: "hosts.data", text: "Choose a host for the data server" };
+        if (body.hosts.data && (body.hosts.data === body.hosts.blue || body.hosts.data === body.hosts.green)) {
+          return { field: "hosts.data", text: "The data server needs a host of its own" };
+        }
+      }
+      return null;
+    }
+
+    async function nextStep() {
+      if (state.busy || state.created) return;
+      const n = state.current;
+      clearMarks(); stepError(n, ""); say("");
+      const problem = clientCheck(n);
+      if (problem) { stepError(n, problem.text); mark(problem.field); return; }
+      state.busy = true; if (next) setLoading(next, true);
+      const res = await request("POST", "/api/v1/environments?check=true", flowBody(root, n < 6, state.manifest));
+      state.busy = false; if (next) setLoading(next, false);
+      if (res.status === 200) {
+        state.plan = (res.data && res.data.plan) || null;
+        go(n + 1);
+        return;
+      }
+      const field = refusalField(res), at = fieldStep(field);
+      if (at > n && res.status >= 400 && res.status < 500) { go(n + 1); return; } // a later step's field: fine for now
+      if (at && res.status >= 400 && res.status < 500) {
+        go(at);
+        stepError(at, res.text);
+        mark(field);
+        return;
+      }
+      stepError(n, res.text);
+    }
+
+    async function startFirst() {
+      const res = await request("POST", `/api/v1/environments/${state.created}/deploy`, {});
+      if (res.status === 202) { location.assign(`/environments/${state.created}`); return; }
+      // Created, but the first deployment didn't start: stay on Review, locked; Deploy tries the start again.
+      lock(true);
+      say(`Created ${state.name}, but its first deployment didn't start: ${res.text}.`, "Open the environment",
+          `/environments/${state.created}`);
+    }
+
+    async function deployAll() {
+      if (state.busy) return;
+      state.busy = true; if (deploy) setLoading(deploy, true);
+      try {
+        say(""); stepError(FLOW_STEPS, "");
+        if (!state.created) {
+          const body = flowBody(root, false, state.manifest);
+          const res = await request("POST", "/api/v1/environments", body);
+          if (res.status === 201 && res.data && res.data.id) {
+            state.created = res.data.id;
+            state.name = res.data.name || body.name;
+          } else if (res.status === 0 || res.status >= 500) {
+            state.unsure = true; // it may have been created: the answer was lost
+            say(`${res.text}. The environment may or may not have been created; check the list before trying again.`,
+                "Open the list", "/environments");
+            return;
+          } else {
+            const field = refusalField(res), at = fieldStep(field);
+            if (state.unsure && /already exists/.test(res.text)) {
+              say("It may have been created already:", "open it", "/environments");
+              return;
+            }
+            if (at && at < FLOW_STEPS) { go(at); stepError(at, res.text); mark(field); return; }
+            stepError(FLOW_STEPS, res.text);
+            return;
+          }
+        }
+        await startFirst();
+      } finally {
+        state.busy = false; if (deploy) setLoading(deploy, false);
+        if (state.created && deploy) deploy.disabled = false;
+      }
+    }
+
+    function lock(on) {
+      root.toggleAttribute ? root.toggleAttribute("data-locked", on) : (on ? root.setAttribute("data-locked", "") : null);
+      if (back) back.disabled = on;
+      if (restart) restart.disabled = on;
+      if (next) next.hidden = true;
+      if (deploy) { deploy.hidden = false; deploy.textContent = on ? "Start the deployment" : deploy.textContent; }
+    }
+
+    // Keeps data_mode, the hosts' disabled options and the shape's notes in step with what is chosen.
+    function syncChoices() {
+      const shapeEl = $('[name="shape"]:checked', root);
+      const two = Boolean(shapeEl && shapeEl.value === "bluegreen");
+      const keep = $('[name="keep_data"]', root);
+      const mode = two || (keep && keep.checked && !keep.closest("[hidden]")) ? "server" : "slot";
+      if (modeInput) modeInput.value = mode;
+      const pick = (slot) => { const el = $(`[data-host-select="${slot}"]`, root); return el ? el.value : ""; };
+      const blue = pick("blue"), green = two ? pick("green") : "";
+      $$("[data-host-select]", root).forEach((sel) => {
+        const slot = sel.dataset.hostSelect;
+        $$("option", sel).forEach((o) => {
+          if (!o.value || o.dataset.unpinned !== undefined) return;
+          let off = "";
+          if (mode === "server" && slot !== "data" && !o.dataset.ip) off = "Its address must be an IP for the data server to let it in";
+          if (slot === "data" && (o.value === blue || o.value === green)) off = "The data server needs a host of its own";
+          o.disabled = Boolean(off);
+          o.textContent = (o.dataset.label || o.textContent) + (off ? `: ${off}` : "");
+        });
+      });
+      const same = $("[data-same-host]", root);
+      if (same) same.hidden = !(two && blue && blue === green);
+      const none = $('[name="traffic.switch"][value="none"]', root), sy = $('[name="traffic.switch"][value="switchyard"]', root);
+      if (none) {
+        none.disabled = two;
+        if (two && none.checked && sy && !sy.disabled) sy.checked = true;
+      }
+      const slots = $("[data-name-slots]", root), name = ($('[name="name"]', root) || {}).value || "<name>";
+      if (slots) slots.textContent = `${name}-blue, ${name}-green and ${name}-data`;
+    }
+
+    // The manifest decides whether Blue/Green and a data server are possible (its capabilities, §12.3 step 2).
+    root.addEventListener("slipway:manifest", (ev) => {
+      const m = ev.detail;
+      state.manifest = m;
+      const caps = (m && m.capabilities) || [];
+      const path = (($('[name="manifest_file"]', root) || {}).value || "slipway.yml").trim();
+      const bg = $('[name="shape"][value="bluegreen"]', root), keep = $('[name="keep_data"]', root);
+      const bgReason = $("[data-bluegreen-reason]", root), keepReason = $("[data-server-reason]", root);
+      if (bg) {
+        bg.disabled = !caps.includes("bluegreen");
+        if (bg.disabled && bg.checked) $('[name="shape"][value="single"]', root).checked = true;
+      }
+      if (bgReason) bgReason.textContent = !m ? "Read slipway.yml first." : caps.includes("bluegreen") ? "" :
+        `${path} doesn't declare data.migrations: expand_contract, which two slots need`;
+      if (keep) {
+        keep.disabled = !caps.includes("server");
+        if (keep.disabled) keep.checked = false;
+      }
+      if (keepReason) keepReason.textContent = caps.includes("server") || !m
+        ? "The database and file store run on a host of their own, so a second slot can be added later."
+        : `${path} doesn't describe a data server (data.server)`;
+      const noData = $("[data-no-data]", root);
+      if (noData) noData.hidden = Boolean(m) && caps.some((c) => DATA_FIELD_CAPS.includes(c));
+      syncChoices();
+    });
+
+    // The Traffic step's table, from the last check's plan (§12.3 step 5).
+    const tls = {};
+    function fillTraffic() {
+      const body = $("[data-traffic-rows]", root);
+      if (!body) return;
+      $$("[data-map='route_tls']", body).forEach((sel) => { if (sel.value) tls[sel.dataset.mapKey] = sel.value; });
+      const plan = state.plan;
+      if (!plan || !(plan.hostnames || []).length) {
+        body.innerHTML = '<tr><td colspan="4" class="muted">slipway.yml gives no public names, or Slipway can list them only once the earlier steps are filled in.</td></tr>';
+        return;
+      }
+      const sw = ($('[name="traffic.switch"]:checked', root) || {}).value || "none";
+      const through = sw === "switchyard" ? `Switchyard (${ds.trafficAddress || "no traffic address set"})` : "Not published by Slipway";
+      const slots = plan.slots || {};
+      const modes = [["auto", "Let's Encrypt"], ["dns", "DNS challenge"], ["internal", "Internal CA"], ["off", "No TLS"]];
+      body.innerHTML = plan.hostnames.map((h) => {
+        const to = h.follows === "server" ? `The data server on ${(slots.data || {}).host || "its host"}` : `Blue on ${(slots.blue || {}).host || "its host"}`;
+        const chosen = tls[h.hostname] || "";
+        const options = [`<option value=""${chosen ? "" : " selected"}>Switchyard's (${esc(ds.defaultTls || "auto")})</option>`]
+          .concat(modes.map(([v, l]) => `<option value="${v}"${chosen === v ? " selected" : ""}>${esc(l)}</option>`)).join("");
+        return `<tr><td class="mono">${esc(h.hostname)}</td><td>${esc(through)}</td><td>${esc(to)}</td>` +
+          `<td><select class="input" data-map="route_tls" data-map-key="${esc(h.hostname)}" aria-label="TLS for ${esc(h.hostname)}">${options}</select></td></tr>`;
+      }).join("");
+    }
+
+    // Review: every choice as a definition list.
+    function fillReview() {
+      const dl = $("[data-review]", root);
+      if (!dl) return;
+      const body = flowBody(root, false, state.manifest);
+      const text = (sel) => { const el = $(sel, root); const o = el && el.selectedOptions && el.selectedOptions[0]; return o ? (o.dataset.label || o.textContent).trim() : ""; };
+      const two = (($('[name="shape"]:checked', root) || {}).value) === "bluegreen";
+      const rows = [
+        ["Name", body.name], ["Repository", text('[name="repository_id"]')], ["Branch", body.branch],
+        ["Manifest", body.manifest_file || "slipway.yml"],
+        ["Shape", two ? "Blue/Green, with a data server" : body.data_mode === "server" ? "Single slot, with a data server" : "Single slot"],
+        ["Blue", text('[data-host-select="blue"]')],
+      ];
+      if (body.hosts.green) rows.push(["Green", text('[data-host-select="green"]')]);
+      if (body.hosts.data) rows.push(["Data server", text('[data-host-select="data"]')]);
+      rows.push(["Settings", Object.keys(body.settings || {}).map((k) => `${k}=${body.settings[k]}`).join(", ") || "None set"]);
+      if (body.services) rows.push(["Optional services", body.services.join(", ") || "None"]);
+      rows.push(["Variables", Object.keys(body.env || {}).join(", ") || "None"]);
+      rows.push(["Switch", body.traffic.switch === "switchyard" ? `Switchyard${ds.trafficAddress ? ` (${ds.trafficAddress})` : ""}` : "None"]);
+      rows.push(["DNS", body.traffic.dns ? `Cloudflare, at ${body.traffic.dns.address || "the integration's public IP"}${body.traffic.dns.proxied ? ", proxied" : ""}` : "Not published"]);
+      if (two) rows.push(["Activate", body.auto_activate ? "Automatically when the smoke test passes" : "When you choose Activate"]);
+      const names = ((state.plan && state.plan.hostnames) || []).map((h) => h.hostname);
+      rows.push(["Public names", names.join(", ") || "None"]);
+      const fa = body.first_admin;
+      rows.push(["Data", body.seed_snapshot_id ? "From a snapshot" : "Start empty"]);
+      if (fa) rows.push(["First admin", (fa.fields && (fa.fields.email || Object.values(fa.fields)[0])) || "Set"]);
+      if (body.keep_backups) rows.push(["Backups to keep", String(body.keep_backups)]);
+      dl.innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v || "—")}</dd>`).join("");
+    }
+
+    root.addEventListener("change", syncChoices);
+    root.addEventListener("input", (ev) => { if (ev.target && ev.target.name === "name") syncChoices(); });
+    // Enter in a field would submit the form natively: it moves to the next step instead.
+    root.addEventListener("submit", (ev) => { ev.preventDefault(); if (state.current < FLOW_STEPS) nextStep(); else deployAll(); });
+    if (next) next.addEventListener("click", (ev) => { ev.preventDefault(); nextStep(); });
+    if (back) back.addEventListener("click", (ev) => { ev.preventDefault(); if (!state.created) { clearMarks(); go(state.current - 1); } });
+    if (deploy) deploy.addEventListener("click", (ev) => { ev.preventDefault(); deployAll(); });
+    if (restart) restart.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      if (state.created || !confirm("Start over? Every choice on this page is cleared.")) return;
+      if (root.reset) root.reset();
+      state.plan = null; state.unsure = false;
+      clearMarks(); say(""); sections.forEach((_, i) => stepError(i + 1, ""));
+      root.dispatchEvent(new Event("change"));
+      go(1);
+    });
+    syncChoices();
+    go(1);
   }
 
   // -------------------------------------------------------------- boot
@@ -1165,9 +1653,11 @@
       }
     } catch (e) { /* ignore */ }
     $$("[data-deploy-log]").forEach(streamLog);
-    $$("[data-load]").forEach(load);
+    $$("[data-load]").forEach((el) => { if (el.dataset.lazy === undefined) load(el); });
     $$("select[data-fill]").forEach(wireFill);
     $$("select[data-branches]").forEach(wireBranches);
+    // Before wireShowWhen: the flow keeps its computed fields (data_mode) current on every change first.
+    $$("form[data-env-flow]").forEach(wireEnvFlow);
     $$("form").forEach(wireShowWhen);
     $$("[data-app-form]").forEach(wireAppForm);
     $$("form[data-preview-form]").forEach(wirePreview);
@@ -1191,5 +1681,5 @@
     });
   });
 
-  window.slipway = { api, toast, serialize, humanBytes, statusBadge };
+  window.slipway = { api, toast, serialize, humanBytes, statusBadge, renderers, FIELD_STEP, fieldStep, flowBody };
 })();

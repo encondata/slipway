@@ -1,8 +1,8 @@
 # Bringing Sirdar into Slipway
 
-Status: phases 1 (manifest and steps) and 2 (data safety) are built on branch `sirdar`
-(from `instance-folders`); phase 2 still has to pass the real-host checks below. Phases 3
-to 6 are the plan.
+Status: phases 1 (manifest and steps), 2 (data safety) and 3 (environments and slots) are
+built on branch `sirdar` (from `instance-folders`). Phases 2 and 3 still have to pass their
+real-host checks below. Phases 4 to 6 are the plan.
 
 ## Goal
 
@@ -20,10 +20,10 @@ it deploys the same way. Once it matches Sirdar, Sirdar is retired.
 | Web | Jinja pages and `slipway.js` | React (about 20k lines), imports portal code |
 | Sign-in | its own users, roles, GitHub | portal users ranked admin, their portal passwords and 2FA |
 | What it deploys | any repository: a Dockerfile or a compose file | ServerSherpa only: the five stacks in `deploy/stack`, through `ss-stack` |
-| Unit | instance: one repository, one branch, one host | environment: one ServerSherpa, one or two slots |
+| Unit | instance: one repository, one branch, one host; phase 3: environment, one or two app slots and a data server, each an instance | environment: one ServerSherpa, one or two slots |
 | Engine | shell over its own SSH session, one log per deployment | 17 numbered steps as Ansible playbooks, one log per step, retry from the failed step |
 | Targets | SSH hosts | SSH, Proxmox (Terraform), ESXi (pyvmomi), DigitalOcean (VPC, droplets, managed Postgres, Spaces, load balancer, firewall, certificates) |
-| Traffic | Switchyard routes | Cloudflare DNS, Nginx Proxy Manager on the LAN, DigitalOcean load balancer plus Caddy in the cloud |
+| Traffic | Switchyard routes; phase 3: Activate repoints an environment's names in Switchyard, and Cloudflare DNS records at a fixed address | Cloudflare DNS, Nginx Proxy Manager on the LAN, DigitalOcean load balancer plus Caddy in the cloud |
 | Data | phase 2: a backup before every change that replaces data, the Backups list, restore, reset, roll back, encrypted snapshots ([snapshots.md](snapshots.md)) | a dump before each Update only (not before a restore or a reset), restore, reset, roll back, snapshot bundles, VM snapshots |
 
 Sirdar's ServerSherpa knowledge sits in a few modules: `envfile.py` (the `.env`
@@ -125,23 +125,29 @@ The draft's sketch of this was wrong in one place: its first admin passed
 `bootstrap-admin` reached the command twice and it failed with a usage error),
 and it lacked the required `--first-name` and `--last-name`.
 
-The draft's attachable data (a managed Postgres or Spaces bucket in place of
-the app's own stacks, with the `.env` keys that point the app at them) and
-`migrations: expand_contract` belong to phases 3 and 4. In phase 2 an instance
-whose data lives outside its host (`STACK_EXTERNAL_DATA=1`, `STACK_DB_HOST`, or
-a LAN data VM, where `ss-stack has-data` exits 4) is backed up, but Slipway
-won't restore over it, roll it back, reset it or seed it.
+Phase 3 adds the keys an environment needs ([manifest.md](manifest.md#environments-attach-and-server)):
+`services.<name>.health` (the path the checks request), `data.migrations:
+expand_contract` (required for two app slots), `data.attach` (the `.env` keys that
+point an app slot at data on another host, built from named endpoints such as
+`{data.db.host}`) and `data.server` (which services, ports, secrets, projects,
+volumes and commands the data server uses, and the endpoints it provides). Phase 4
+fills the same `data.attach` from a managed Postgres and a Spaces bucket. An
+instance outside an environment whose data lives outside its host
+(`STACK_EXTERNAL_DATA=1`, `STACK_DB_HOST`, or a hand-made data VM, where
+`ss-stack has-data` exits 4) is still backed up, and Slipway still won't restore
+over it, roll it back, reset it or seed it.
 
 A repository without `slipway.yml` deploys exactly as it does today.
 
 ## New pieces in Slipway
 
-**Environments and slots.** An environment is one app from one repository and
-branch: it has its settings, secrets, attached data and public names. It runs in
-one slot, or in two for Blue/Green. Each slot is an ordinary Slipway instance on a
-host, so the existing deploy, logs, ports and folders keep working, and each slot
-can be on a different server. One slot is active. Instances that don't belong to
-an environment keep working as they do now.
+**Environments and slots (phase 3, built).** An environment is one app from one
+repository and branch: it has its settings, secrets, attached data and public names.
+It runs in one slot, or in two for Blue/Green with a data server both slots use. Each
+slot and the data server is an ordinary Slipway instance on a host, so the existing
+deploy, logs, ports and folders keep working, and each can be on a different server.
+One slot is active. Instances that don't belong to an environment keep working as
+they do now. [environments.md](environments.md) explains how to set one up and run it.
 
 **Providers that make hosts.** A host gets a provider: `ssh` (today's hosts),
 `digitalocean`, `proxmox` or `esxi`. A provider creates the server, pins its host
@@ -156,11 +162,13 @@ or deletes what it recorded, as Sirdar does with `managed_records` and
 `do_resources`. Their credentials go into the slot's `.env` under the keys the
 manifest names.
 
-**Traffic switches.** The active slot is switched through one interface with
-three backends: the DigitalOcean load balancer (add the new droplet, wait for
-health, smoke test, remove the old one), Switchyard on the LAN (repoint the routes,
-the role Nginx Proxy Manager plays in Sirdar), and Cloudflare DNS for the public
-names.
+**Traffic switches.** The active slot is switched through one interface. Phase 3
+builds its Switchyard backend: Activate repoints the environment's Switchyard hosts
+in one apply, checks the names through Switchyard, and puts them back if anything
+fails (the role Nginx Proxy Manager plays in Sirdar). Phase 4 adds the DigitalOcean
+load balancer (add the new droplet, wait for health, smoke test, remove the old
+one). Cloudflare DNS is not a switch: Slipway keeps an A record per public name at
+one fixed address (the WAN address, or later the load balancer's), as Sirdar does.
 
 **Steps.** Every deployment runs as numbered steps (Resolve the commit, Download
 the source, Upload the release, Read slipway.yml, Check host ports, Write the
@@ -172,8 +180,11 @@ build when they are still on the host (the release of a deployment that failed
 after its build is kept for that), and runs the settings, ports and start again.
 Phase 2 adds Back up the data (after Build) to an app's deploys, and data jobs
 (restore, reset, roll back, snapshots, first admin, starter content) run as
-deployments of their own kind with their own steps. Environment deploys will add
-Prepare server, Restore, Smoke test, Switch traffic and the teardown steps.
+deployments of their own kind with their own steps. Phase 3 adds the environment's
+steps: Check the slot (smoke test), Update Switchyard, Update DNS records, Stop and
+start Blue and Green around a data job, and the steps of the jobs that run on the
+environment itself (Activate, Publish names, Discard, Remove a slot, Delete). Phase 5
+adds Prepare server.
 
 **Backups and snapshots (phase 2).** A backup before every change that replaces
 data: before a deploy (which migrates), a restore, a reset and a roll back, kept
@@ -232,8 +243,44 @@ Each phase merges on its own and leaves Slipway working.
       the host, and still backs up.
 
    After each, a user signs in with their own password and 2FA.
-3. **Environments and slots.** Environments, Blue/Green on SSH hosts with a
-   separate data server, Switchyard switching, Activate, Cloudflare DNS.
+3. **Environments and slots (built; real-host checks to do).** Environments,
+   Blue/Green on SSH hosts with a separate data server, Switchyard switching,
+   Activate and switch back, Discard of a failed idle-slot deploy, Cloudflare DNS.
+   The design is [phase3-environments.md](phase3-environments.md); how to use it is
+   [environments.md](environments.md). BaseCampV3's side is on `slipway-manifest`:
+   the phase 3 keys in `slipway.yml`, `ss-stack has-data --server`, a data server
+   that runs only its db and storage stacks (`STACKS=(db storage)` with
+   `STACK_DB_PUBLISH=1`, and `restore` stopping only the app stacks it runs), and
+   `deploy/stack/test-server-role.sh`.
+
+   **Real-host checks** (not in CI). Three LAN hosts with pinned keys (blue, green,
+   data), Switchyard with a traffic address, Cloudflare with a test zone, and
+   BaseCampV3 `slipway-manifest`:
+   1. create `uat` as Blue/Green with DNS and `tls_mode auto`: the chain deploys the
+      data server (its DNS records and `spaces` host appear), then blue, then
+      activates blue and adds the starter content; Back up now carries the
+      environment's identity keys;
+   2. deploy a commit with an expand migration to green while blue serves, and
+      activate green: the same session and 2FA still work;
+   3. switch back (while a Back up now runs) and forward again; switch back once
+      more and deploy a fix to green: the lag check refuses it until confirmed;
+   4. deploy a commit whose migration fails to the idle slot, then Discard it
+      (nothing restored); repeat and Roll back instead (both slots stop, the failed
+      one stays stale);
+   5. restore a backup (both slots stopped, the lead slot migrated and started
+      before the job ends); make the lead slot's start fail once and see the job
+      fail and hold; take a snapshot and seed a second environment from it;
+   6. remove green, add it on another host with the data server updated, deploy
+      to it;
+   7. stop Switchyard during an Activate (names put back), then Resolve;
+   8. delete `uat`: only the records and hosts Slipway made are gone, and the
+      volumes and backups stay on the data host;
+   9. a standalone ServerSherpa instance on one of the hosts deploys and publishes
+      as before throughout;
+   10. restart Slipway during the chain (after the data server deploy's `finish`):
+       the environment page's notice continues it.
+
+   After each, a user signs in with their own password and 2FA.
 4. **DigitalOcean.** Accounts (production and development), VPC, droplets as hosts,
    managed Postgres, Spaces bucket and key, load balancer, firewall, certificates,
    the load-balancer switch, delete with the name and the production phrase.

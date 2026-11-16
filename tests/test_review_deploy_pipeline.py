@@ -233,7 +233,7 @@ async def test_host_change_refused_while_a_deploy_task_is_pending(admin_client, 
         await gate.wait()
 
     monkeypatch.setattr(deployer, "run_deployment", slow_deploy)
-    deployer.runner.submit(uuid.uuid4(), inst_id)
+    deployer.runner.submit(uuid.uuid4(), (inst_id,))
     try:
         r = await admin_client.patch(f"/api/v1/instances/{inst_id}", json={"host_id": str(other_id)})
         assert r.status_code == 409
@@ -335,14 +335,14 @@ async def test_delete_refused_while_runner_holds_the_instance(admin_client, monk
         await gate.wait()
 
     monkeypatch.setattr(deployer, "run_deployment", slow_deploy)
-    deployer.runner.submit(uuid.uuid4(), inst_id)
+    deployer.runner.submit(uuid.uuid4(), (inst_id,))
     try:
         r = await admin_client.delete(f"/api/v1/instances/{inst_id}")
         assert r.status_code == 409
     finally:
         gate.set()
         await asyncio.gather(*deployer.runner._tasks)
-    assert not deployer.runner.busy(inst_id)
+    assert not deployer.runner.busy((inst_id,))
 
 
 async def test_deploys_during_delete_never_reach_the_host(admin_client, monkeypatch):
@@ -369,7 +369,7 @@ async def test_deploys_during_delete_never_reach_the_host(admin_client, monkeypa
         dep = Deployment(instance_id=inst_id, branch="main", log="")
         db.add(dep)
         await db.commit()
-    deployer.runner.submit(dep.id, inst_id)
+    deployer.runner.submit(dep.id, (inst_id,))
     await asyncio.sleep(0.05)
 
     gate.set()

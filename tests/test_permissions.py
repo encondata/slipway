@@ -231,3 +231,164 @@ async def test_conditional_data_permissions(make_client):
     assert r.status_code == 403 and "instances:operate" in r.json()["detail"]
     r = await c["developer"].post(f"/api/v1/deployments/{taken}/retry")
     assert r.status_code == 202 and r.json()["options"]["stop_app"] is True
+
+
+# ------------------------------------------------------------- environments (phase 3 §11, test 52)
+
+import pytest  # noqa: E402
+
+from tests.test_env_api import (  # noqa: E402
+    HOSTNAMES,
+    _create_body,
+    _fake_key,
+    _update,
+    cf,  # noqa: F401  (autouse: a FakeCloudflare)
+    github,  # noqa: F401  (autouse: the repository's files)
+    no_public_checks,  # noqa: F401  (autouse)
+    sy,  # noqa: F401  (autouse: a FakeSwitchyard)
+)
+from tests.test_env_rules import T0, _failed_green, _job, _world  # noqa: E402
+
+
+async def _settle(env_id) -> None:
+    """Undo what an allowed request queued, so the next request meets the same environment."""
+    from sqlalchemy import update
+
+    from slipway.db.session import get_sessionmaker
+    from slipway.models import Deployment, Environment
+
+    async with get_sessionmaker()() as db:
+        await db.execute(update(Deployment).where(Deployment.status.in_(["queued", "running"]))
+                         .values(status="cancelled", finished_at=T0))
+        await db.execute(update(Environment).where(Environment.id == env_id).values(status="live", deleted_at=None))
+        await db.commit()
+
+
+@pytest.mark.parametrize("role", ROLES)
+async def test_environment_endpoints_by_role(make_client, role):
+    """Every §11 endpoint against one built-in role: 403 for a role without the permission, anything else
+    (the request runs, or is refused for another reason) for a role with it. One role per run, so each meets a
+    fresh database."""
+    from datetime import timedelta
+
+    from slipway.db.session import get_sessionmaker
+    from slipway.models import Environment
+
+    c = await clients(make_client)
+    ids = await _world()
+    await _fake_key()
+    await _update(Environment, ids["env"], hostnames=HOSTNAMES)
+    async with get_sessionmaker()() as db:
+        failed = await _failed_green(db, ids)
+        activate = _job(None, ids["env"], "activate", "failed", at=T0 + timedelta(hours=2),
+                        options={"slot": "green", "from_slot": "blue"})
+        remove = _job(None, ids["env"], "remove_slot", "failed", at=T0 + timedelta(hours=2), options={"slot": "green"})
+        teardown = _job(None, ids["env"], "teardown", "failed", at=T0 + timedelta(hours=2), options={"confirmed": True})
+        done = _job(ids["green"], ids["env"], "deploy", "succeeded", at=T0 + timedelta(minutes=30),
+                    options={"slot": "green"})
+        db.add_all([activate, remove, teardown, done])
+        await db.commit()
+    e = f"/api/v1/environments/{ids['env']}"
+    notice = {"text": "stopped", "at": T0.isoformat(), "deployment_id": done.id.hex,
+              "next": {"kind": "activate", "slot": "green"}}
+    endpoints = [
+        # Roll back first: it needs the failed deploy to be the latest changing job, and data:reset on shared data.
+        ("post", f"/api/v1/deployments/{failed.id}/rollback", {"confirm": "uat"}, {M, A}),
+        ("get", "/api/v1/environments", None, {V, D, M, A}),
+        ("post", "/api/v1/environments?check=true", _create_body(ids), {M, A}),
+        ("post", "/api/v1/environments", _create_body(ids, name="uat"), {M, A}),
+        ("get", e, None, {V, D, M, A}),
+        ("patch", e, {"keep_backups": 4}, {M, A}),
+        ("get", f"{e}/env", None, {M, A}),
+        ("post", f"{e}/deploy", None, {D, M, A}),
+        ("post", f"{e}/deploy", {"target": "data"}, {D, M, A}),
+        ("post", f"{e}/activate", {"slot": "green"}, {D, M, A}),
+        ("post", f"{e}/publish", None, {D, M, A}),
+        ("post", f"{e}/discard", {"slot": "green"}, {D, M, A}),
+        ("post", f"{e}/notice/continue", None, {D, M, A}),
+        ("get", f"{e}/traffic/plan", None, {V, D, M, A}),
+        ("get", f"{e}/traffic/plan?slot=green", None, {V, D, M, A}),
+        ("post", f"{e}/traffic/resolve", {"confirm": "uat"}, {D, M, A}),
+        ("get", f"{e}/dns", None, {V, D, M, A}),
+        ("post", f"{e}/dns/claim", {"hostname": "api.uat.example.com"}, {D, M, A}),
+        ("post", f"{e}/slots", {"host_id": str(ids["host_green"])}, {M, A}),
+        ("delete", f"{e}/slots/green", {"confirm": "uat"}, {M, A}),
+        ("delete", e, {"confirm": "uat"}, {M, A}),
+        ("delete", e, {"confirm": "uat", "snapshot": {"name": "matrix-snap"}}, {M, A}),
+        ("get", f"{e}/deployments", None, {V, D, M, A}),
+        ("get", "/api/v1/settings/cloudflare", None, {A}),
+        ("put", "/api/v1/settings/cloudflare", {"zone": "example.com"}, {A}),
+        ("post", "/api/v1/settings/cloudflare/test", None, {A}),
+        ("put", "/api/v1/settings/switchyard", {"url": "https://sy.example.test", "traffic_address": "10.0.0.2"}, {A}),
+        ("post", f"/api/v1/deployments/{activate.id}/retry", None, {D, M, A}),
+        ("post", f"/api/v1/deployments/{remove.id}/retry", {"confirm": "uat"}, {M, A}),
+        ("post", f"/api/v1/deployments/{teardown.id}/retry", {"confirm": "uat"}, {M, A}),
+        ("get", f"/api/v1/deployments?environment={ids['env']}", None, {V, D, M, A}),
+        ("get", f"/api/v1/deployments/{activate.id}", None, {V, D, M, A}),
+    ]
+    for method, url, body, allowed in endpoints:
+        await _update(Environment, ids["env"], notice=notice)
+        kw = {"json": body} if body is not None else {}
+        r = await c[role].request(method.upper(), url, **kw)
+        if role in allowed:
+            assert r.status_code != 403, (role, method, url, r.text)
+        else:
+            assert r.status_code == 403, (role, method, url, r.status_code, r.text)
+        await _settle(ids["env"])
+
+
+async def test_environment_conditional_permissions(make_client):
+    """Permissions an environment request needs because of what it asks for (§4.1): a deploy that goes live by
+    itself (traffic:switch), a seed snapshot (data:reset), another repository's snapshot (snapshots:download),
+    a delete that takes a snapshot first (data:backup) and Add a slot that updates the data server
+    (deployments:create)."""
+    import uuid
+
+    from slipway.db.session import get_sessionmaker
+    from slipway.models import Environment, Snapshot
+    from tests.test_data_api import client_with
+    from tests.test_env_rules import MAN
+
+    c = await clients(make_client)
+    ids = await _world(active=None, status="new")
+    e = f"/api/v1/environments/{ids['env']}"
+    deployer_only = await client_with(make_client, "deployer@example.com",
+                                      ["environments:read", "deployments:create"])
+    # Nothing is live: the deploy goes live by itself, which takes traffic:switch.
+    r = await deployer_only.post(f"{e}/deploy")
+    assert r.status_code == 403 and "traffic:switch" in r.json()["detail"]
+    r = await c["developer"].post(f"{e}/deploy")
+    assert r.status_code == 202 and r.json()["options"]["go_live"] is True, r.text
+    await _settle(ids["env"])
+    await _update(Environment, ids["env"], status="new")
+
+    async with get_sessionmaker()() as db:
+        same = Snapshot(id=uuid.uuid4(), name="same-repo", status="ready", origin="instance", app=MAN.data.app,
+                        repository="acme/serversherpa", file_sha256="a" * 64, db_sha256="b" * 64)
+        other = Snapshot(id=uuid.uuid4(), name="other-repo", status="ready", origin="instance", app=MAN.data.app,
+                         repository="acme/other", file_sha256="c" * 64, db_sha256="d" * 64)
+        db.add_all([same, other])
+        await db.commit()
+    writer = await client_with(make_client, "writer@example.com", ["environments:read", "environments:write"])
+    body = _create_body(ids, first_admin=None, seed_snapshot_id=str(same.id))
+    r = await writer.post("/api/v1/environments?check=true", json=body)
+    assert r.status_code == 403
+    assert r.json() == {"detail": "Starting from a snapshot needs the data:reset permission", "field": "seed_snapshot_id"}
+    r = await c["maintainer"].post("/api/v1/environments?check=true", json=body)
+    assert r.status_code == 200, r.text
+    body = _create_body(ids, first_admin=None, seed_snapshot_id=str(other.id))
+    r = await c["maintainer"].post("/api/v1/environments?check=true", json=body)
+    assert r.status_code == 403 and "snapshots:download" in r.json()["detail"]
+    r = await c["admin"].post("/api/v1/environments?check=true", json=body)
+    assert r.status_code == 200, r.text
+
+    deleter = await client_with(make_client, "deleter@example.com", ["environments:read", "environments:delete"])
+    r = await deleter.request("DELETE", e, json={"confirm": "uat", "snapshot": {"name": "before"}})
+    assert r.status_code == 403 and "data:backup" in r.json()["detail"]
+    r = await deleter.request("DELETE", e, json={"confirm": "uat"})
+    assert r.status_code == 202 and r.json()["kind"] == "teardown"
+    await _settle(ids["env"])
+
+    adder = await client_with(make_client, "adder@example.com", ["environments:read", "environments:write"])
+    r = await adder.post(f"{e}/slots", json={"host_id": str(ids["host_green"]), "update_data_server": True})
+    assert r.status_code == 403 and "deployments:create" in r.json()["detail"]

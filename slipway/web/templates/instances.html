@@ -23,7 +23,8 @@
     <tbody>
     {% for i in instances %}
       <tr>
-        <td><a class="primary-cell" href="/instances/{{ i.id }}" style="color:inherit"><span class="row-icon">{{ icon("box") }}</span><span><strong>{{ i.name }}</strong><small class="mono">{{ i.slug }}</small></span></a></td>
+        <td><a class="primary-cell" href="/instances/{{ i.id }}" style="color:inherit"><span class="row-icon">{{ icon("box") }}</span><span><strong>{{ i.name }}</strong><small class="mono">{{ i.slug }}</small></span></a>
+          {%- if i.environment_id and i.environment %} <span class="chip env-chip" title="{{ 'The data server' if i.slot == 'data' else 'A slot' }} of environment {{ i.environment.name }}">{{ i.environment.name }} · {{ i.slot }}</span>{% endif %}</td>
         <td class="muted">{{ i.repository.full_name }}</td>
         <td><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span></td>
         <td>{% if can_hosts %}<a href="/hosts/{{ i.host.id }}">{{ i.host.name }}</a>{% else %}{{ i.host.name }}{% endif %}</td>
@@ -31,7 +32,9 @@
         <td>{{ badge("instance", i.status) }}</td>
         <td class="muted nowrap">{{ i.last_deployed_at|timeago }}{% if i.current_commit_sha %}<div class="subtle mono">{{ i.current_commit_sha[:7] }}</div>{% endif %}</td>
         <td class="actions-cell">
-          {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}
+          {% if i.environment_id %}
+          {% if auth.can(Perm.ENVIRONMENTS_READ) and i.environment %}<a class="btn btn-sm" href="/environments/{{ i.environment.id }}" title="Deploy {{ i.environment.name }} from its page: Slipway picks the slot">{{ icon("environments", "i-sm") }} Environment</a>{% endif %}
+          {% elif auth.can(Perm.DEPLOYMENTS_CREATE) %}
           <button class="btn btn-sm" data-api="POST /api/v1/instances/{{ i.id }}/deploy" {% if can_deployments %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Deployment queued"{% endif %} {{ 'disabled' if i.status == 'deploying' }}>{{ icon("rocket", "i-sm") }} Deploy</button>
           {% endif %}
           <a class="btn btn-sm" href="/instances/{{ i.id }}">Open</a>

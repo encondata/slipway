@@ -23,7 +23,8 @@
 {#- What a running job of each kind is doing (slipway.js STATUS says the same). -#}
 {% set RUNNING_LABELS = {"deploy": "Building", "restore": "Restoring", "reset": "Resetting", "rollback": "Rolling back",
                          "backup": "Backing up", "snapshot": "Taking snapshot", "admin": "Creating admin",
-                         "content": "Adding content"} %}
+                         "content": "Adding content", "activate": "Activating", "publish": "Publishing",
+                         "discard": "Discarding", "remove_slot": "Removing", "teardown": "Deleting"} %}
 
 {#- ``job`` is the kind of the deployment (or of the instance's active job): a running restore reads
     Restoring, and a finished job that isn't a deploy reads Done. -#}
@@ -37,6 +38,8 @@
                  "failed": ("Failed", "error"), "cancelled": ("Cancelled", "")},
   "repo": {"unconfigured": ("Not configured", ""), "running": ("Deployed", "success"), "deploying": ("Building", "warning spin"),
            "failed": ("Failed", "error"), "stopped": ("Stopped", ""), "created": ("Not deployed", "")},
+  "environment": {"new": ("New", "primary"), "live": ("Live", "success"), "deleting": ("Deleting", "warning spin"),
+                  "deleted": ("Deleted", "")},
 } -%}
 {%- set label, cls = maps[kind].get(value, (value|replace("_", " ")|title, "")) -%}
 {%- if job and job != "deploy" and kind == "deployment" and value == "succeeded" %}{% set label = "Done" %}{% endif -%}
@@ -82,4 +85,17 @@
 
 {% macro repo_icon(repo) -%}
 <span class="row-icon">{{ icon("lock" if repo.is_private else "repositories") }}</span>
+{%- endmacro %}
+
+{#- A slot of an environment: ``Live`` / ``Idle`` / ``Data`` (phase 3 §12.2), with its name. -#}
+{% macro slot_chip(slot, active=False) -%}
+{%- if slot == "data" -%}<span class="chip slot-chip data" title="The data server">Data</span>
+{%- elif active -%}<span class="chip slot-chip live" title="Takes the traffic">{{ slot|capitalize }} · Live</span>
+{%- else -%}<span class="chip slot-chip" title="Doesn't take traffic">{{ slot|capitalize }} · Idle</span>{%- endif -%}
+{%- endmacro %}
+
+{#- A smoke test's result (``pages.check_view``): OK or Failed, the time and the failing names in the title. -#}
+{% macro check_chip(c) -%}
+{%- if c -%}<span class="badge {{ 'success' if c.ok else 'error' }}" title="{{ c.title }}">{{ "OK" if c.ok else "Failed" }}</span>
+{%- else -%}<span class="subtle">Not checked</span>{%- endif -%}
 {%- endmacro %}

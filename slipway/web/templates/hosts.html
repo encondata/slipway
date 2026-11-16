@@ -16,12 +16,12 @@
   {% if hosts %}
   {% set can_instances = auth.can(Perm.INSTANCES_READ) %}
   <div class="table-wrap"><table class="table">
-    <thead><tr><th>Host</th><th>Environment</th><th>Health</th><th>CPU</th><th>RAM</th><th>Docker</th>{% if can_instances %}<th>Instances</th>{% endif %}<th>Checked</th><th class="num">Actions</th></tr></thead>
+    <thead><tr><th>Host</th><th>Label</th><th>Health</th><th>CPU</th><th>RAM</th><th>Docker</th>{% if can_instances %}<th>Instances</th>{% endif %}<th>Checked</th><th class="num">Actions</th></tr></thead>
     <tbody>
     {% for h in hosts %}
       <tr>
         <td><a class="primary-cell" href="/hosts/{{ h.id }}" style="color:inherit"><span class="row-icon">{{ icon("hosts") }}</span><span><strong>{{ h.name }}</strong><small class="mono">{{ h.username }}@{{ h.address }}</small></span></a></td>
-        <td>{% if h.environment %}<span class="chip">{{ h.environment }}</span>{% else %}<span class="subtle">—</span>{% endif %}</td>
+        <td>{% if h.label %}<span class="chip">{{ h.label }}</span>{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td>{{ badge("host", h.status) }}</td>
         <td>{% if h.metrics.cpu_percent is defined %}{{ meter("CPU", h.metrics.cpu_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td>{% if h.metrics.mem_percent is defined %}{{ meter("RAM", h.metrics.mem_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>

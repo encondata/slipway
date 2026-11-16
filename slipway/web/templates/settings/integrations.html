@@ -23,6 +23,11 @@
           placeholder="{{ 'Saved; leave empty to keep it' if sy_has_key else 'sy_…' }}" {{ '' if sy_has_key else 'required' }}>
         <span class="help">{% if sy_key_prefix %}Saved key: <code>{{ sy_key_prefix }}…</code>, the same prefix Switchyard lists under API keys. {% endif %}Encrypted at rest and never shown again.</span>
       </div>
+      <div class="field span-2">
+        <label for="sy-traffic">Traffic address</label>
+        <input class="input mono" id="sy-traffic" name="traffic_address" value="{{ sy.traffic_address or '' }}" placeholder="10.0.0.2 or proxy.lan:443" data-keep-empty autocomplete="off" spellcheck="false">
+        <span class="help">Where Switchyard serves the hostnames, as host or host:port. After a switch, Slipway checks each name through it from this server. Empty: the check is skipped with a warning.</span>
+      </div>
       <div class="field">
         <label for="sy-tls">Default certificate for new hostnames</label>
         <select class="input" id="sy-tls" name="default_tls_mode">
@@ -41,6 +46,45 @@
       <button class="btn" type="button" data-api="POST /api/v1/settings/switchyard/test" data-success-field="message">{{ icon("sync", "i-sm") }} Test connection</button>
       <button class="btn btn-danger" type="button" data-api="PUT /api/v1/settings/switchyard" data-body='{"clear": true}'
         data-confirm="Disconnect Switchyard? Hostnames already in Switchyard stay there; Slipway stops updating them." data-success="Switchyard disconnected" data-then="reload">Disconnect</button>
+      {% endif %}
+    </div>
+  </form>
+</section>
+
+<section class="card" id="cloudflare-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("cloud", "i-lg") }}</span>
+    <div><h2>Cloudflare</h2><p>DNS records for environments' public names. Slipway publishes an A record for each name, at a fixed address, and changes only records it made or claimed.</p></div>
+    <span class="spacer"></span>
+    {% if cf.configured %}<span class="badge success">Connected</span>{% else %}<span class="badge">Not set up</span>{% endif %}
+  </div>
+  <form class="card-body stack" style="gap: 16px" method="post" action="/js-required"
+        data-form="PUT /api/v1/settings/cloudflare" data-success="Cloudflare settings saved" data-then="reload">
+    <div class="form-grid">
+      <div class="field">
+        <label for="cf-zone">Zone</label>
+        <input class="input mono" id="cf-zone" name="zone" value="{{ cf.zone }}" placeholder="example.com" required autocomplete="off" spellcheck="false">
+        <span class="help">The domain whose records Slipway manages{% if cf.zone_id %} (zone <code>{{ cf.zone_id }}</code>){% endif %}.</span>
+      </div>
+      <div class="field">
+        <label for="cf-ip">Public IP</label>
+        <input class="input mono" id="cf-ip" name="public_ip" value="{{ cf.public_ip }}" placeholder="203.0.113.10" autocomplete="off" spellcheck="false">
+        <span class="help">The WAN address published records point at.</span>
+      </div>
+      <div class="field">
+        <label for="cf-token">API token</label>
+        <input class="input mono" id="cf-token" name="token" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+          placeholder="{{ ('Set (…' ~ cf.token_hint ~ '); leave empty to keep it') if cf.has_token else 'A Cloudflare API token' }}" {{ '' if cf.has_token else 'required' }}>
+        <span class="help">{% if cf.has_token %}Set (…{{ cf.token_hint }}). {% endif %}It needs Zone DNS Edit and Zone Read on this zone. Encrypted at rest and never shown again.</span>
+      </div>
+      <label class="check" style="align-self: end"><input type="checkbox" name="proxied" {{ 'checked' if cf.proxied }}><span><strong>Proxied by default</strong><br><span class="subtle">New records go through Cloudflare's proxy unless an environment says otherwise.</span></span></label>
+    </div>
+    <div class="row" style="gap: 8px; flex-wrap: wrap">
+      <button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button>
+      {% if cf.configured %}
+      <button class="btn" type="button" data-api="POST /api/v1/settings/cloudflare/test" data-success-field="message">{{ icon("sync", "i-sm") }} Test</button>
+      <button class="btn btn-danger" type="button" data-api="PUT /api/v1/settings/cloudflare" data-body='{"clear": true}'
+        data-confirm="Remove the Cloudflare integration? Records already in Cloudflare stay there; Slipway stops managing them." data-success="Cloudflare removed" data-then="reload"
+        {% if cf_users %}disabled title="Environments {{ cf_users|join(', ') }} publish DNS records through Cloudflare; turn that off on them first"{% endif %}>Remove</button>
       {% endif %}
     </div>
   </form>

@@ -24,6 +24,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
 | Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
+| Environments | An app from one branch in one slot or in Blue/Green slots that share a data server, on your SSH hosts: deploys go to the idle slot, Activate moves the names in Switchyard after a smoke test and puts them back if a check fails, Switch back, Discard, Cloudflare DNS records ([docs/environments.md](docs/environments.md)) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
 | UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
 

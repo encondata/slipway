@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import ForeignKey, Index, String, Text, false, text, true
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, Text, UniqueConstraint, false, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from slipway.core.crypto import EncryptedJSON
@@ -15,6 +15,9 @@ from slipway.db.base import Base, Timestamps, UUIDPrimaryKey
 from slipway.models.host import Host
 from slipway.models.repository import Repository
 from slipway.models.user import User
+
+if TYPE_CHECKING:
+    from slipway.models.environment import Environment
 
 
 class BuildSource(StrEnum):
@@ -54,6 +57,12 @@ class DeploymentKind(StrEnum):
     SNAPSHOT = "snapshot"
     ADMIN = "admin"
     CONTENT = "content"
+    # Environment-level jobs (phase 3 D9): instance_id is None and environment_id is set.
+    ACTIVATE = "activate"
+    PUBLISH = "publish"
+    DISCARD = "discard"
+    REMOVE_SLOT = "remove_slot"
+    TEARDOWN = "teardown"
 
 
 class FreshData(StrEnum):
@@ -65,6 +74,11 @@ class FreshData(StrEnum):
 
 class Instance(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "instances"
+    __table_args__ = (
+        # One instance per slot of an environment; a slot always belongs to an environment and back.
+        UniqueConstraint("environment_id", "slot", name="uq_instances_environment_id_slot"),
+        CheckConstraint("(environment_id IS NULL) = (slot IS NULL)", name="slot_pair"),
+    )
 
     name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(63), unique=True)
@@ -142,8 +156,18 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     fresh_data: Mapped[str | None] = mapped_column(String(8))  # FreshData
     last_control_at: Mapped[datetime | None]  # the last start or restart from the instance page
 
+    # Phase 3: the environment this instance is a slot of (None for a standalone instance), which slot
+    # (``blue``, ``green``, or ``data`` for the data server), and the slot's own state:
+    # {last_check: {ok, at, deployment_id, results} | None, stale: {reason, at, deployment_id} | None}.
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="RESTRICT"), index=True
+    )
+    slot: Mapped[str | None] = mapped_column(String(8))  # SlotName
+    slot_state: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+
     repository: Mapped[Repository] = relationship(lazy="selectin")
     host: Mapped[Host] = relationship(lazy="selectin")
+    environment: Mapped[Environment | None] = relationship(lazy="selectin", foreign_keys=[environment_id])
 
     @property
     def container_name(self) -> str:
@@ -173,6 +197,10 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
         return self.container_name
 
 
+ACTIVE_ENV_JOB = "status IN ('queued', 'running') AND kind <> 'activate'"
+ACTIVE_ACTIVATE = "status IN ('queued', 'running') AND kind = 'activate'"
+
+
 class Deployment(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "deployments"
     __table_args__ = (
@@ -184,9 +212,35 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
             postgresql_where=text("status IN ('queued', 'running')"),
             sqlite_where=text("status IN ('queued', 'running')"),
         ),
+        # Phase 3 (I2): at most one queued or running job per environment besides activate, and at most
+        # one activate. NULLs never conflict, so standalone instances are unaffected.
+        Index(
+            "ux_deployments_one_active_env",
+            "environment_id",
+            unique=True,
+            postgresql_where=text(ACTIVE_ENV_JOB),
+            sqlite_where=text(ACTIVE_ENV_JOB),
+        ),
+        Index(
+            "ux_deployments_one_active_activate",
+            "environment_id",
+            unique=True,
+            postgresql_where=text(ACTIVE_ACTIVATE),
+            sqlite_where=text(ACTIVE_ACTIVATE),
+        ),
+        # Every job is about an instance, an environment, or both.
+        CheckConstraint("instance_id IS NOT NULL OR environment_id IS NOT NULL", name="subject"),
     )
 
-    instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("instances.id", ondelete="CASCADE"), index=True)
+    # None for an environment-level job (activate, publish, discard, remove_slot, teardown).
+    instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("instances.id", ondelete="CASCADE"), index=True
+    )
+    # Set on every job of an environment member and on every environment-level job. SET NULL keeps the
+    # job and its log should the environment row ever go (environments are only soft-deleted).
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[str] = mapped_column(String(16), default=DeploymentStatus.QUEUED, index=True)
     branch: Mapped[str] = mapped_column(String(255))
     commit_sha: Mapped[str | None] = mapped_column(String(40))
@@ -214,7 +268,8 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
     restore_backup_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("backups.id", ondelete="SET NULL"))
     snapshot_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("snapshots.id", ondelete="SET NULL"))
 
-    instance: Mapped[Instance] = relationship(lazy="selectin")
+    instance: Mapped[Instance | None] = relationship(lazy="selectin")
+    environment: Mapped[Environment | None] = relationship(lazy="selectin")
     triggered_by: Mapped[User | None] = relationship(lazy="selectin")
 
     @property

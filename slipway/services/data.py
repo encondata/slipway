@@ -27,9 +27,11 @@ from typing import Any, Protocol
 
 from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select, update
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.base import NO_VALUE
 
 from slipway import __version__
 from slipway.core.config import get_settings
@@ -68,14 +70,21 @@ CHANGING_KINDS = ("deploy", "restore", "rollback", "reset", "admin", "content") 
 PIPELINE_KINDS = ("deploy", "restore", "rollback", "reset")
 RESTORE_KINDS = ("restore", "rollback", "reset")  # run the live release again with data steps
 DATA_ONLY_KINDS = ("backup", "snapshot", "admin", "content")
+# Phase 3: jobs of a whole environment (instance_id is None, environment_id is set). None of them changes the
+# data, so CHANGING_KINDS stays as it is.
+ENV_KINDS = ("activate", "publish", "discard", "remove_slot", "teardown")
 KIND_LABELS = {
     "deploy": "Deploy", "restore": "Restore", "rollback": "Roll back", "reset": "Reset data", "backup": "Back up",
     "snapshot": "Take snapshot", "admin": "Create first admin", "content": "Add starter content",
+    "activate": "Activate", "publish": "Publish names", "discard": "Discard", "remove_slot": "Remove slot",
+    "teardown": "Delete environment",
 }
 # How a job is named inside a sentence ("failed deployment 1a2b3c4d").
 KIND_NOUNS = {
     "deploy": "deployment", "restore": "restore", "rollback": "roll back", "reset": "reset", "backup": "backup",
     "snapshot": "snapshot", "admin": "first-admin job", "content": "starter-content job",
+    "activate": "activation", "publish": "name publishing", "discard": "discard", "remove_slot": "slot removal",
+    "teardown": "teardown",
 }
 # Steps that replace or delete data on a data job (I1); a job that failed in one of them leaves a hold.
 REPLACING_STEPS = ("reset", "restore", "files", "after_import")
@@ -233,17 +242,156 @@ def release_identity_keys(manifest_json: dict[str, Any]) -> list[str]:
     return [str(s["key"]) for s in manifest_json.get("secrets") or [] if isinstance(s, dict) and s.get("identity")]
 
 
-def data_scope_key(instance: Instance) -> str:
-    """What per-instance data work is serialised on. Phase 2: the instance; phase 3 may share it per environment."""
-    return str(instance.id)
+def plan_identity(plan: Any, keys: Iterable[str]) -> dict[str, str]:
+    """The identity values a rendered plan's data is made with (phase 3 §5.3): ``AppPlan.identity``, which holds
+    them even where the server role writes the line empty, and for a key it lacks, the rendered ``.env``'s value
+    (``rendered_identity``). In the app and slot roles both are the same."""
+    known = getattr(plan, "identity", None) or {}
+    env = getattr(plan, "env", None) or {}
+    return {k: known[k] if k in known else env[k] for k in keys if k in known or k in env}
 
 
-def data_shared_reason(instance: Instance) -> str | None:
+# ------------------------------------------------------------ environments (phase 3)
+
+ENV_DATA, ENV_TRAFFIC = "data", "traffic"
+# The environment kinds that only read the data: they hold the data key alone, so an activate (the traffic key
+# alone) runs beside them (D8). A snapshot belongs here only when it doesn't stop the app, and neither does when
+# it runs on an app slot (mode slot) or stops the owner again at its end (``env_keys``).
+_DATA_ONLY_ENV = ("backup",)
+
+
+def variables_of(instance: Instance) -> dict[str, str]:
+    """The variables the instance's releases render with: its own, or for a member of an environment the
+    environment's (phase 3 D5), when the environment is loaded."""
+    if instance.environment_id is None:
+        return dict(instance.env or {})
+    environment = loaded_environment(instance)
+    return dict((environment.env if environment is not None else instance.env) or {})
+
+
+def loaded_environment(instance: Instance) -> Any:
+    """``instance.environment`` when it is already loaded (selectin), else None: never a lazy load, which an
+    async session can't do."""
+    if instance.environment_id is None and "environment" not in instance.__dict__:
+        return None
+    value = sa_inspect(instance).attrs.environment.loaded_value
+    return None if value is NO_VALUE else value
+
+
+def env_keys(environment_id: uuid.UUID, kind: str | None, options: dict[str, Any] | None = None, *,
+             on_app_slot: bool = False) -> tuple[Any, ...]:
+    """The runner keys of a job of an environment (D8): ``(env, "data")`` alone for a backup and for a snapshot
+    that doesn't stop the app, ``(env, "traffic")`` alone for an activate, and both for everything else.
+    Sorted, so two jobs never take them in opposite orders.
+
+    A backup or snapshot takes both keys after all when it runs on an app slot (``on_app_slot``: in mode
+    ``slot`` the data owner is the slot an activate starts, checks and switches to, and both jobs would write
+    the slot host's one-line lock), or when it will stop the owner again at its end (``options.restop``), which
+    would stop what an activate beside it had just started."""
+    opts = options or {}
+    reads_only = kind in _DATA_ONLY_ENV or (kind == DeploymentKind.SNAPSHOT and not opts.get("stop_app"))
+    if reads_only and not on_app_slot and not opts.get("restop"):
+        return ((environment_id, ENV_DATA),)
+    if kind == DeploymentKind.ACTIVATE:
+        return ((environment_id, ENV_TRAFFIC),)
+    return ((environment_id, ENV_DATA), (environment_id, ENV_TRAFFIC))
+
+
+def runner_keys(instance: Instance, kind: str | None = None, options: dict[str, Any] | None = None) -> tuple[Any, ...]:
+    """What a job (or a change that isn't a job, with ``kind`` None) is serialised on: the instance's id for a
+    standalone instance, as before environments; the environment's keys for a member (``env_keys``). A change
+    that isn't a job (control, a backup delete, a check, the deploy-root move) takes both environment keys."""
+    if instance.environment_id is None:
+        return (instance.id,)
+    return env_keys(instance.environment_id, kind, options, on_app_slot=instance.slot in ("blue", "green"))
+
+
+def job_keys(dep: Deployment, instance: Instance | None = None) -> tuple[Any, ...]:
+    """The runner keys a queued or running deployment holds. ``instance`` is the job's instance when the caller
+    has it loaded (else ``dep.instance``)."""
+    if dep.instance_id is None:
+        assert dep.environment_id is not None
+        return env_keys(dep.environment_id, dep.kind, dep.options)
+    inst = instance if instance is not None else dep.instance
+    if dep.environment_id is not None and (inst is None or inst.environment_id is None):
+        return env_keys(dep.environment_id, dep.kind, dep.options)
+    if inst is None:
+        return (dep.instance_id,)
+    return runner_keys(inst, dep.kind, dep.options)
+
+
+def keys_meet(a: Iterable[Any], b: Iterable[Any]) -> bool:
+    return bool(set(a) & set(b))
+
+
+async def active_env_jobs(db: AsyncSession, environment_id: uuid.UUID) -> list[Deployment]:
+    """Every queued or running job of the environment: its members' and its own, oldest first."""
+    return list((await db.scalars(
+        select(Deployment).options(defer(Deployment.log))
+        .where(Deployment.environment_id == environment_id,
+               Deployment.status.in_([DeploymentStatus.QUEUED, DeploymentStatus.RUNNING]))
+        .order_by(Deployment.created_at, Deployment.id)
+    )).all())
+
+
+def slot_text(slot: str | None) -> str:
+    """How a slot is named in a sentence: ``blue``, ``green``, ``the data server``."""
+    return "the data server" if slot == "data" else str(slot or "")
+
+
+def job_label(kind: str, *, slot: str | None = None, back: bool = False) -> str:
+    """What a job of an environment is called on its pages (§8.1): ``Deploy to green``, ``Update the data
+    server``, ``Activate green``, ``Switch back to blue``... Standalone jobs keep ``kind_label``."""
+    if kind == DeploymentKind.DEPLOY:
+        return "Update the data server" if slot == "data" else f"Deploy to {slot}" if slot else "Deploy"
+    if kind == DeploymentKind.ACTIVATE:
+        return f"Switch back to {slot}" if back else f"Activate {slot}"
+    if kind == DeploymentKind.DISCARD:
+        return f"Discard {slot}"
+    if kind == DeploymentKind.REMOVE_SLOT:
+        return f"Remove {slot}"
+    return kind_label(kind)
+
+
+def dep_label(dep: Deployment) -> str:
+    """``job_label`` of a deployment: its slot is its instance's, or ``options.slot`` for an environment job."""
+    opts = dep.options or {}
+    slot = opts.get("slot")
+    if dep.instance_id is not None and dep.instance is not None and dep.instance.slot:
+        slot = dep.instance.slot
+    if dep.environment_id is None:
+        return kind_label(dep.kind)
+    return job_label(dep.kind, slot=slot, back=bool(opts.get("back")))
+
+
+def confirm_name(instance: Instance) -> str:
+    """The name a typed confirmation must equal (D20): the environment's for a member, so people type the name
+    they see on the environment page; the instance's own otherwise."""
+    env = loaded_environment(instance)
+    return env.name if env is not None else instance.name
+
+
+def is_shared_slot(instance: Instance, environment: Any = None) -> bool:
+    """An app slot whose data is on a data server (mode ``server``): it has no data of its own."""
+    env = environment if environment is not None else loaded_environment(instance)
+    return env is not None and env.data_mode != "slot" and instance.slot in ("blue", "green")
+
+
+def data_shared_reason(instance: Instance, *, environment: Any = None, owner: Instance | None = None) -> str | None:
     """Why Slipway won't restore, reset or seed this instance's data, or None.
+
+    Phase 3: an app slot in mode ``server`` shares its environment's data, which lives on the data server
+    (``owner`` names its host; pass it, or the text says "its data server"). The data owner and a mode ``slot``
+    slot answer as phase 2.
 
     Phase 2: only when the last probe found the data outside the host (``has_data`` exit 4), as cached in
     ``app_state.live.data_elsewhere``.
     """
+    env = environment if environment is not None else loaded_environment(instance)
+    if is_shared_slot(instance, env):
+        where = owner.host.name if owner is not None else "its data server"
+        return (f"{env.name}'s data is shared by its slots and lives on {where}: back it up, restore or reset it "
+                "from the environment page")
     live = live_state(instance)
     if live and live.get("data_elsewhere"):
         return (f"{instance.name}'s data lives outside {instance.host.name} (an external or shared database); "
@@ -783,8 +931,12 @@ def dirty_note(dirty_job: Deployment | None) -> str:
     return f"Holds data changed by failed {kind_noun(dirty_job.kind)} {dirty_job.id.hex[:8]} ({dirty_job.short_sha})"
 
 
-def restorable(instance: Instance, row: Backup, *, dirty_job: Deployment | None = None) -> Restorable:
-    """Whether the backup can be restored into the live release, with the first failing rule's reason (§9.2)."""
+def restorable(instance: Instance, row: Backup, *, dirty_job: Deployment | None = None,
+               env: dict[str, str] | None = None) -> Restorable:
+    """Whether the backup can be restored into the live release, with the first failing rule's reason (§9.2).
+
+    ``env``: the variables the live release renders with (a job's own); by default the instance's, or for a
+    member of an environment the environment's (phase 3 D5), which win over a restored identity value too."""
     note = dirty_note(dirty_job) if row.dirty_of is not None else None
 
     def no(reason: str) -> Restorable:
@@ -814,7 +966,7 @@ def restorable(instance: Instance, row: Backup, *, dirty_job: Deployment | None 
             return no(f"Taken with other {label}, which Slipway can't decrypt any more (SLIPWAY_ENCRYPTION_KEY "
                       "changed): put the old key back first in the list and run slipway rotate-encryption-key")
         override = restore_override(row.identity, release_identity_keys(man), instance.live_identity)
-        pinned = env_pinned(override, instance.env)
+        pinned = env_pinned(override, env if env is not None else variables_of(instance))
         if pinned:
             return no(env_pin_message(pinned[0]))
     shared = data_shared_reason(instance)
@@ -856,6 +1008,16 @@ def change_began(dep: Deployment) -> bool:
     else:
         return False
     return any(_began(rows.get(k)) for k in keys)
+
+
+def slots_left_stopped(dep: Deployment) -> list[str]:
+    """The app slots a data owner job's ``stop_slots`` stopped while they ran (``options.slots_were``) and that
+    nothing started again (``options.slots_started``): [] when the step never began (phase 3 §9.13)."""
+    if not _began(_steps(dep).get("stop_slots")):
+        return []
+    options = dep.options or {}
+    started = {str(s) for s in options.get("slots_started") or []}
+    return [str(s) for s, was in (options.get("slots_were") or {}).items() if was == "running" and str(s) not in started]
 
 
 def left_stopped(dep: Deployment) -> bool:
@@ -925,41 +1087,113 @@ async def _job(db: AsyncSession, instance: Instance, dep_id: Any) -> Deployment 
                            .where(Deployment.id == did, Deployment.instance_id == instance.id))
 
 
+async def owner_for(db: AsyncSession, instance: Instance) -> Instance:
+    """The instance that holds ``instance``'s data fields (D3): itself, unless it is an app slot of an environment
+    whose data is on a data server (``environments.owner_of``)."""
+    if instance.environment_id is None:
+        return instance
+    from slipway.services import environments  # environments imports this module
+
+    return await environments.owner_of(db, instance) or instance
+
+
+def stopped_text(slots: Iterable[str]) -> str:
+    """``Blue and Green are stopped`` / ``Blue is stopped``: what a data job that stopped the app slots left."""
+    names = [str(s).capitalize() for s in slots]
+    if not names:
+        return ""
+    return f"{' and '.join(names)} {'is' if len(names) == 1 else 'are'} stopped"
+
+
 async def hold_text(db: AsyncSession, instance: Instance) -> str | None:
-    """The refusal while ``data_dirty.hold`` stands (§8.4), or None."""
-    dirty = instance.data_dirty or {}
+    """The refusal while ``data_dirty.hold`` stands (§8.4), or None.
+
+    For a member of an environment the hold is the data owner's, named by the environment (§7.5). A data job that
+    stopped the app slots (``stop_slots``) records them in ``data_dirty.last.slots_stopped``, and a lead slot that
+    didn't start again records ``last.start_error = {slot, error}``; the text then says so (§7.4).
+    """
+    owner = await owner_for(db, instance)
+    dirty = owner.data_dirty or {}
     if not dirty.get("hold"):
         return None
     last = dirty.get("last") or {}
-    backup = await _backup_of(db, instance, last.get("backup_id"))
+    backup = await _backup_of(db, owner, last.get("backup_id"))
     where = f" ({last['step_text']})" if last.get("step_text") else ""
     before = f"restore the backup taken just before it ({backup.name})" if backup else "restore an earlier backup"
-    return (f"{instance.name}'s last {kind_noun(str(last.get('kind') or 'job'))} stopped part-way{where}, so its "
+    kind = kind_noun(str(last.get("kind") or "job"))
+    text = (f"{confirm_name(owner)}'s last {kind} stopped part-way{where}, so its "
             f"database may be empty or half-restored. Retry it, or {before}. Start, Restart and Deploy are off until then.")
+    stopped = stopped_text(last.get("slots_stopped") or [])
+    failed = last.get("start_error") if isinstance(last.get("start_error"), dict) else None
+    if failed and stopped:
+        text += f" {failed.get('slot')} didn't start again after the {kind} ({failed.get('error')}); {stopped}."
+    elif stopped:
+        text += f" {stopped}."
+    return text
 
 
-def dirty_snapshot_text(instance: Instance) -> str | None:
-    """Why a snapshot is refused while the data is half-changed (§7.5 export), or None."""
+def dirty_snapshot_text(instance: Instance, environment: Any = None) -> str | None:
+    """Why a snapshot is refused while the data is half-changed (§7.5 export), or None. ``environment``: the
+    member's environment, when the caller has it (else ``instance.environment`` when loaded)."""
     dirty = instance.data_dirty
     if not dirty:
         return None
     first = dirty.get("first") or {}
     d8 = str(first.get("deployment_id") or "")[:8]
-    return (f"{instance.name}'s data was left half-changed by {kind_noun(str(first.get('kind') or 'job'))} {d8}; "
+    # A member's data is its environment's: the owner is named as the environment, as in hold_text (§7.5).
+    env = environment if environment is not None and instance.environment_id is not None else None
+    name = env.name if env is not None else confirm_name(instance)
+    return (f"{name}'s data was left half-changed by {kind_noun(str(first.get('kind') or 'job'))} {d8}; "
             "a snapshot of it would seed others with that. Retry, restore or roll back first.")
 
 
 async def latest_changing_job(db: AsyncSession, instance: Instance | uuid.UUID, *,
-                              exclude: uuid.UUID | None = None) -> Deployment | None:
+                              exclude: uuid.UUID | None = None,
+                              past_server_deploys: bool = False) -> Deployment | None:
     """The newest job that may have changed the data (D10): backups and snapshots never count. ``exclude`` leaves
-    out one job (a retry that has just started asks about the jobs before it)."""
-    instance_id = instance.id if isinstance(instance, Instance) else instance
-    stmt = (select(Deployment).options(defer(Deployment.log))
-            .where(Deployment.instance_id == instance_id, Deployment.kind.in_(CHANGING_KINDS)))
+    out one job (a retry that has just started asks about the jobs before it).
+
+    For a member of an environment it is the newest such job of the whole environment, whichever member it ran on
+    (phase 3 §7.5): the slots and the data server share one set of data.
+
+    ``past_server_deploys``: look past the data server's deploys (Update the data server) that replaced no data.
+    They run no app migration and never settle a failed slot deploy (§7.5), so a failed slot deploy's roll back
+    and its retry's inheritance still stand after one. A data server deploy that began a data step (it restored a
+    snapshot onto fresh data) still counts."""
+    if isinstance(instance, Instance):
+        instance_id, env_id = instance.id, instance.environment_id
+    else:
+        instance_id = instance
+        env_id = await db.scalar(select(Instance.environment_id).where(Instance.id == instance_id))
+    stmt = select(Deployment).options(defer(Deployment.log)).where(Deployment.kind.in_(CHANGING_KINDS))
+    if env_id is not None:
+        stmt = stmt.where(Deployment.environment_id == env_id)
+    else:
+        stmt = stmt.where(Deployment.instance_id == instance_id)
     if exclude is not None:
         stmt = stmt.where(Deployment.id != exclude)
     # The id settles equal times.
-    return await db.scalar(stmt.order_by(Deployment.created_at.desc(), Deployment.id.desc()).limit(1))
+    stmt = stmt.order_by(Deployment.created_at.desc(), Deployment.id.desc())
+    if env_id is None or not past_server_deploys:
+        return await db.scalar(stmt.limit(1))
+    servers = set((await db.scalars(select(Instance.id).where(
+        Instance.environment_id == env_id, Instance.slot == "data"))).all())
+    offset, batch = 0, 20
+    while True:
+        rows = (await db.scalars(stmt.offset(offset).limit(batch))).all()
+        for job in rows:
+            if job.kind == DeploymentKind.DEPLOY and job.instance_id in servers and not _replaced_data(job):
+                continue
+            return job
+        if len(rows) < batch:
+            return None
+        offset += batch
+
+
+def _replaced_data(dep: Deployment) -> bool:
+    """Whether a deploy began one of its data steps (restoring a snapshot, or resetting for one)."""
+    rows = _steps(dep)
+    return any(_began(rows.get(k)) for k in REPLACING_STEPS)
 
 
 async def active_job(db: AsyncSession, instance_id: uuid.UUID) -> Deployment | None:
@@ -988,7 +1222,9 @@ class Inheritance:
 async def retry_inheritance(db: AsyncSession, parent: Deployment, *, exclude: uuid.UUID | None = None) -> Inheritance:
     """``exclude``: the retry itself, when it is already queued (``_start``)."""
     instance = await _instance_of(db, parent)
-    latest = await latest_changing_job(db, instance, exclude=exclude)
+    # An Update the data server since doesn't stop a slot deploy's retry inheriting (§7.5, as rollback_state).
+    latest = await latest_changing_job(db, instance, exclude=exclude,
+                                       past_server_deploys=_app_slot_deploy(parent, instance))
     is_latest = latest is not None and latest.id == parent.id
     inherit = is_latest and replacing_began(parent)
     rows = _steps(parent)
@@ -1009,6 +1245,12 @@ async def retry_inheritance(db: AsyncSession, parent: Deployment, *, exclude: uu
                        done_by=done_by)
 
 
+def _app_slot_deploy(dep: Deployment, instance: Instance) -> bool:
+    """A deploy to an app slot of an environment (not to its data server, nor a standalone instance's)."""
+    return dep.kind == DeploymentKind.DEPLOY and instance.environment_id is not None \
+        and instance.slot in ("blue", "green")
+
+
 @dataclass
 class RollbackState:
     """``rollback_state``: unpacks as ``(available, reason)``; the rest is for the dialog and the job."""
@@ -1018,47 +1260,221 @@ class RollbackState:
     backup: Backup | None = None  # the rollback point
     also_undoes: str | None = None  # the dialog's line when the rollback point predates the deployment
     first_deployment_id: str | None = None
+    # Phase 3, mode server: the roll back runs on the data owner and throws away what the active slot wrote since
+    # the backup, so it needs data:reset as well as data:restore (D17).
+    needs_reset: bool = False
+    owner_id: uuid.UUID | None = None  # the instance the roll back job runs on (the data owner)
 
     def __iter__(self):
         return iter((self.available, self.reason))
 
 
+async def _environment_of(db: AsyncSession, instance: Instance) -> Any:
+    if instance.environment_id is None:
+        return None
+    env = loaded_environment(instance)
+    if env is not None:
+        return env
+    from slipway.models import Environment
+
+    return await db.get(Environment, instance.environment_id)
+
+
+async def _env_job(db: AsyncSession, instance: Instance, dep_id: Any) -> Deployment | None:
+    """A job of ``instance``, or of any member of its environment."""
+    if instance.environment_id is None:
+        return await _job(db, instance, dep_id)
+    did = _uuid(dep_id)
+    if did is None:
+        return None
+    return await db.scalar(select(Deployment).options(defer(Deployment.log))
+                           .where(Deployment.id == did, Deployment.environment_id == instance.environment_id))
+
+
 async def rollback_state(db: AsyncSession, dep: Deployment) -> RollbackState:
-    """Whether Roll back is offered for ``dep``, and why not (§8.2)."""
-    instance = await _instance_of(db, dep)
-    if dep.kind != DeploymentKind.DEPLOY or dep.status not in (DeploymentStatus.FAILED, DeploymentStatus.CANCELLED):
+    """Whether Roll back is offered for ``dep``, and why not (§8.2).
+
+    For a member of an environment the rules are read against the data owner's dirty state and backups, and the
+    roll back runs there (phase 3 §7.3). In mode ``server`` it is the second way past a failed deploy (Discard is
+    the first): it needs an active slot other than the failed one, which it starts again on the restored data,
+    and ``data:reset`` (``needs_reset``), since it loses what that slot wrote since the backup.
+    """
+    if dep.kind != DeploymentKind.DEPLOY or dep.status not in (DeploymentStatus.FAILED, DeploymentStatus.CANCELLED) \
+            or dep.instance_id is None:
         return RollbackState(False, "Only a failed deployment can be rolled back")
-    latest = await latest_changing_job(db, instance)
+    instance = await _instance_of(db, dep)
+    owner = await owner_for(db, instance)
+    env = await _environment_of(db, instance)
+    shared = env is not None and env.data_mode != "slot"
+    # An Update the data server since doesn't count (§7.5: it never settles a failed slot deploy, and the dirty
+    # state and its pre-deploy backup are unchanged by it).
+    latest = await latest_changing_job(db, instance, past_server_deploys=_app_slot_deploy(dep, instance))
     if latest is not None and latest.id != dep.id:
         return RollbackState(False, f"{kind_noun(latest.kind).capitalize()} {latest.id.hex[:8]} ran after this deployment; "
                                     "restore a backup instead")
-    first = (instance.data_dirty or {}).get("first") or {}
+    first = (owner.data_dirty or {}).get("first") or {}
     if first.get("kind") != DeploymentKind.DEPLOY:
         runs = (f"{instance.name} still runs {instance.current_commit_sha[:7]}" if instance.current_commit_sha
                 else f"{instance.name} hasn't gone live yet")
         return RollbackState(False, f"Nothing to roll back: this deployment failed before it changed the data; {runs}")
-    backup = await _backup_of(db, instance, first.get("backup_id"))
+    backup = await _backup_of(db, owner, first.get("backup_id"))
     if backup is None or backup.status != BackupStatus.READY or backup.reason != BackupReason.PRE_DEPLOY:
         return RollbackState(False, "There is no backup from before the first failed deploy (it had no data yet, "
                                     "or the backup is gone)")
-    if not instance.current_commit_sha:
+    if shared:
+        if env.active_slot_id is None:
+            return RollbackState(False, "Nothing is live to start again on the data a roll back puts back: retry the "
+                                        "deployment instead", backup)
+        if env.active_slot_id == instance.id:
+            return RollbackState(False, f"{instance.slot} takes the traffic and this was its own deploy: retry the "
+                                        "deployment instead", backup)
+    elif not instance.current_commit_sha:
         return RollbackState(False, "This was the first deploy: use Start over instead")
-    if "restore" not in capabilities(instance):
-        return RollbackState(False, f"{live_sha7(instance)}'s slipway.yml has no restore command")
-    rule = restorable(instance, backup)
+    if "restore" not in capabilities(owner):
+        return RollbackState(False, f"{live_sha7(owner)}'s slipway.yml has no restore command")
+    rule = restorable(owner, backup)
     if not rule.ok:
         return RollbackState(False, rule.reason, backup)
     if rule.override:
         # A roll back never changes the identity keys (it has no "put back its keys" tick).
         return RollbackState(False, f"The backup from before the first failed deploy was made with other "
-                                    f"{identity_label(instance)}; restore it from the Backups card instead", backup)
+                                    f"{identity_label(owner)}; restore it from the Backups card instead", backup)
     first_id = str(first.get("deployment_id") or "")
     also = None
     if first_id and first_id != dep.id.hex:
-        earlier = await _job(db, instance, first_id)
+        earlier = await _env_job(db, instance, first_id)
         sha = f" ({earlier.short_sha})" if earlier is not None and earlier.commit_sha else ""
         also = f"This also undoes failed deployment {first_id[:8]} before it{sha}."
-    return RollbackState(True, None, backup, also, first_id or None)
+    return RollbackState(True, None, backup, also, first_id or None, needs_reset=shared, owner_id=owner.id)
+
+
+@dataclass
+class DiscardState:
+    """``discard_state``: unpacks as ``(available, reason)``."""
+
+    available: bool
+    reason: str | None
+    slot: str | None = None  # the app slot whose failed deploy Discard settles
+    deployment_id: str | None = None  # that failed deploy (the owner's ``data_dirty.first``)
+
+    def __iter__(self):
+        return iter((self.available, self.reason))
+
+
+async def discard_state(db: AsyncSession, env: Any, slot: str | None = None) -> DiscardState:
+    """Whether Discard <slot> is offered (phase 3 §9.14, D17): a deploy to the idle slot failed after its
+    ``start`` began, so the owner is dirty, while the active slot kept serving. ``slot`` None: the slot the
+    owner's dirty state names. The checks are §9.14's refusals, in its order."""
+    from slipway.services import environments, jobs  # both import this module
+
+    members = await environments.members(db, env)
+    apps = environments.app_members(members)
+    owner = environments.owner_in(env, members)
+    first = ((owner.data_dirty if owner is not None else None) or {}).get("first") or {}
+    failed = await db.scalar(select(Deployment).options(defer(Deployment.log)).where(
+        Deployment.id == _uuid(first.get("deployment_id")), Deployment.environment_id == env.id)) \
+        if _uuid(first.get("deployment_id")) else None
+    failed_slot = next((s for s, m in members.items() if failed is not None and m.id == failed.instance_id), None)
+    slot = slot or (failed_slot if failed_slot in environments.APP_SLOTS else None)
+    out = DiscardState(False, None, slot, failed.id.hex if failed is not None else None)
+
+    def no(reason: str) -> DiscardState:
+        out.reason = reason
+        return out
+
+    if env.data_mode == "slot" or len(apps) < 2:
+        only = apps[0].slot if apps else "blue"
+        return no(f"Roll back or retry instead: {only} is {env.name}'s only slot")
+    target = members.get(slot) if slot else None
+    if target is None or failed is None or failed.kind != DeploymentKind.DEPLOY or failed.instance_id != target.id:
+        return no(f"{slot or 'This slot'} has no failed deploy to discard")
+    if env.active_slot_id == target.id:
+        return no(f"{slot} takes the traffic: retry its deploy or roll back instead")
+    if env.active_slot_id is None:
+        return no("Nothing is live to check the data with: roll back or retry")
+    held = await hold_text(db, owner)
+    if held:
+        return no(held)
+    later = await _failed_since(db, env, members, owner, target)
+    if later:
+        return no(later)
+    busy = await jobs.busy_job(db, env, env_keys(env.id, DeploymentKind.DISCARD))
+    if busy is not None:
+        return no(environments.busy_text(env, busy))
+    unresolved = environments.unresolved_text(env)
+    if unresolved:
+        return no(unresolved)
+    out.available = True
+    return out
+
+
+async def _failed_since(db: AsyncSession, env: Any, members: dict[str, Instance], owner: Instance | None,
+                        target: Instance) -> str | None:
+    """Why Discard <slot> would wipe more than the slot's own mark, or None. Settle clears the owner's whole
+    ``data_dirty``, so its ``last`` must be a deploy of the slot too (the failed deploy, or a retry or new deploy
+    of the slot that failed again). A later job on another member that left the data half-changed, such as an
+    Update the data server that failed in its start, is retried first. A deploy of that member that succeeded
+    after it settles it (a data server deploy never clears ``data_dirty`` itself, §7.5)."""
+    last = ((owner.data_dirty if owner is not None else None) or {}).get("last") or {}
+    last_id = _uuid(last.get("deployment_id"))
+    if last_id is None:
+        return None
+    job = await db.scalar(select(Deployment).options(defer(Deployment.log)).where(
+        Deployment.id == last_id, Deployment.environment_id == env.id))
+    if job is None or (job.kind == DeploymentKind.DEPLOY and job.instance_id == target.id):
+        return None
+    if job.kind == DeploymentKind.DEPLOY and job.instance_id is not None:
+        since = await db.scalar(select(Deployment.id).where(
+            Deployment.instance_id == job.instance_id, Deployment.kind == DeploymentKind.DEPLOY,
+            Deployment.status == DeploymentStatus.SUCCEEDED, Deployment.created_at > job.created_at).limit(1))
+        if since is not None:
+            return None
+    slot = next((s for s, m in members.items() if m.id == job.instance_id), None)
+    label = job_label(job.kind, slot=slot) if slot else kind_label(job.kind)
+    return (f"{label} {job.id.hex[:8]} failed after {target.slot}'s deploy and left {env.name}'s data half-changed "
+            "too: retry it first")
+
+
+# What a job's end writes on the data owner (phase 3 §7.5), by kind and outcome. Outcomes: ``succeeded``,
+# ``changed`` (failed or interrupted after a change began) and ``unchanged`` (failed before anything changed).
+# Actions: ``mark`` data_dirty as P2 §8.4 (``mark_dirty``), ``clear`` it, ``clear_if_same_slot`` (only when its
+# ``first`` is a deploy of this same slot), ``set`` (live_identity: the job's identity values, as P2), ``if_unset``
+# (live_identity only when it has none, from AppPlan.identity), ``restore`` (live_identity as the restore step
+# left it), ``keep`` (left as the job's own steps wrote it), ``now`` (the time).
+_P2_DEPLOY_OK = {"data_dirty": "clear", "live_identity": "set", "fresh_data": "clear", "seed_snapshot_id": "clear"}
+
+
+def owner_writes(kind: str, outcome: str, instance: Instance, *, environment: Any = None) -> dict[str, str]:
+    """Which of the data owner's phase 2 fields a job of ``kind`` on ``instance`` writes when it ends with
+    ``outcome``, and how (the §7.5 table, as a pure function). The fields always go to ``owner_for(instance)``:
+    the instance itself for a standalone instance, a mode ``slot`` slot or the data server, whose phase 2 rules
+    are unchanged. ``{}``: nothing on the owner."""
+    if outcome not in ("succeeded", "changed", "unchanged"):
+        raise ValueError(outcome)
+    env = environment if environment is not None else loaded_environment(instance)
+    member = env is not None
+    if outcome == "unchanged":
+        return {}
+    if kind == DeploymentKind.DISCARD:
+        return {"data_dirty": "clear"} if outcome == "succeeded" else {}
+    if kind == "control":  # a control start or restart of any app slot (P2 §8.1 retry rule)
+        return {"last_control_at": "now"}
+    if kind == DeploymentKind.DEPLOY:
+        if outcome == "changed":
+            return {"data_dirty": "mark"}
+        if not member or env.data_mode == "slot":
+            return dict(_P2_DEPLOY_OK)
+        if instance.slot == "data":
+            # It ran no app migration, so it never settles a failed slot deploy; and fresh_data stays as its
+            # start left it, so the first app slot deploy on the empty data still creates the first admin (§8.4 ᵃ).
+            return {"live_identity": "if_unset", "fresh_data": "keep", "seed_snapshot_id": "clear"}
+        return {"live_identity": "if_unset", "fresh_data": "clear", "seed_snapshot_id": "clear",
+                "data_dirty": "clear_if_same_slot"}
+    if kind in RESTORE_KINDS:
+        return {"data_dirty": "clear", "live_identity": "restore"} if outcome == "succeeded" else {"data_dirty": "mark"}
+    if kind == DeploymentKind.CONTENT and outcome == "succeeded":
+        return {"content_pending": "clear"}
+    return {}
 
 
 def _restores_snapshot(dep: Deployment) -> bool:
@@ -1071,7 +1487,11 @@ def _restores_snapshot(dep: Deployment) -> bool:
 RETRY_PERMISSION = {
     "deploy": "deployments:create", "restore": "data:restore", "rollback": "data:restore", "reset": "data:reset",
     "backup": "data:backup", "snapshot": "data:backup", "admin": "deployments:create", "content": "deployments:create",
+    # Phase 3 §4.1: Discard needs deployments:create as well (RETRY_EXTRA).
+    "activate": "traffic:switch", "publish": "traffic:switch", "discard": "traffic:switch",
+    "remove_slot": "environments:delete", "teardown": "environments:delete",
 }
+RETRY_EXTRA = {"discard": ("deployments:create",)}
 
 
 SNAPSHOT_STEPS = ("restore", "files", "after_import")  # the steps of a chain that read the snapshot
@@ -1118,7 +1538,7 @@ async def retry_refusal(db: AsyncSession, instance: Instance, dep: Deployment) -
         if held:
             return held
     if kind == DeploymentKind.SNAPSHOT:
-        return dirty_snapshot_text(instance)
+        return dirty_snapshot_text(instance, await _environment_of(db, instance))
     if kind == DeploymentKind.BACKUP:
         if (dep.options or {}).get("files") and "files" not in capabilities(instance):
             return (f"{live_sha7(instance)}'s slipway.yml has no export_files command, so Slipway can't back up "
@@ -1136,12 +1556,29 @@ async def retry_refusal(db: AsyncSession, instance: Instance, dep: Deployment) -
     return None
 
 
+async def _retry_also_needs(db: AsyncSession, dep: Deployment, instance: Instance) -> list[str]:
+    """The permissions POST /deployments/{id}/retry asks besides the kind's own (``permission``): data:reset to
+    put back identity keys or to roll back shared data (mode ``server``, D17), instances:operate to stop the app
+    for a snapshot."""
+    out: list[str] = []
+    options = dep.options or {}
+    env = await _environment_of(db, instance)
+    if options.get("restore_identity") or (dep.kind == DeploymentKind.ROLLBACK and env is not None
+                                           and env.data_mode != "slot"):
+        out.append("data:reset")
+    if options.get("stop_app"):
+        out.append("instances:operate")
+    return out
+
+
 async def retry_state(db: AsyncSession, dep: Deployment) -> dict[str, Any]:
     """``actions.retry`` of the deployment page (§8.1)."""
     instance = await _instance_of(db, dep)
     out: dict[str, Any] = {"available": False, "reason": None, "needs_confirm": dep.kind in RESTORE_KINDS,
                            "offers_skip_backup": False, "inherits": False,
                            "permission": RETRY_PERMISSION.get(dep.kind, "deployments:create")}
+    if instance.environment_id is not None:  # a standalone instance's answer stays phase 2's (I1)
+        out["also_needs"] = await _retry_also_needs(db, dep, instance)
 
     def no(reason: str) -> dict[str, Any]:
         return {**out, "reason": reason}
@@ -1173,6 +1610,17 @@ async def retry_state(db: AsyncSession, dep: Deployment) -> dict[str, Any]:
     running = await active_job(db, instance.id)
     if running is not None:
         return no(busy_text(running))
+    env = await _environment_of(db, instance)
+    if env is not None:
+        # The environment's fences, as the retry endpoint asks them through job_refusal (hold, an unresolved
+        # switch, the slot that serves traffic), so the page never offers a retry the API refuses.
+        from slipway.services import environments, jobs  # both import this module
+
+        fenced = await jobs.environment_fence(db, env, await environments.members(db, env), instance=instance,
+                                              kind=dep.kind or DeploymentKind.DEPLOY, options=dep.options or {},
+                                              retry_of=dep)
+        if fenced is not None:
+            return no(fenced.text)
     refused = await retry_refusal(db, instance, dep)
     if refused:
         return no(refused)
@@ -1228,6 +1676,23 @@ async def identity_lost(db: AsyncSession, instance: Instance) -> bool:
     return bool(await db.scalar(select(Instance.live_identity.is_not(None)).where(Instance.id == instance.id)))
 
 
+async def start_over_refusal(db: AsyncSession, instance: Instance, *, environment: Any = None) -> str | None:
+    """Why Start over is refused, or None: the instance has gone live (phase 2). On the data server of a mode
+    ``server`` environment, the rule is the environment's (§7.3): no app slot has ever gone live (none has a
+    live commit, none is active, no Activate succeeded); the data server's own first deploy doesn't count."""
+    env = environment if environment is not None else loaded_environment(instance)
+    if env is None or env.data_mode == "slot" or instance.slot != "data":
+        return f"{instance.name} has gone live; use Reset data" if instance.current_commit_sha else None
+    went_live = env.active_slot_id is not None or bool(await db.scalar(
+        select(Instance.id).where(Instance.environment_id == env.id, Instance.slot.in_(("blue", "green")),
+                                  Instance.current_commit_sha.is_not(None)).limit(1)))
+    if not went_live:
+        went_live = bool(await db.scalar(select(Deployment.id).where(
+            Deployment.environment_id == env.id, Deployment.kind == DeploymentKind.ACTIVATE,
+            Deployment.status == DeploymentStatus.SUCCEEDED).limit(1)))
+    return f"An app slot of {env.name} has gone live; use Reset data" if went_live else None
+
+
 async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, start_over: bool = False) -> dict[str, Any]:
     """The checks every data endpoint shares (§13); raises HTTPException. Returns ``app_state.live`` ({} for Start over).
 
@@ -1239,8 +1704,9 @@ async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, s
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only app instances (slipway.yml) can back up, restore or reset their data")
     live = live_state(instance)
     if start_over:
-        if instance.current_commit_sha:
-            raise HTTPException(status.HTTP_409_CONFLICT, f"{instance.name} has gone live; use Reset data")
+        refused = await start_over_refusal(db, instance)
+        if refused:
+            raise HTTPException(status.HTTP_409_CONFLICT, refused)
         live = {}
     elif live is None:
         raise HTTPException(status.HTTP_409_CONFLICT, not_live_text(instance))
@@ -1263,7 +1729,7 @@ async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, s
             raise HTTPException(status.HTTP_409_CONFLICT, f"{sha7}'s slipway.yml has no seed command")
     from slipway.services import deployer  # the deployer imports this module
 
-    if deployer.runner.is_deleting(instance.id):
+    if deployer.runner.is_deleting(runner_keys(instance, kind)):
         raise HTTPException(status.HTTP_409_CONFLICT, "This instance is being deleted")
     running = await active_job(db, instance.id)
     if running is not None:
@@ -1277,7 +1743,7 @@ async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, s
         if held:
             raise HTTPException(status.HTTP_409_CONFLICT, held)
     if kind == DeploymentKind.SNAPSHOT:
-        dirty = dirty_snapshot_text(instance)
+        dirty = dirty_snapshot_text(instance, await _environment_of(db, instance))
         if dirty:
             raise HTTPException(status.HTTP_409_CONFLICT, dirty)
     if kind in RESTORE_KINDS:

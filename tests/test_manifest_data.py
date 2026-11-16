@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -100,7 +101,8 @@ def test_the_serversherpa_example_parses_and_plans():
     man = manifest.parse(EXAMPLE)
     assert man.identity_keys() == ["SS_TOTP_ENCRYPTION_KEY", "SS_PASSWORD_PEPPER"]
     assert {s.key: s.identity for s in man.secrets}["SS_JWT_SECRET"] is False
-    assert man.data == manifest.DataSpec(
+    # Its environment keys (data.migrations, attach, server) are tests/test_manifest_env.py's.
+    assert dataclasses.replace(man.data, migrations=None, attach=None, server=None) == manifest.DataSpec(
         app="serversherpa", format="pg-custom",
         volumes=(manifest.Volume("ss-{STACK_ENV}-db_pgdata", "database"),
                  manifest.Volume("ss-{STACK_ENV}-storage_seaweeddata", "files"),

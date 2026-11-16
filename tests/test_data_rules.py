@@ -981,7 +981,8 @@ async def test_require_data_job_refusals():
     async with get_sessionmaker()() as db:
         inst = await _load(db, iid)
         assert (await data.require_data_job(db, inst, "restore"))["sha"] == SHA
-        assert data.data_scope_key(inst) == str(iid)
+        # A standalone instance's jobs are serialised on its id alone, whatever their kind (phase 3 D8).
+        assert data.runner_keys(inst) == data.runner_keys(inst, "backup") == data.runner_keys(inst, "deploy") == (iid,)
 
         inst.build_source = "compose"
         assert await _refused(db, inst, "backup") == (

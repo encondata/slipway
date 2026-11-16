@@ -12,6 +12,14 @@ from slipway.models.data import (
     SnapshotOrigin,
     SnapshotStatus,
 )
+from slipway.models.environment import (
+    DataMode,
+    Environment,
+    EnvironmentStatus,
+    Resource,
+    ResourceOrigin,
+    SlotName,
+)
 from slipway.models.host import Host, HostAuthMethod, HostStatus
 from slipway.models.instance import (
     BuildSource,
@@ -34,9 +42,12 @@ __all__ = [
     "BackupReason",
     "BackupStatus",
     "BuildSource",
+    "DataMode",
     "Deployment",
     "DeploymentKind",
     "DeploymentStatus",
+    "Environment",
+    "EnvironmentStatus",
     "FirstAdmin",
     "FirstAdminMode",
     "FirstAdminStatus",
@@ -48,7 +59,10 @@ __all__ = [
     "InstanceStatus",
     "OAuthAccount",
     "Repository",
+    "Resource",
+    "ResourceOrigin",
     "Role",
+    "SlotName",
     "Snapshot",
     "SnapshotOrigin",
     "SnapshotStatus",

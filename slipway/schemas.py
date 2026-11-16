@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,10 +193,16 @@ class HostOut(Out):
     hostname: str
     port: int
     username: str
-    environment: str
+    label: str
+    # The label's old name, kept as a copy for one release (phase 3 D21).
+    environment: str = ""
     description: str
     deploy_root: str
     proxy_address: str | None = None
+    lan_address: str | None = None
+    provider: str = "ssh"
+    provider_id: str | None = None
+    owner_environment_id: uuid.UUID | None = None
     auth_method: str
     public_key: str | None
     host_key_fingerprint: str | None
@@ -207,19 +214,47 @@ class HostOut(Out):
     metrics: dict[str, Any]
     created_at: datetime
 
+    @model_validator(mode="after")
+    def _copy_label(self) -> HostOut:
+        self.environment = self.label
+        return self
+
 
 class _HostFields(BaseModel):
     hostname: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9.:\-\[\]]+$"), NoNul] | None = None
     port: int | None = Field(None, ge=1, le=65535)
     username: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z_][a-z0-9_.-]*$"), NoNul] | None = None
+    label: Annotated[str, Field(max_length=32), NoNul] | None = None
+    # The label's old name, still accepted for one release (phase 3 D21).
     environment: Annotated[str, Field(max_length=32), NoNul] | None = None
     description: Annotated[str, Field(max_length=255), NoNul] | None = None
     deploy_root: Annotated[str, Field(max_length=255), NoNul] | None = None
     # Address the reverse proxy uses for this host's ports; "" clears it (then the hostname is used).
     proxy_address: Annotated[str, Field(max_length=255, pattern=r"^$|^[A-Za-z0-9.\-]+$|^\[[0-9A-Fa-f:.]+\]$"), NoNul] | None = None
+    # The address this host's connections to other LAN hosts come from, when it isn't the proxy address
+    # (a multi-homed host): an IP literal, since a data server's allow list takes addresses. "" clears it.
+    lan_address: Annotated[str, Field(max_length=45), NoNul] | None = None
     private_key: Annotated[str, Field(max_length=20000), NoNul] | None = None
     key_passphrase: str | None = Field(None, max_length=500)
     password: str | None = Field(None, max_length=500)
+
+    @field_validator("lan_address")
+    @classmethod
+    def _lan_address(cls, v: str | None) -> str | None:
+        if not v:
+            return v
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("Enter an IP address, such as 10.0.0.12") from None
+
+    @model_validator(mode="after")
+    def _label_alias(self) -> _HostFields:
+        if self.label is not None and self.environment is not None and self.label != self.environment:
+            raise ValueError("Send label or environment (its old name), not both with different values")
+        if self.label is None:
+            self.label = self.environment
+        return self
 
     @field_validator("deploy_root")
     @classmethod
@@ -528,6 +563,9 @@ class InstanceOut(Out):
     data_dirty: dict[str, Any] | None = None
     identity_changed_at: datetime | None = None
     identity_source: str | None = None
+    # Phase 3: the environment this instance is a slot of ({id, name}), and which slot; None for standalone.
+    environment: dict[str, Any] | None = None
+    slot: str | None = None
 
     @classmethod
     def of(cls, i: Instance, *, env_unreadable: bool = False, seed_snapshot: Snapshot | None = None,
@@ -578,7 +616,16 @@ class InstanceOut(Out):
             data_dirty=i.data_dirty or None,
             identity_changed_at=i.identity_changed_at,
             identity_source=i.identity_source,
+            environment=_environment_ref(i),
+            slot=i.slot,
         )
+
+
+def _environment_ref(i: Instance) -> dict[str, Any] | None:
+    env = data.loaded_environment(i) if i.environment_id is not None else None
+    if env is None:
+        return {"id": i.environment_id, "name": None} if i.environment_id is not None else None
+    return {"id": env.id, "name": env.name}
 
 
 async def instance_outs(db: AsyncSession, instances: list[Instance], *,
@@ -677,10 +724,35 @@ def _backup_ref(row: Backup | None) -> dict[str, Any] | None:
     return {"id": row.id, "name": row.name, "taken_at": row.taken_at, "status": row.status}
 
 
+def _switch_summary(record: Any) -> Any:
+    """``options.switch`` as the API shows it (phase 3 §11): where traffic went from and to, the hostnames
+    created, changed and deleted, and whether Switchyard applied it. The bodies Slipway read first stay out."""
+    if not isinstance(record, dict):
+        return record
+
+    def names(key: str) -> list[str]:
+        return [str(e.get("hostname")) for e in record.get(key) or [] if isinstance(e, dict) and e.get("hostname")]
+
+    return {"backend": record.get("backend"), "from_slot": record.get("from_slot"), "to_slot": record.get("to_slot"),
+            "created": names("created"), "changed": names("changed"), "deleted": names("deleted"),
+            "applied": bool(record.get("applied"))}
+
+
+def _options_out(options: dict[str, Any] | None) -> dict[str, Any]:
+    out = {k: v for k, v in (options or {}).items() if k not in _HIDDEN_OPTIONS}
+    if "switch" in out:
+        out["switch"] = _switch_summary(out["switch"])
+    return out
+
+
 class DeploymentOut(BaseModel):
     id: uuid.UUID
-    instance_id: uuid.UUID
-    instance_name: str
+    # None for a job of a whole environment (activate, publish, discard, remove_slot, teardown).
+    instance_id: uuid.UUID | None
+    instance_name: str | None
+    # The environment the job belongs to ({id, name}), and the slot it ran on or is about.
+    environment: dict[str, Any] | None = None
+    slot: str | None = None
     status: str
     branch: str
     commit_sha: str | None
@@ -709,10 +781,15 @@ class DeploymentOut(BaseModel):
         them the references are left out."""
         backups, snapshots = backups or {}, snapshots or {}
         snap = snapshots.get(d.snapshot_id) if d.snapshot_id else None
+        instance = d.instance if d.instance_id is not None else None
+        env = d.environment if d.environment_id is not None else None
+        slot = (instance.slot if instance is not None else None) or (d.options or {}).get("slot")
         return cls(
             id=d.id,
             instance_id=d.instance_id,
-            instance_name=d.instance.name,
+            instance_name=instance.name if instance is not None else None,
+            environment={"id": env.id, "name": env.name} if env is not None else None,
+            slot=str(slot) if slot else None,
             status=d.status,
             branch=d.branch,
             commit_sha=d.commit_sha,
@@ -727,7 +804,7 @@ class DeploymentOut(BaseModel):
             retry_of_id=d.retry_of_id,
             kind=d.kind or "deploy",
             previous_sha=d.previous_sha,
-            options={k: v for k, v in (d.options or {}).items() if k not in _HIDDEN_OPTIONS},
+            options=_options_out(d.options),
             backup=_backup_ref(backups.get(d.backup_id)) if d.backup_id else None,
             restore_backup=_backup_ref(backups.get(d.restore_backup_id)) if d.restore_backup_id else None,
             snapshot={"id": snap.id, "name": snap.name, "status": snap.status} if snap is not None else None,
@@ -781,6 +858,8 @@ class RetryIn(BaseModel):
     confirm: Confirm | None = None
     skip_backup: bool = False  # data:reset: only for a job whose backup failed
     take_over_lock: bool = False  # data:reset
+    # A teardown's retry forgets the Switchyard hosts and DNS records it can't delete (the typed name).
+    forget_traffic: bool = False
 
 
 class ConfirmIn(BaseModel):
@@ -919,6 +998,222 @@ def seeding_needs_download(snapshot: Snapshot, repository: str | None) -> bool:
     """Seeding an instance of ``repository`` from ``snapshot`` needs snapshots:download (D16): the snapshot is
     of another repository, or of one nobody recorded."""
     return not snapshot.repository or snapshot.repository != repository
+
+
+# --------------------------------------------------------------------- environments (phase 3 §11)
+
+# An environment's name is checked by environments.validate_create (2-26 characters, §2), which answers with
+# {detail, field}; the schema only bounds it, so a long name gets that answer and not a schema error.
+EnvName = Annotated[str, Field(max_length=100), NoNul]
+SlotKey = Literal["blue", "green", "data"]
+TlsMode = Literal["auto", "dns", "internal", "off"]
+
+
+class DnsIn(BaseModel):
+    """``traffic.dns``: publish an A record for every name, at ``address`` (default: Cloudflare's public IP)."""
+
+    address: Annotated[str, Field(max_length=45), NoNul] | None = None
+    proxied: bool | None = None  # default: the Cloudflare integration's
+
+
+class TrafficIn(BaseModel):
+    switch: Literal["none", "switchyard"] = "none"
+    dns: DnsIn | None = None
+    # Turning DNS off: forget, without deleting, the records whose Cloudflare zone is gone (deleted and added
+    # again, or moved to another account), since there is nothing left there to delete.
+    forget_lost_zone: bool = False
+
+
+class _EnvironmentFields(BaseModel):
+    settings: dict[EnvKey, Annotated[str, Field(max_length=4096), NoNul]] | None = Field(None, max_length=100)
+    services: list[Annotated[str, Field(max_length=63, pattern=manifest.SERVICE_RE.pattern)]] | None = Field(
+        None, max_length=50)
+    env: dict[EnvKey, EnvValue] | None = Field(None, max_length=500)
+    route_tls: dict[Annotated[str, Field(max_length=253), NoNul], TlsMode] | None = Field(None, max_length=50)
+    auto_activate: bool | None = None
+    traffic: TrafficIn | None = None
+    keep_backups: int | None = None  # 1-100, checked with the environment's own message
+    seed_content: bool | None = None
+
+    @field_validator("settings", "env")
+    @classmethod
+    def _clean(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return None if v is None else deployer.clean_env(v)
+
+    @field_validator("services")
+    @classmethod
+    def _services(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else sorted(set(v))
+
+    @field_validator("route_tls")
+    @classmethod
+    def _route_tls(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return None if v is None else {switchyard.clean_hostname(k): m for k, m in v.items()}
+
+
+class EnvironmentCreate(_EnvironmentFields):
+    name: EnvName
+    repository_id: uuid.UUID
+    branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
+    manifest_file: Annotated[str, Field(max_length=255), NoNul] | None = None
+    data_mode: Literal["slot", "server"]
+    hosts: dict[SlotKey, uuid.UUID]
+    seed_snapshot_id: uuid.UUID | None = None
+    first_admin: FirstAdminIn | None = None
+
+
+class EnvironmentUpdate(_EnvironmentFields):
+    """PATCH: only the fields sent change. Each slot uses them from its next deploy."""
+
+
+class EnvDeployIn(BaseModel):
+    """``POST /environments/{id}/deploy``: the idle slot by default, or the data server (``target: data``)."""
+
+    target: Literal["slot", "data"] = "slot"
+    slot: Literal["blue", "green"] | None = None
+    # The deploy goes ahead although the active slot's release is behind the database (§7.6).
+    acknowledge_schema: bool = False
+    # Deploy again, confirming: the commit the refused deploy was of, so the acknowledgement covers that release
+    # and not whatever the branch moved on to. Only a commit a deploy of that slot was already of.
+    commit_sha: str | None = Field(None, pattern=r"^[0-9a-f]{40}$")
+
+
+class SlotIn(BaseModel):
+    slot: Literal["blue", "green"]
+
+
+class SlotAdd(BaseModel):
+    host_id: uuid.UUID
+    update_data_server: bool = False  # queue an update of the data server so it lets the new host in
+
+
+class HostnameIn(BaseModel):
+    hostname: Annotated[str, Field(min_length=1, max_length=253), NoNul]
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str) -> str:
+        return switchyard.clean_hostname(v)
+
+
+class SnapshotFirst(BaseModel):
+    name: Annotated[str, Field(max_length=64), NoNul]
+    notes: Annotated[str, Field(max_length=2000), NoNul] | None = None
+
+
+class EnvironmentDelete(BaseModel):
+    confirm: Confirm | None = None
+    snapshot: SnapshotFirst | None = None  # take a snapshot of the data first (data:backup)
+
+
+class SlotHost(BaseModel):
+    id: uuid.UUID
+    name: str
+    address: str
+    upstream_address: str
+    lan_address: str | None = None
+
+
+class SlotOut(BaseModel):
+    slot: str
+    instance_id: uuid.UUID
+    role: Literal["app", "data"]
+    host: SlotHost
+    status: str
+    active: bool
+    # {sha, deployed_at, release, settings_differ}: what runs now, and whether the environment's settings
+    # changed since (they reach the slot with its next deploy).
+    live: dict[str, Any] | None = None
+    last_check: dict[str, Any] | None = None
+    stale: dict[str, Any] | None = None
+    ports: list[dict[str, Any]] = []
+
+    @classmethod
+    def of(cls, env: Any, i: Instance) -> SlotOut:
+        live = data.live_state(i)
+        live_out = None
+        if live is not None or i.current_commit_sha:
+            live = live or {}
+            settings = {str(k): str(v) for k, v in (live.get("settings") or {}).items()}
+            wanted = {str(k): str(v) for k, v in (env.app_settings or {}).items()}
+            live_out = {"sha": live.get("sha") or i.current_commit_sha, "deployed_at": i.last_deployed_at,
+                        "release": live.get("release"), "settings_differ": bool(live) and settings != wanted}
+        state = i.slot_state or {}
+        ports = [{"service": p.get("service") or "", "container": p.get("container"), "host": p.get("host")}
+                 for p in i.published_ports or []]
+        named = {p["service"] for p in ports}
+        for name, port in ((live or {}).get("host_ports") or {}).items() if i.slot == "data" else ():
+            if name not in named:
+                ports.append({"service": str(name), "container": None, "host": port})
+        h = i.host
+        return cls(slot=str(i.slot), instance_id=i.id, role="data" if i.slot == "data" else "app",
+                   host=SlotHost(id=h.id, name=h.name, address=h.address, upstream_address=h.upstream_address,
+                                 lan_address=h.lan_address),
+                   status=i.status, active=env.active_slot_id == i.id, live=live_out,
+                   last_check=state.get("last_check") if isinstance(state.get("last_check"), dict) else None,
+                   stale=state.get("stale") if isinstance(state.get("stale"), dict) else None, ports=ports)
+
+
+class SlotAdded(SlotOut):
+    deployment: DeploymentOut | None = None  # the data server's update, with update_data_server
+    note: str | None = None
+
+
+class EnvironmentSummary(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    repository: dict[str, Any]  # {id, full_name}
+    branch: str
+    data_mode: str
+    active_slot: str | None
+    slots: list[dict[str, Any]]  # [{slot, host_name, status, sha7}]
+    last_job: dict[str, Any] | None = None  # {id, kind, status, finished_at}
+
+    @staticmethod
+    def parts(env: Any, members: dict[str, Instance], last: Deployment | None) -> dict[str, Any]:
+        order = {"blue": 0, "green": 1, "data": 2}
+        slots = sorted(members.values(), key=lambda m: order.get(str(m.slot), 3))
+        active = next((m.slot for m in slots if m.id == env.active_slot_id), None)
+        return {
+            "id": env.id, "name": env.name, "status": env.status,
+            "repository": {"id": env.repository_id, "full_name": env.repository.full_name if env.repository else None},
+            "branch": env.branch, "data_mode": env.data_mode, "active_slot": active,
+            "slots": [{"slot": m.slot, "host_name": m.host.name, "status": m.status,
+                       "sha7": (m.current_commit_sha or "")[:7] or None} for m in slots],
+            "last_job": {"id": last.id, "kind": last.kind, "status": last.status, "finished_at": last.finished_at,
+                         "label": data.dep_label(last)} if last is not None else None,
+        }
+
+    @classmethod
+    def of(cls, env: Any, members: dict[str, Instance], last: Deployment | None) -> EnvironmentSummary:
+        return cls(**cls.parts(env, members, last))
+
+
+class EnvironmentOut(EnvironmentSummary):
+    manifest_file: str
+    auto_activate: bool
+    traffic: dict[str, Any]
+    traffic_state: dict[str, Any]
+    route_tls: dict[str, Any]
+    hostnames: list[dict[str, Any]]
+    settings: dict[str, Any]
+    services: list[str] | None
+    secrets: list[str]  # names only, never the values
+    env_keys: list[str]
+    # The environment's variables are stored but can't be decrypted with SLIPWAY_ENCRYPTION_KEY.
+    env_unreadable: bool = False
+    slots: list[SlotOut]  # type: ignore[assignment]  # the full rows here
+    data_owner_id: uuid.UUID | None
+    # {keep_backups, seed_snapshot, first_admin, data_dirty, capabilities}: the data owner's (D3)
+    data: dict[str, Any]
+    active_job: DeploymentOut | None = None
+    notice: dict[str, Any] | None = None
+    created_by: str | None = None
+    created_at: datetime
+    deleted_at: datetime | None = None
+    actions: dict[str, Any] = {}
+    warnings: list[str] = []  # POST /environments: what was accepted but is worth knowing
 
 
 # --------------------------------------------------------------------------- audit

@@ -95,7 +95,7 @@ async def storage(tmp_path) -> AsyncIterator[Path]:
 def submitted(monkeypatch) -> list[uuid.UUID]:
     """Jobs are queued but never run here."""
     jobs: list[uuid.UUID] = []
-    monkeypatch.setattr(deployer.runner, "submit", lambda dep_id, inst_id: jobs.append(dep_id))
+    monkeypatch.setattr(deployer.runner, "submit", lambda dep_id, keys: jobs.append(dep_id))
     return jobs
 
 

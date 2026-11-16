@@ -8,12 +8,18 @@
 {%- if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Job queued"{% endif -%}
 {%- endmacro %}
 
-{% macro confirm_field(instance, id) -%}
+{#- ``name`` is what must be typed: the instance's name, or the environment's for an environment's data owner
+    (data.confirm_name, D20), so every dialog here serves both. -#}
+{% macro confirm_field(name, id) -%}
 <div class="field confirm-field">
-  <label for="{{ id }}">Type <strong class="mono">{{ instance.name }}</strong> to confirm</label>
-  <input class="input mono" id="{{ id }}" name="confirm" data-must-equal="{{ instance.name }}" autocomplete="off" spellcheck="false" maxlength="100">
+  <label for="{{ id }}">Type <strong class="mono">{{ name }}</strong> to confirm</label>
+  <input class="input mono" id="{{ id }}" name="confirm" data-must-equal="{{ name }}" autocomplete="off" spellcheck="false" maxlength="100">
 </div>
 {%- endmacro %}
+
+{#- The name the data dialogs speak of and ask for: ``d.who`` (pages.data_view), else the instance's. -#}
+{% macro who(instance, d) -%}{{ d.who if d and d.who else instance.name }}{%- endmacro %}
+{% macro confirm_name(instance, d) -%}{{ d.confirm if d and d.confirm else instance.name }}{%- endmacro %}
 
 {% macro head(title) -%}
 <div class="modal-head"><h2>{{ title }}</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
@@ -90,8 +96,8 @@
       {% if d.rebuild_note %}<p class="help" style="margin: 0">{{ d.rebuild_note }}</p>{% endif %}
       <p class="help" style="margin: 0" data-show-if="dirty_note" data-slot="dirty_note"></p>
       <p class="help" style="margin: 0" data-show-if="no_revision_check">Slipway can't check this backup's revision against the release.</p>
-      <p style="margin: 0">Puts {{ instance.name }}'s database back to this backup, then starts release <span class="mono">{{ d.sha7 }}</span> again (it migrates the data forward). Slipway first backs up the database as it is now, so you can undo this from the job's page. Everything written since <span data-slot="taken"></span> is lost. The app is down while it runs.</p>
-      {{ confirm_field(instance, "restore-confirm") }}
+      <p style="margin: 0">Puts {{ who(instance, d) }}'s database back to this backup, then starts release <span class="mono">{{ d.sha7 }}</span> again (it migrates the data forward). Slipway first backs up the database as it is now, so you can undo this from the job's page. Everything written since <span data-slot="taken"></span> is lost. {{ "Blue and Green are stopped while it runs." if d.shared else "The app is down while it runs." }}</p>
+      {{ confirm_field(confirm_name(instance, d), "restore-confirm") }}
     </div>
     {{ foot("Restore backup") }}
   </form>
@@ -102,9 +108,9 @@
 {% macro backup_dialog(instance, d) -%}
 <dialog class="modal" id="backup-now">
   <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/backups" {{ then_job() }}>
-    {{ head("Back up " ~ instance.name) }}
+    {{ head("Back up " ~ who(instance, d)) }}
     <div class="modal-body">
-      <p style="margin: 0">Dumps {{ instance.name }}'s database on {{ instance.host.name }} now, while the app keeps running. Slipway keeps it until you delete it (up to {{ d.manual_max }} you take yourself).</p>
+      <p style="margin: 0">Dumps {{ who(instance, d) }}'s database on {{ instance.host.name }} now, while the app keeps running. Slipway keeps it until you delete it (up to {{ d.manual_max }} you take yourself).</p>
       {% if "files" in d.caps %}
       <label class="check"><input type="checkbox" name="files"><span>Include the {{ d.labels.files|lower }}</span></label>
       {% endif %}
@@ -123,7 +129,7 @@
 <dialog class="modal" id="take-snapshot">
   <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/snapshots"
         {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{deployment.id}"{% else %}data-then="reload" data-success="Snapshot started"{% endif %}>
-    {{ head("Take a snapshot of " ~ instance.name) }}
+    {{ head("Take a snapshot of " ~ who(instance, d)) }}
     <div class="modal-body">
       <div class="field">
         <label for="snapshot-name">Name</label>
@@ -135,9 +141,9 @@
         <textarea class="input" id="snapshot-notes" name="notes" rows="2" maxlength="2000"></textarea>
       </div>
       {% if auth.can(Perm.INSTANCES_OPERATE) and instance.status == "running" %}
-      <label class="check"><input type="checkbox" name="stop_app"><span>Stop the app while copying <span class="subtle">(consistent; the app is down while the data is exported on the host)</span></span></label>
+      <label class="check"><input type="checkbox" name="stop_app"><span>Stop the app while copying <span class="subtle">({{ "consistent; Blue and Green are stopped while the data is exported" if d.shared else "consistent; the app is down while the data is exported on the host" }})</span></span></label>
       {% endif %}
-      <p style="margin: 0">Copies {{ instance.name }}'s database{% if "files" in d.caps %}, its {{ d.labels.files|lower }}{% endif %} and its {{ d.labels.identity }} into a snapshot kept, encrypted, on this Slipway server.</p>
+      <p style="margin: 0">Copies {{ who(instance, d) }}'s database{% if "files" in d.caps %}, its {{ d.labels.files|lower }}{% endif %} and its {{ d.labels.identity }} into a snapshot kept, encrypted, on this Slipway server.</p>
     </div>
     {{ foot("Take snapshot", danger=False) }}
   </form>
@@ -151,7 +157,7 @@
 {%- set pending = d.first_admin and d.first_admin.status == "pending" -%}
 <dialog class="modal" id="reset-data" style="width: min(640px, calc(100vw - 32px))">
   <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/data/reset" {{ then_job() }}>
-    {{ head("Reset " ~ instance.name ~ "'s data") }}
+    {{ head("Reset " ~ who(instance, d) ~ "'s data") }}
     <div class="modal-body">
       <div class="row wrap" style="gap: 8px 20px">
         <label class="check"><input type="radio" name="start_from" value="empty" data-no-send checked><span>Start empty</span></label>
@@ -182,9 +188,9 @@
       {% if "starter_content" in d.caps %}
       <label class="check" data-show-when="start_from=empty"><input type="checkbox" name="seed" {{ 'checked' if instance.seed_content }}><span>Add starter content</span></label>
       {% endif %}
-      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }} and starts {{ instance.name }} again <span data-show-when="start_from=empty">empty</span><span data-show-when="start_from=snapshot">from the snapshot</span>. Slipway first backs up the database{% if "files" in d.caps %} and the {{ L.files|lower }}{% endif %}.</p>
+      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }}{% if d.shared %} and each slot's own volumes{% endif %} and starts {{ who(instance, d) }} again <span data-show-when="start_from=empty">empty</span><span data-show-when="start_from=snapshot">from the snapshot</span>. Slipway first backs up the database{% if "files" in d.caps %} and the {{ L.files|lower }}{% endif %}.{% if d.shared %} Blue and Green are stopped while it runs.{% endif %}</p>
       {% if d.unbacked %}<p style="margin: 0"><strong>Deleted and in no backup: {{ d.unbacked|join(", ") }}.</strong></p>{% endif %}
-      {{ confirm_field(instance, "reset-confirm") }}
+      {{ confirm_field(confirm_name(instance, d), "reset-confirm") }}
     </div>
     {{ foot("Reset data") }}
   </form>
@@ -195,10 +201,16 @@
 {% macro start_over_dialog(instance, d) -%}
 <dialog class="modal" id="start-over">
   <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/data/start-over" {{ then_job() }}>
-    {{ head("Start " ~ instance.name ~ " over") }}
+    {{ head("Start " ~ who(instance, d) ~ " over") }}
     <div class="modal-body">
-      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }}, which {{ instance.name }}'s failed first deploys created, after backing them up. The next deploy starts empty{% if d.seed_snapshot %}, or from snapshot {{ d.seed_snapshot.name }}{% endif %}.</p>
-      {{ confirm_field(instance, "start-over-confirm") }}
+      {% set so = d.start_over_server %}
+      {% if so %}
+      <p style="margin: 0">Deletes {{ so.env }}'s data on {{ instance.host.name }} ({% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the data server's volumes{% endfor %}){% if so.slots %}, and the app's own volumes on {% for s in so.slots %}{{ s|capitalize }}{{ " and " if not loop.last }}{% endfor %}, which {{ "its" if so.slots|length == 1 else "their" }} failed deploys left{% endif %}, after backing them up. No app slot has gone live on this data yet.</p>
+      <p style="margin: 0">The data server is stopped afterwards. {{ so.env }}'s next deploy updates it first, and starts empty{% if d.seed_snapshot %}, or from snapshot {{ d.seed_snapshot.name }}{% endif %}.</p>
+      {% else %}
+      <p style="margin: 0">Deletes {% for v in d.volumes %}<span class="mono">{{ v }}</span>{{ ", " if not loop.last }}{% else %}the app's data volumes{% endfor %} on {{ instance.host.name }}, which {{ who(instance, d) }}'s failed first deploys created, after backing them up. The next deploy starts empty{% if d.seed_snapshot %}, or from snapshot {{ d.seed_snapshot.name }}{% endif %}.</p>
+      {% endif %}
+      {{ confirm_field(confirm_name(instance, d), "start-over-confirm") }}
     </div>
     {{ foot("Start over") }}
   </form>
@@ -217,7 +229,7 @@
     <div class="modal-body">
       {% if another %}<p style="margin: 0">{{ instance.name }} is live: Slipway runs the app's first-admin command again with these details when you choose Create it now. Use it to get back in after the last admin account was lost.</p>{% endif %}
       {{ admin_fields(fa, "", "fa", values=(row.fields if row and not another else {}), password_optional=keep_password and not another) }}
-      {% if another %}{{ confirm_field(instance, "first-admin-confirm") }}{% endif %}
+      {% if another %}{{ confirm_field(confirm_name(instance, d), "first-admin-confirm") }}{% endif %}
     </div>
     {{ foot("Save", danger=another) }}
   </form>
@@ -234,7 +246,7 @@
       <p style="margin: 0">Puts the database back as it was before deployment {{ dep.id.hex[:8] }} (backup <span class="mono">{{ st.backup.name }}</span>, taken {{ st.backup.taken_at|dt }}) and starts <span class="mono">{{ d.sha7 }}</span> again, the release that was running.{% if st.also_undoes %} {{ st.also_undoes }}{% endif %} Slipway first backs up the database as it is now, for diagnosis. Everything written since {{ st.backup.taken_at|dt }} is lost. {{ d.labels.files }} aren't rolled back.</p>
       {% if d.rollback.by_hand %}<p style="margin: 0"><strong>{{ instance.name }} was started by hand on {{ d.rollback.by_hand|dt }}: what was written since is lost too.</strong></p>{% endif %}
       {% if d.rebuild_note %}<p class="help" style="margin: 0">{{ d.rebuild_note }}</p>{% endif %}
-      {{ confirm_field(instance, "rollback-confirm") }}
+      {{ confirm_field(confirm_name(instance, d), "rollback-confirm") }}
     </div>
     {{ foot("Roll back") }}
   </form>
@@ -257,7 +269,7 @@
       <label class="check"><input type="checkbox" name="skip_backup"><span>Retry without the backup <span class="subtle">(the data is changed with no copy to go back to)</span></span></label>
       {% endif %}
       {% endif %}
-      {{ confirm_field(instance, "retry-confirm") }}
+      {{ confirm_field(confirm_name(instance, d), "retry-confirm") }}
     </div>
     {{ foot("Retry") }}
   </form>
@@ -353,4 +365,70 @@
     {{ foot("Save", danger=False) }}
   </form>
 </dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------- the Backups card (§15.1) #}
+{# The instance page's card, and the environment page's for its data owner (phase 3 §12.2, with ``subtitle``). #}
+{% macro backups_card(instance, d, subtitle=None) -%}
+{%- set can_hosts = auth.can(Perm.HOSTS_READ) -%}
+{%- set caps = d.caps -%}
+{%- set can_restore = auth.can(Perm.DATA_RESTORE) -%}
+{%- set can_reset = auth.can(Perm.DATA_RESET) -%}
+{%- set can_backup = auth.can(Perm.DATA_BACKUP) and "backup" in caps -%}
+{%- set empty_text = (d.elsewhere ~ "") if d.elsewhere and not d.backups else
+      ("This app's slipway.yml declares no dump command, so Slipway can't back it up." if d.live and "backup" not in caps else
+       "No backups yet. Slipway takes one before each deploy once the app has data.") -%}
+<section class="card" id="backups-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("database", "i-lg") }}</span>
+    <div><h2>Backups</h2><p>{% if subtitle %}{{ subtitle }}{% else %}Database dumps in {% if can_hosts and d.folder %}<span class="mono">{{ d.folder }}/backups</span>{% else %}the instance's backups folder{% endif %} on {{ instance.host.name }}. Slipway takes one before every deploy and every change that replaces data, and keeps the newest {{ d.keep }} (and up to {{ d.manual_max }} you take yourself).{% endif %}</p></div>
+    <span class="spacer"></span>
+    <div class="actions">
+      <button class="btn btn-sm" type="button" data-reload-target="#backups" title="Checks the files on {{ instance.host.name }}">{{ icon("sync", "i-sm") }} Refresh</button>
+      {% if can_backup %}
+      <button class="btn btn-sm" type="button" data-open="backup-now" {% if d.busy %}disabled title="A job is running for this instance; wait for it to finish"{% endif %}>{{ icon("database", "i-sm") }} Back up now…</button>
+      <button class="btn btn-sm" type="button" data-open="take-snapshot" {% if d.snapshot_off %}disabled title="{{ d.snapshot_off }}"{% endif %}>{{ icon("package", "i-sm") }} Take snapshot…</button>
+      {% endif %}
+    </div>
+  </div>
+  {% if d.ram_backed or (d.elsewhere and d.backups) or (can_backup and d.snapshot_off and not d.busy) %}
+  <div class="card-body stack" style="gap: 10px">
+    {% if d.ram_backed %}<div class="callout warning">{{ icon("alert") }}<span>{{ instance.name }}'s folder is in RAM on {{ instance.host.name }} (Unraid): backups there are lost when it restarts. Move the instance's folder under <code>/mnt/user</code>.</span></div>{% endif %}
+    {% if d.elsewhere and d.backups %}<div class="callout primary">{{ icon("info") }}<span>{{ d.elsewhere }}.</span></div>{% endif %}
+    {% if can_backup and d.snapshot_off and not d.busy %}<p class="subtle" style="margin: 0">Take snapshot is off: {{ d.snapshot_off }}</p>{% endif %}
+  </div>
+  {% endif %}
+  <div id="backups" data-load="/api/v1/instances/{{ instance.id }}/backups?check=true" data-render="backups"
+       data-instance="{{ instance.id }}" data-host="{{ instance.host.name }}" data-files-label="{{ d.labels.files }}"
+       data-identity-label="{{ d.labels.identity }}" data-empty="{{ empty_text }}" data-job-shas='{{ d.job_shas|tojson }}'
+       {% if can_restore %}data-can-restore{% endif %} {% if can_reset %}data-can-reset{% endif %} {% if d.busy %}data-busy{% endif %}
+       {% if "revision_check" in caps %}data-revision-check{% endif %} {% if "files" in caps %}data-has-files-cap{% endif %}>
+    {% if d.backups %}
+    <div class="table-wrap"><table class="table backups">
+      <thead><tr><th>Taken</th><th>Why</th><th>Data</th><th>Size</th><th>On host</th><th></th></tr></thead>
+      <tbody>{% for r in d.backups %}
+        <tr>
+          <td class="nowrap" title="{{ r.taken_iso }}">{{ r.taken }}</td>
+          <td>{{ r.why }}{% for text, title in r.chips %} <span class="chip" title="{{ title }}">{{ text }}</span>{% endfor %}{% if r.b.note %}<div class="subtle">{{ r.b.note }}</div>{% endif %}</td>
+          <td class="mono subtle">{{ r.data }}</td>
+          <td class="nowrap">{{ r.size }}</td>
+          <td><span class="badge {{ r.on_host[1] }}">{{ r.on_host[0] }}</span></td>
+          <td class="actions-cell">
+            {%- if can_restore %}
+              {%- if not r.b.restorable %}<span class="subtle">{{ r.b.reason_text }}</span>
+              {%- elif r.b.needs_reset_perm and not can_reset %}<span class="subtle">{{ r.restore_off }}</span>
+              {%- else %}<button class="btn btn-sm" type="button" data-open="restore-backup" data-fill='{{ r.fill|tojson }}' {% if r.restore_off %}disabled title="{{ r.restore_off }}"{% endif %}>Restore…</button>{% endif %}
+            {%- endif %}
+            {%- if can_reset %}
+            <button class="btn btn-sm btn-danger" type="button" data-api="DELETE /api/v1/instances/{{ instance.id }}/backups/{{ r.b.id }}" data-then="reload"
+                    data-confirm="{{ 'Forget backup ' ~ r.b.name ~ '? Its files aren\'t on ' ~ instance.host.name ~ ' any more.' if r.delete_label == 'Forget' else 'Delete backup ' ~ r.b.name ~ ' from ' ~ instance.host.name ~ '? This can\'t be undone.' }}"
+                    {% if r.delete_off %}disabled title="{{ r.delete_off }}"{% endif %}>{{ r.delete_label }}</button>
+            {%- endif %}
+          </td>
+        </tr>
+      {% endfor %}</tbody>
+    </table></div>
+    {% if "files" in caps %}<div class="card-foot backups-foot"><span class="subtle">Backups before a deploy or a restore hold the database; those before a reset, and Back up now when you tick it, also hold the {{ d.labels.files|lower }}.</span></div>{% endif %}
+    {% else %}<div class="card-body"><p class="muted">{{ empty_text }}</p></div>{% endif %}
+  </div>
+</section>
 {%- endmacro %}

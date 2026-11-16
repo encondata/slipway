@@ -6,9 +6,9 @@
     <input class="input" id="hf-name" name="name" value="{{ h.name if h else '' }}" placeholder="prod-01" required pattern="[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}">
   </div>
   <div class="field">
-    <label for="hf-env">Environment</label>
-    <input class="input" id="hf-env" name="environment" value="{{ h.environment if h else '' }}" placeholder="prod, staging, dev…" list="env-options" data-keep-empty>
-    <datalist id="env-options"><option>prod</option><option>staging</option><option>dev</option></datalist>
+    <label for="hf-label">Label <span class="subtle">(optional)</span></label>
+    <input class="input" id="hf-label" name="label" value="{{ h.label if h else '' }}" placeholder="prod, staging, dev…" list="label-options" maxlength="32" data-keep-empty>
+    <datalist id="label-options"><option>prod</option><option>staging</option><option>dev</option></datalist>
   </div>
   <div class="field">
     <label for="hf-hostname">Hostname or IP</label>
@@ -33,6 +33,11 @@
     <label for="hf-proxy">Address for the reverse proxy <span class="subtle">(optional)</span></label>
     <input class="input mono" id="hf-proxy" name="proxy_address" value="{{ (h.proxy_address or '') if h else '' }}" placeholder="Same as the hostname above" data-keep-empty>
     <span class="help">Where Switchyard sends traffic for this host's instances, when it differs from the address Slipway uses for SSH (for example the LAN IP when Slipway connects over a VPN).</span>
+  </div>
+  <div class="field span-2">
+    <label for="hf-lan">LAN address <span class="subtle">(optional)</span></label>
+    <input class="input mono" id="hf-lan" name="lan_address" value="{{ (h.lan_address or '') if h else '' }}" placeholder="Same as the reverse proxy address" maxlength="45" data-keep-empty>
+    <span class="help">The IP address this host's connections to other hosts on the LAN come from, when it isn't the address above (a host with more than one network). An environment's data server lets its app slots in by this address.</span>
   </div>
   <div class="field span-2">
     <span class="label-text">Authentication</span>

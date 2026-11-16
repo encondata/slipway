@@ -55,6 +55,10 @@ An app with data says so too (all optional; a manifest without them deploys as b
       password: {stdin: true, args: [--password-stdin]}
     timeouts: {restore: 120}                            # minutes
 
+An app in an environment (phase 3) may also say how it runs as Blue/Green app slots that share a data server:
+``services.<name>.health``, ``data.migrations``, ``data.attach`` and ``data.server``. ``plan`` then renders one of
+three roles: ``app`` (as before), ``slot`` (an app slot whose data is elsewhere) or ``server`` (the data server).
+
 ``{slipway.out}``, ``{slipway.in}`` and ``{admin.<field>}`` are *slots*: values Slipway fills in when it
 runs the command (a file it names, or what an operator typed). Each is a whole argument, and ``plan``
 leaves it as ``{"slot": ...}`` for the deployer to fill in and quote. docs/manifest.md has the whole format.
@@ -68,7 +72,7 @@ import base64
 import posixpath
 import re
 import secrets as _secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import yaml
@@ -88,8 +92,9 @@ _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 # Values written to .env without quotes: what a shell sourcing the file and Compose both read the same way.
 _RAW_VALUE = re.compile(r"^[A-Za-z0-9._+/=:@%^*!?,-]*\Z")
 
-# {slipway.<name>} in a template.
-BUILTINS = ("slug", "name", "release", "env_dir", "sha", "sha12", "host", "deployment")
+# {slipway.<name>} in a template. environment and slot are empty for an instance outside an environment.
+BUILTINS = ("slug", "name", "release", "env_dir", "sha", "sha12", "host", "deployment", "environment", "slot")
+MEMBER_BUILTINS = ("environment", "slot")
 # Only start is required. The rest after stop are about the app's data (docs/manifest.md says what each does).
 COMMANDS = ("build", "start", "stop", "has_data", "data_up", "dump", "verify_dump", "revision", "accepts", "restore",
             "export_files", "import_files", "after_import", "seed")
@@ -110,7 +115,7 @@ DEFAULT_TIMEOUTS = {
 MAX_TIMEOUT = 1440  # minutes: a day
 # What the pages and endpoints offer an app, in this order (Manifest.capabilities).
 CAPABILITIES = ("backup", "verify", "restore", "revision_check", "files", "reset", "snapshot", "seed", "first_admin",
-                "starter_content")
+                "starter_content", "attach", "server", "bluegreen")
 HOLDS = ("database", "files", "other")
 MAX_IDENTITY = 16
 
@@ -123,6 +128,31 @@ PASSWORD_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
 _SHELL_VARS = frozenset({"PATH", "HOME", "SHELL", "IFS", "ENV", "BASH_ENV", "CDPATH", "PS4", "USER", "LOGNAME"})
 _PROGRAM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 _WHOLE = re.compile(r"^\{([^{}]*)\}\Z")
+
+# Environments (phase 3): how an app runs as Blue/Green slots that share a data server.
+HEALTH_RE = re.compile(r"^/[A-Za-z0-9._~/%?&=+-]{0,199}\Z")  # the path smoke tests request
+MIGRATIONS = ("expand_contract",)
+ROLES = ("app", "slot", "server")
+# What an environment can provide for each kind of data endpoint: its fields, and the ones that are secret.
+ENDPOINT_FIELDS: dict[str, tuple[str, ...]] = {
+    "postgres": ("host", "port", "database", "user", "password", "tls", "ca_b64"),
+    "s3": ("endpoint", "region", "bucket", "access_key", "secret_key", "path_style"),
+}
+SECRET_FIELDS: dict[str, tuple[str, ...]] = {"postgres": ("password",), "s3": ("secret_key",)}
+SERVER_COMMANDS = ("build", "start", "stop", "has_data", "data_up")
+MAX_NEEDS = 4
+MAX_ATTACH_ENV = 40
+MAX_SERVER_ENV = 20
+MAX_SERVER_PORTS = 8
+_SECRET_REF = re.compile(r"^\{secret\.([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+# Where each kind of environment value may be used in a template, as the messages name the places.
+_PLACES = {
+    "data": "data.attach.env",
+    "secret": "data.attach.env and data.server.provides",
+    "server.host": "data.server.provides and data.server.env",
+    "server.port": "data.server.provides and data.server.env",
+    "server.clients": "data.server.env",
+}
 
 
 class ManifestError(ValueError):
@@ -167,6 +197,7 @@ class Service:
     hostname: str | None = None  # template
     optional: bool = False
     default: bool = True  # an optional service is on unless this is false
+    health: str | None = None  # the path smoke tests request (None: "/")
 
 
 @dataclass(frozen=True)
@@ -182,6 +213,52 @@ class DataFiles:
 
 
 @dataclass(frozen=True)
+class DataAttach:
+    """How the app runs on a host that doesn't hold its data (``data.attach``)."""
+
+    needs: dict[str, str]  # endpoint name: kind (postgres or s3)
+    env: dict[str, str]  # .env key: template, written into every app slot's .env when the data is elsewhere
+
+    def to_json(self) -> dict[str, Any]:
+        return {"needs": dict(self.needs), "env": list(self.env)}
+
+
+@dataclass(frozen=True)
+class ServerPort:
+    """A port only the data server publishes (``data.server.ports``)."""
+
+    name: str
+    port: int
+    port_var: str
+
+
+@dataclass(frozen=True)
+class DataServer:
+    """How the app's own data services run alone on a data server (``data.server``)."""
+
+    services: tuple[str, ...] = ()  # services that run there; their hostnames follow the server
+    ports: tuple[ServerPort, ...] = ()
+    secrets: tuple[str, ...] = ()  # the only secrets written there; every other one is written empty
+    env: dict[str, str] = field(default_factory=dict)  # .env key: template, written only on the server
+    projects: tuple[str, ...] | None = None  # templates, each one of projects (None: every project)
+    volumes: tuple[str, ...] | None = None  # templates, each one of data.volumes (None: every volume)
+    commands: dict[str, tuple[str, ...]] = field(default_factory=dict)  # replace these commands on the server
+    provides: dict[str, dict[str, str]] = field(default_factory=dict)  # need: {field: template}
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "services": list(self.services),
+            "ports": {p.name: {"port": p.port, "port_var": p.port_var} for p in self.ports},
+            "secrets": list(self.secrets),
+            "env": list(self.env),
+            "projects": list(self.projects) if self.projects is not None else None,
+            "volumes": list(self.volumes) if self.volumes is not None else None,
+            "commands": list(self.commands),
+            "provides": {need: list(fields) for need, fields in self.provides.items()},  # field names, never values
+        }
+
+
+@dataclass(frozen=True)
 class DataSpec:
     """What slipway.yml says about the app's data (``data:``). Every field is optional."""
 
@@ -191,14 +268,25 @@ class DataSpec:
     files: DataFiles | None = None
     identity_label: str = "identity keys"
     identity_help: str = ""
+    migrations: str | None = None  # expand_contract: the previous release runs on the schema the next one migrates
+    attach: DataAttach | None = None
+    server: DataServer | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "app": self.app, "format": self.format,
             "volumes": [{"name": v.name, "holds": v.holds} for v in self.volumes],
             "files": {"format": self.files.format, "label": self.files.label} if self.files else None,
             "identity_label": self.identity_label, "identity_help": self.identity_help,
         }
+        # Only when declared, so what is stored for an app that doesn't use environments stays as it was (I1).
+        if self.migrations is not None:
+            out["migrations"] = self.migrations
+        if self.attach is not None:
+            out["attach"] = self.attach.to_json()
+        if self.server is not None:
+            out["server"] = self.server.to_json()
+        return out
 
 
 @dataclass(frozen=True)
@@ -287,6 +375,33 @@ class Manifest:
                 out.append(s)
         return out
 
+    def services_for(self, role: str, chosen: list[str] | None) -> list[Service]:
+        """The services a plan in ``role`` runs and publishes ports for (§5.3): ``services_on(chosen)`` for an
+        app; without ``data.server.services`` for an app slot; on a data server, those services, then each
+        ``data.server.ports`` entry as a service with no hostname (so ports are planned the same way)."""
+        on = self.services_on(chosen)
+        server = self.data.server
+        if role == "app" or server is None:
+            return on
+        if role == "slot":
+            return [s for s in on if s.name not in server.services]
+        return [s for s in on if s.name in server.services] + [
+            Service(name=p.name, port=p.port, port_var=p.port_var) for p in server.ports]
+
+    def health_path(self, service: str) -> str:
+        """The path smoke tests request from ``service``: its ``health``, or ``/``."""
+        return next((s.health for s in self.services if s.name == service and s.health), "/")
+
+    def member_keys(self) -> set[str]:
+        """Keys Slipway sets on an environment's members from ``data.attach`` and ``data.server``, which the
+        environment's own variables may not set (§5.2 rule 13)."""
+        keys: set[str] = set()
+        if self.data.attach:
+            keys |= set(self.data.attach.env)
+        if self.data.server:
+            keys |= set(self.data.server.env) | {p.port_var for p in self.data.server.ports}
+        return keys
+
     def setting_keys(self) -> set[str]:
         return {s.key for s in self.settings}
 
@@ -320,6 +435,10 @@ class Manifest:
             "seed": "restore" in has,
             "first_admin": self.first_admin is not None,
             "starter_content": "seed" in has,
+            "attach": self.data.attach is not None,
+            "server": self.data.server is not None,
+            # Two app slots on one set of data (D7): a data server, and migrations the previous release survives.
+            "bluegreen": self.data.server is not None and self.data.migrations == "expand_contract",
         }
         return tuple(c for c in CAPABILITIES if on[c])
 
@@ -495,7 +614,7 @@ def parse(text: str) -> Manifest:
         if not isinstance(svc, str) or not SERVICE_RE.match(svc):
             raise _err(where, "a service name is lowercase letters, digits, '-' and '_'")
         spec = _mapping(spec, where)
-        _only(spec, ("port", "port_var", "protocol", "hostname", "optional", "default"), where)
+        _only(spec, ("port", "port_var", "protocol", "hostname", "optional", "default", "health"), where)
         port = _port(spec["port"], f"{where}.port") if spec.get("port") is not None else None
         port_var = _env_key(spec["port_var"], f"{where}.port_var") if spec.get("port_var") is not None else None
         if port_var and port is None:
@@ -515,10 +634,17 @@ def parse(text: str) -> Manifest:
             check_template(hostname, f"{where}.hostname")
             if port is None or protocol != "tcp":
                 raise _err(where, "a hostname needs a tcp port")
+        health = spec.get("health")
+        if health is not None:
+            health = _str(health, f"{where}.health", max_len=200)
+            if hostname is None:
+                raise _err(f"{where}.health", "a health path needs a hostname")
+            if not HEALTH_RE.match(health):
+                raise _err(f"{where}.health", f"'{health}' is not a path such as /healthz")
         services.append(Service(
             name=svc, port=port, port_var=port_var, protocol=protocol, hostname=hostname,
             optional=_bool(spec.get("optional", False), f"{where}.optional"),
-            default=_bool(spec.get("default", True), f"{where}.default"),
+            default=_bool(spec.get("default", True), f"{where}.default"), health=health,
         ))
 
     opt = _mapping(data.get("optional_services"), "optional_services")
@@ -548,6 +674,13 @@ def parse(text: str) -> Manifest:
     data_spec = _data(data.get("data"))
     first_admin = _first_admin(data["first_admin"], taken) if data.get("first_admin") is not None else None
     _check_data_rules(commands, data_spec)
+    raw_data = _mapping(data.get("data"), "data")
+    attach = _attach(raw_data["attach"], taken, {s.key for s in secret_list}) \
+        if raw_data.get("attach") is not None else None
+    server = _server(raw_data["server"], taken, secret_list, services, projects, commands, data_spec, attach) \
+        if raw_data.get("server") is not None else None
+    if attach or server:
+        data_spec = replace(data_spec, attach=attach, server=server)
     timeouts = _timeouts(data.get("timeouts"), commands, first_admin)
 
     return Manifest(
@@ -669,7 +802,11 @@ def _label(value: Any, pattern: re.Pattern[str], where: str, what: str) -> str:
 
 def _data(value: Any) -> DataSpec:
     spec = _mapping(value, "data")
-    _only(spec, ("app", "format", "volumes", "files", "identity_label", "identity_help"), "data")
+    _only(spec, ("app", "format", "volumes", "files", "identity_label", "identity_help", "migrations", "attach", "server"),
+          "data")
+    migrations = spec.get("migrations")
+    if migrations is not None and migrations not in MIGRATIONS:
+        raise _err("data.migrations", "the only value is expand_contract")
     fmt_rule = "a format label is lowercase letters, digits, '.', '_', '+' and '-', at most 40, such as pg-custom"
     app = _label(spec["app"], APP_ID_RE, "data.app",
                  "an app id is lowercase letters, digits, '.', '_' and '-', at most 64, such as serversherpa") \
@@ -704,7 +841,227 @@ def _data(value: Any) -> DataSpec:
                           label=_text(fspec, "label", "data.files", "Files", 40))
     return DataSpec(app=app, format=fmt, volumes=tuple(volumes), files=files,
                     identity_label=_text(spec, "identity_label", "data", "identity keys", 60),
-                    identity_help=_text(spec, "identity_help", "data", "", 300))
+                    identity_help=_text(spec, "identity_help", "data", "", 300), migrations=migrations)
+
+
+# ------------------------------------------------------- environments: attach and server
+
+
+def _set_by(key: str, taken: dict[str, str]) -> str | None:
+    """Why ``key`` can't be one data.attach or data.server sets: what already sets it, or None."""
+    what = taken.get(key)
+    if what is None:
+        return None
+    if what.endswith(".port_var") or what == "optional_services.var":
+        return "is a port variable; Slipway sets it" if what.endswith(".port_var") else f"is {what}; Slipway sets it"
+    if what.startswith("settings."):
+        return f"is an app setting ({what})"
+    if what.startswith("secrets."):
+        return f"is a secret ({what}); use {{secret.{key}}} in a value instead"
+    return f"is already set by {what}"
+
+
+def _env_values(value: Any, where: str, limit: tuple[int, int], taken: dict[str, str],
+                allow: frozenset[str]) -> dict[str, str]:
+    """data.attach.env or data.server.env: .env keys Slipway sets, each a template that may use ``allow``."""
+    spec = _mapping(value, where)
+    low, high = limit
+    if not low <= len(spec) <= high:
+        raise _err(where, f"give {low} to {high} keys" if low else f"give at most {high} keys")
+    out: dict[str, str] = {}
+    for key, tmpl in spec.items():
+        kwhere = f"{where}.{key}"
+        _env_key(key, kwhere)
+        why = _set_by(key, taken)
+        if why:
+            raise _err(kwhere, why)
+        out[key] = _str(tmpl, kwhere, max_len=1000, allow_empty=True)
+        check_template(out[key], kwhere, allow=allow)
+    return out
+
+
+def _attach(value: Any, taken: dict[str, str], secret_keys: set[str]) -> DataAttach:
+    where = "data.attach"
+    spec = _mapping(value, where)
+    _only(spec, ("needs", "env"), where)
+    kinds = ", ".join(ENDPOINT_FIELDS)
+    raw = _mapping(spec.get("needs"), f"{where}.needs")
+    if not 1 <= len(raw) <= MAX_NEEDS:
+        raise _err(f"{where}.needs", f"give 1 to {MAX_NEEDS} endpoints the app reads, each a kind ({kinds})")
+    needs: dict[str, str] = {}
+    for name, kind in raw.items():
+        nwhere = f"{where}.needs.{name}"
+        if not isinstance(name, str) or not FIELD_RE.match(name):
+            raise _err(nwhere, "an endpoint name is a lowercase letter, then lowercase letters, digits and '_', at most 31")
+        if kind not in ENDPOINT_FIELDS:
+            raise _err(nwhere, f"{kind!r} isn't a kind Slipway can provide ({kinds})")
+        needs[name] = kind
+    env = _env_values(spec.get("env"), f"{where}.env", (1, MAX_ATTACH_ENV), taken, frozenset({"data", "secret"}))
+    for key, tmpl in env.items():
+        for name in placeholders(tmpl):
+            if name.startswith("data."):
+                _, need, fld = name.split(".")
+                if need not in needs:
+                    raise _err(f"{where}.env.{key}", f"{{{name}}} isn't one of data.attach.needs ({', '.join(needs)})")
+                fields = ENDPOINT_FIELDS[needs[need]]
+                if fld not in fields:
+                    raise _err(f"{where}.env.{key}",
+                               f"{{{name}}} isn't a field of a {needs[need]} endpoint ({', '.join(fields)})")
+            elif name.startswith("secret.") and name.removeprefix("secret.") not in secret_keys:
+                raise _err(f"{where}.env.{key}", f"{{{name}}} isn't one of secrets")
+    return DataAttach(needs=needs, env=env)
+
+
+def _server(value: Any, taken: dict[str, str], secret_list: list[Secret], services: list[Service],
+            projects: tuple[str, ...], commands: dict[str, tuple[str, ...]], data: DataSpec,
+            attach: DataAttach | None) -> DataServer:
+    where = "data.server"
+    spec = _mapping(value, where)
+    _only(spec, ("services", "ports", "secrets", "env", "projects", "volumes", "commands", "provides"), where)
+    if attach is None:
+        raise ManifestError("slipway.yml: data.server needs data.attach: the app slots must be told where the server is")
+    if "dump" not in commands:
+        raise ManifestError("slipway.yml: data.server needs commands.dump: Slipway backs the data up on the server")
+    by_name = {s.name: s for s in services}
+
+    names = _name_list(spec.get("services"), f"{where}.services", 20)
+    for name in names:
+        svc = by_name.get(name)
+        if svc is None:
+            raise _err(f"{where}.services", f"{name} is not one of services")
+        if svc.optional:
+            raise _err(f"{where}.services", f"{name} is optional; a data server's services always run")
+        if svc.port is None:
+            raise _err(f"{where}.services", f"{name} has no port; a data server's services publish one")
+
+    ports: list[ServerPort] = []
+    port_vars: dict[str, str] = {}
+    used = {(s.port, s.protocol): s.name for s in services if s.port is not None}
+    raw_ports = _mapping(spec.get("ports"), f"{where}.ports")
+    if len(raw_ports) > MAX_SERVER_PORTS:
+        raise _err(f"{where}.ports", f"give at most {MAX_SERVER_PORTS} ports")
+    for name, pspec in raw_ports.items():
+        pwhere = f"{where}.ports.{name}"
+        if not isinstance(name, str) or not FIELD_RE.match(name):
+            raise _err(pwhere, "a port name is a lowercase letter, then lowercase letters, digits and '_', at most 31")
+        if name in by_name:
+            raise _err(pwhere, "is a service's name; give the port another name")
+        pspec = _mapping(pspec, pwhere)
+        _only(pspec, ("port", "port_var"), pwhere)
+        if pspec.get("port") is None or pspec.get("port_var") is None:
+            raise _err(pwhere, "give port (the port it listens on) and port_var (the variable that sets its host port)")
+        port = _port(pspec["port"], f"{pwhere}.port")
+        if (port, "tcp") in used:
+            raise _err(f"{pwhere}.port", f"{port}/tcp is also {used[(port, 'tcp')]}'s port")
+        used[(port, "tcp")] = name
+        var = _env_key(pspec["port_var"], f"{pwhere}.port_var")
+        if var in taken or var in port_vars:
+            raise _err(f"{pwhere}.port_var", f"{var} is already set by {taken.get(var) or port_vars[var]}")
+        port_vars[var] = f"{pwhere}.port_var"
+        ports.append(ServerPort(name=name, port=port, port_var=var))
+
+    declared = [s.key for s in secret_list]
+    server_secrets = _name_list(spec.get("secrets"), f"{where}.secrets", len(declared) or 1)
+    for i, key in enumerate(server_secrets):
+        if key not in declared:
+            raise _err(f"{where}.secrets[{i}]", f"{key} is not one of secrets")
+
+    env = _env_values(spec.get("env"), f"{where}.env", (0, MAX_SERVER_ENV), {**taken, **port_vars},
+                      frozenset({"server.host", "server.port", "server.clients"}))
+    port_names = [*(p.name for p in ports), *names]
+    for key, tmpl in env.items():
+        _check_server_ports(tmpl, f"{where}.env.{key}", port_names)
+
+    def one_of(value: Any, key: str, allowed: tuple[str, ...] | list[str], what: str) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        items = _template_list(value, f"{where}.{key}", 20)
+        for i, item in enumerate(items):
+            if item not in allowed:
+                raise _err(f"{where}.{key}[{i}]", f"'{item}' is not one of {what}")
+        return tuple(items)
+
+    server_projects = one_of(spec.get("projects"), "projects", projects, "projects")
+    server_volumes = one_of(spec.get("volumes"), "volumes", [v.name for v in data.volumes], "data.volumes")
+
+    server_commands: dict[str, tuple[str, ...]] = {}
+    for key, cspec in _mapping(spec.get("commands"), f"{where}.commands").items():
+        if key not in SERVER_COMMANDS:
+            raise _err(f"{where}.commands.{key}", f"unknown command (allowed: {', '.join(SERVER_COMMANDS)})")
+        server_commands[key] = _argv(cspec, f"{where}.commands.{key}")[0]
+
+    provides = _provides(spec.get("provides"), attach, declared, server_secrets, port_names)
+    return DataServer(services=tuple(names), ports=tuple(ports), secrets=tuple(server_secrets), env=env,
+                      projects=server_projects, volumes=server_volumes, commands=server_commands, provides=provides)
+
+
+def _name_list(value: Any, where: str, limit: int) -> list[str]:
+    """A list of names (services, secrets), each at most once."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > limit:
+        raise _err(where, f"must be a list of at most {limit}")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        name = _str(item, f"{where}[{i}]", max_len=100)
+        if name in out:
+            raise _err(where, f"{name} is listed twice")
+        out.append(name)
+    return out
+
+
+def _check_server_ports(template: str, where: str, port_names: list[str]) -> None:
+    for name in placeholders(template):
+        if name.startswith("server.port.") and name.removeprefix("server.port.") not in port_names:
+            raise _err(where, f"{{{name}}} isn't one of data.server.ports or data.server.services "
+                              f"({', '.join(port_names) or 'none'})")
+
+
+def _provides(value: Any, attach: DataAttach, declared: list[str], server_secrets: list[str],
+              port_names: list[str]) -> dict[str, dict[str, str]]:
+    """data.server.provides: every data.attach.needs endpoint, with every field of its kind."""
+    where = "data.server.provides"
+    spec = _mapping(value, where)
+    for need in spec:
+        if need not in attach.needs:
+            raise _err(f"{where}.{need}", f"isn't one of data.attach.needs ({', '.join(attach.needs)})")
+    out: dict[str, dict[str, str]] = {}
+    example = f'"{{secret.{declared[0] if declared else "DB_PASSWORD"}}}"'
+    for need, kind in attach.needs.items():
+        nwhere = f"{where}.{need}"
+        if need not in spec:
+            raise _err(where, f"needs {need} (every data.attach.needs endpoint)")
+        fspec = _mapping(spec[need], nwhere)
+        fields = ENDPOINT_FIELDS[kind]
+        for fld in fspec:
+            if fld not in fields:
+                raise _err(f"{nwhere}.{fld}", f"isn't a field of a {kind} endpoint ({', '.join(fields)})")
+        for fld in fields:
+            if fld not in fspec:
+                raise _err(nwhere, f"needs {fld} ({kind} endpoints have {', '.join(fields)})")
+        rendered: dict[str, str] = {}
+        for fld in fields:
+            fwhere = f"{nwhere}.{fld}"
+            text = _str(fspec[fld], fwhere, max_len=1000, allow_empty=fld == "ca_b64")
+            check_template(text, fwhere, allow=frozenset({"secret", "server.host", "server.port"}))
+            _check_server_ports(text, fwhere, port_names)
+            if fld in SECRET_FIELDS[kind] and not _SECRET_REF.match(text):
+                raise _err(fwhere, f"must be one secret, such as {example}")
+            if fld == "tls" and text not in ("disable", "require"):
+                raise _err(fwhere, f"'{text}' isn't disable or require")
+            if fld == "path_style" and text not in ("true", "false"):
+                raise _err(fwhere, f"'{text}' isn't true or false")
+            for name in placeholders(text):
+                if not name.startswith("secret."):
+                    continue
+                key = name.removeprefix("secret.")
+                if key not in declared:
+                    raise _err(fwhere, f"{{{name}}} isn't one of secrets")
+                if key not in server_secrets:
+                    raise _err(fwhere, f"uses {key}, which data.server.secrets doesn't list")
+            rendered[fld] = text
+        out[need] = rendered
+    return out
 
 
 def _check_data_rules(commands: dict[str, tuple[str, ...]], data: DataSpec) -> None:
@@ -879,7 +1236,35 @@ def placeholders(template: str) -> list[str]:
     return [m.group(1) for m in _PLACEHOLDER.finditer(template) if m.group(1) is not None]
 
 
-def check_template(template: str, where: str) -> None:
+def _env_value_kind(name: str) -> str | None:
+    """Which environment value a placeholder is (a ``_PLACES`` key), or None for any other name."""
+    head = name.split(".", 1)[0]
+    if "." in name and head in ("data", "secret"):
+        return head
+    if name in ("server.host", "server.clients"):
+        return name
+    if name.startswith("server."):
+        return "server.port"  # {server.port.<name>}, or a mistake _check_env_value names
+    return None
+
+
+def _check_env_value(name: str, where: str) -> None:
+    """The shape of an environment value: {data.<need>.<field>}, {secret.<KEY>} or a {server.…} value."""
+    parts = name.split(".")
+    if parts[0] == "data":
+        if len(parts) != 3 or not FIELD_RE.match(parts[1]) or not FIELD_RE.match(parts[2]):
+            raise _err(where, f"{{{name}}} is not {{data.<endpoint>.<field>}}, such as {{data.db.host}}")
+    elif parts[0] == "secret":
+        if len(parts) != 2 or not ENV_KEY_RE.match(parts[1]):
+            raise _err(where, f"{{{name}}} is not {{secret.<KEY>}}, such as {{secret.POSTGRES_PASSWORD}}")
+    elif name not in ("server.host", "server.clients") and not (
+            len(parts) == 3 and parts[1] == "port" and FIELD_RE.match(parts[2])):
+        raise _err(where, f"{{{name}}} is not one of server.host, server.port.<name>, server.clients")
+
+
+def check_template(template: str, where: str, *, allow: frozenset[str] = frozenset()) -> None:
+    """Check a template's placeholders. ``allow`` names the environment values (``_PLACES`` keys) it may use:
+    none, except in data.attach.env, data.server.env and data.server.provides."""
     for m in _PLACEHOLDER.finditer(template):
         token, name = m.group(0), m.group(1)
         if token in ("{{", "}}"):
@@ -889,6 +1274,12 @@ def check_template(template: str, where: str) -> None:
         slot = _slot(name)
         if slot is not None:  # a value filled at run time: only where _argv allows it, never in a template
             raise _err(where, f"{{{name}}} can only be used in {_slot_places(slot)}")
+        kind = _env_value_kind(name)
+        if kind is not None:
+            if kind not in allow:
+                raise _err(where, f"{{{name}}} can only be used in {_PLACES[kind]}")
+            _check_env_value(name, where)
+            continue
         if name.startswith("slipway."):
             if name.removeprefix("slipway.") not in BUILTINS:
                 raise _err(where, f"{{{name}}} is not one of {', '.join('slipway.' + b for b in BUILTINS)}")
@@ -897,8 +1288,11 @@ def check_template(template: str, where: str) -> None:
 
 
 def render(template: str, builtins: dict[str, str], env: dict[str, str], where: str,
-           *, hidden: frozenset[str] | set[str] = frozenset(), blocked: dict[str, str] | None = None) -> str:
-    """Fill in a template. ``hidden`` keys (the secrets) and ``blocked`` ones (name: why) can't be used."""
+           *, hidden: frozenset[str] | set[str] = frozenset(), blocked: dict[str, str] | None = None,
+           values: dict[str, str] | None = None) -> str:
+    """Fill in a template. ``hidden`` keys (the secrets) and ``blocked`` ones (name: why) can't be used.
+    ``values`` holds the environment values (``data.db.host``, ``secret.KEY``, ``server.host``...) this
+    template may use; parse has already refused one where it isn't allowed."""
     why = {k: "is a secret and can't be used here" for k in hidden}
     why.update(blocked or {})
 
@@ -911,7 +1305,13 @@ def render(template: str, builtins: dict[str, str], env: dict[str, str], where: 
         if name is None:
             raise ManifestError(f"{where}: a lone '{token}'")
         if name.startswith("slipway."):
-            return builtins[name.removeprefix("slipway.")]
+            key = name.removeprefix("slipway.")
+            # Empty outside an environment, and for a caller that doesn't fill them in.
+            return builtins.get(key, "") if key in MEMBER_BUILTINS else builtins[key]
+        if _env_value_kind(name) is not None:
+            if values is None or name not in values:
+                raise ManifestError(f"{where}: {{{name}}} has no value")
+            return values[name]
         if name in why:
             raise ManifestError(f"{where}: {{{name}}} {why[name]}")
         if name not in env:
@@ -1038,10 +1438,23 @@ class AppPlan:
     volumes: list[dict[str, str]] = field(default_factory=list)  # [{name, holds}], rendered
     # {"argv": [...], "stream": None, "password_args": [...], "invite_args": [...]}, or None
     first_admin: dict[str, Any] | None = None
+    # Environments (§5.3). The role the plan was made for: app (standalone, or the one slot of a mode slot
+    # environment), slot (an app slot whose data is on a data server) or server (the data server).
+    role: str = "app"
+    # Rendered values that must be hidden like secrets (logs, never stored): data.attach.env values made with a
+    # secret, such as a database URL with its password in it, and the secrets they were made with.
+    secret_values: set[str] = field(default_factory=set)
+    server_ports: dict[str, int] = field(default_factory=dict)  # server role: data.server port or service: host port
+    # What each identity: true key renders to, with the secrets and variables the plan was given, before the
+    # server role writes it empty: the values the data is made with, whichever member's .env this is.
+    identity: dict[str, str] = field(default_factory=dict)
+    # Server role: data.server.provides rendered, {need: {field: value}}. Secret fields hold the secret itself.
+    provides: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-def check_instance_env(manifest: Manifest, env: dict[str, str]) -> None:
-    """The instance's own variables may not change what Slipway sets."""
+def check_instance_env(manifest: Manifest, env: dict[str, str], role: str = "app") -> None:
+    """The instance's own variables may not change what Slipway sets. An environment's variables (the
+    ``slot`` and ``server`` roles) may not set what data.attach and data.server set either."""
     clash = sorted(set(env) & (manifest.slipway_keys() | manifest.setting_keys()))
     if clash:
         raise ManifestError(
@@ -1049,6 +1462,20 @@ def check_instance_env(manifest: Manifest, env: dict[str, str]) -> None:
             f"{'it' if len(clash) == 1 else 'them'} from the instance's environment variables "
             "(use the app settings or a port override instead)"
         )
+    if role != "app":
+        clash = sorted(set(env) & manifest.member_keys())
+        if clash:
+            raise ManifestError(
+                f"{', '.join(clash)} {'is' if len(clash) == 1 else 'are'} set from slipway.yml's data.attach or "
+                f"data.server; remove {'it' if len(clash) == 1 else 'them'} from the environment's variables"
+            )
+
+
+def _clients(value: Any) -> str:
+    """{server.clients}: the addresses, sorted, each once, comma-separated."""
+    if isinstance(value, str):
+        value = value.split(",")
+    return ",".join(sorted({str(v).strip() for v in value or [] if str(v).strip()}))
 
 
 def plan(
@@ -1061,6 +1488,9 @@ def plan(
     host_ports: dict[str, int],
     secrets: dict[str, str],
     env: dict[str, str],
+    role: str = "app",
+    data_values: dict[str, dict[str, str]] | None = None,
+    server_values: dict[str, Any] | None = None,
 ) -> AppPlan:
     """Render an app's ``.env``, routes, projects and commands.
 
@@ -1068,8 +1498,22 @@ def plan(
     order values win in, last first: the instance's own variables, the secrets, ``vars``, the ports
     and optional services, the settings, the ``env_file`` defaults. (Their keys never overlap, except
     an instance variable replacing a secret or a default.)
+
+    ``role`` (§5.3): ``app`` renders exactly as before environments existed. ``slot`` is an app slot whose
+    data is on a data server: without ``data.server.services``, with ``data.attach.env`` filled from
+    ``data_values`` ({need: {field: value}}, the data server's rendered provides). ``server`` is the data
+    server: only its services, ports, projects and volumes, ``data.server.env`` and commands, and only
+    ``data.server.secrets`` (every other secret is written empty). ``server_values`` is ``{host, clients,
+    ports?}``: the server host's address, the app slots' addresses, and port overrides over ``host_ports``.
     """
-    check_instance_env(manifest, env)
+    if role not in ROLES:
+        raise ValueError(f"unknown plan role {role!r}")
+    attach, server = manifest.data.attach, manifest.data.server
+    if role == "slot" and attach is None:
+        raise ManifestError("slipway.yml has no data.attach, so the app can't run on a host that doesn't hold its data")
+    if role == "server" and server is None:
+        raise ManifestError("slipway.yml has no data.server, so Slipway can't run the app's data services on their own")
+    check_instance_env(manifest, env, role)
     _, defaults = parse_env_template(template or "")
     values = dict(defaults)
     written: list[str] = []
@@ -1088,13 +1532,17 @@ def plan(
             put(s.key, value)
     if missing:
         raise ManifestError(f"Set {', '.join(missing)} in the app settings of the instance")
-    on = manifest.services_on(chosen)
+    on = manifest.services_for(role, chosen)
+    ports = dict(host_ports)
+    if role == "server":
+        ports.update({str(k): int(v) for k, v in ((server_values or {}).get("ports") or {}).items()})
     for s in on:
         if s.port_var:
-            put(s.port_var, str(host_ports.get(s.name, s.port)))
-    if manifest.optional_var:
-        names = [s.name for s in on if s.optional]
+            put(s.port_var, str(ports.get(s.name, s.port)))
+    if manifest.optional_var:  # the optional services chosen, in every role
+        names = [s.name for s in manifest.services_on(chosen) if s.optional]
         put(manifest.optional_var, ",".join(names) if names else manifest.optional_none)
+    server_ports = {s.name: int(ports.get(s.name, s.port)) for s in on if s.port is not None} if role == "server" else {}
     # Templates never see a secret, nor a value the instance's own variables set (it may be a password, and
     # what templates render is stored and logged).
     hidden = manifest.secret_keys()
@@ -1114,10 +1562,55 @@ def plan(
         ctx = {k: v for k, v in values.items() if k not in hidden and k not in blocked and k not in stale}
         put(key, render(tmpl, builtins, ctx, f"vars.{key}", hidden=hidden, blocked={**blocked, **stale, **later,
                         key: "is the variable being set"}))
+
+    # {secret.K} is the secret as the app gets it: an instance variable with its name replaces it.
+    effective = {s.key: env[s.key] if s.key in env else secrets[s.key] for s in manifest.secrets}
+    secret_values: set[str] = set()
+    secret_env: set[str] = set()  # data.attach.env keys whose value is made with a secret
+    server_env: dict[str, str] = {}
+    if role == "server":
+        assert server is not None
+        server_env = {"server.host": str((server_values or {}).get("host") or ""),
+                      "server.clients": _clients((server_values or {}).get("clients"))}
+        if not server_env["server.host"]:
+            del server_env["server.host"]  # {server.host} then says it has no value
+        server_env.update({f"server.port.{name}": str(port) for name, port in server_ports.items()})
+    stale = unexpanded()
+    ctx = {k: v for k, v in values.items() if k not in hidden and k not in blocked and k not in stale}
+    if role == "slot":
+        assert attach is not None
+        given = {f"data.{need}.{fld}": str(val) for need, fields in (data_values or {}).items()
+                 for fld, val in (fields or {}).items()}
+        given.update({f"secret.{k}": v for k, v in effective.items()})
+        secret_names = {f"data.{need}.{fld}" for need, kind in attach.needs.items() for fld in SECRET_FIELDS[kind]}
+        secret_names |= {f"secret.{k}" for k in effective}
+        for key, tmpl in attach.env.items():
+            value = render(tmpl, builtins, ctx, f"data.attach.env.{key}", hidden=hidden, blocked={**blocked, **stale},
+                           values=given)
+            used = [n for n in placeholders(tmpl) if n in secret_names]
+            if not value:
+                continue  # left out: the env_file's own line, if any, stays as written
+            put(key, value)
+            if used:
+                secret_env.add(key)
+                secret_values.add(value)
+                secret_values.update(given[n] for n in used if given.get(n))
+    elif role == "server":
+        assert server is not None
+        for key, tmpl in server.env.items():
+            put(key, render(tmpl, builtins, ctx, f"data.server.env.{key}", hidden=hidden, blocked={**blocked, **stale},
+                            values=server_env))
     for s in manifest.secrets:
         put(s.key, secrets[s.key])
     for key, value in env.items():
         put(key, value)
+    # The values the data is made with, before the server role blanks them (the environment's, in every role).
+    identity = {k: values[k] for k in manifest.identity_keys() if k in values}
+    if role == "server":
+        assert server is not None
+        for s in manifest.secrets:  # a data server holds only the secrets its data services need (D18)
+            if s.key not in server.secrets:
+                put(s.key, "")
     if manifest.placeholder:
         left = sorted(k for k, v in values.items() if v == manifest.placeholder)
         if left:
@@ -1125,10 +1618,10 @@ def plan(
                 f"{', '.join(left)} {'is' if len(left) == 1 else 'are'} still {manifest.placeholder}: set "
                 f"{'it' if len(left) == 1 else 'them'} as an app setting or environment variable"
             )
-    public = {k: v for k, v in values.items() if k not in hidden and k not in blocked}
+    public = {k: v for k, v in values.items() if k not in hidden and k not in blocked and k not in secret_env}
     stale = unexpanded()
     usable = {k: v for k, v in public.items() if k not in stale}
-    blocked = {**blocked, **stale}
+    blocked = {**blocked, **stale, **{k: "is made with a secret and can't be used here" for k in secret_env}}
     routes = []
     for s in on:
         if s.hostname:
@@ -1138,6 +1631,8 @@ def plan(
             routes.append({"hostname": host, "service": s.name, "container": s.port})
     projects = []
     for i, tmpl in enumerate(manifest.projects):
+        if role == "server" and server is not None and server.projects is not None and tmpl not in server.projects:
+            continue  # the data server runs only data.server.projects
         name = render(tmpl, builtins, usable, f"projects[{i}]", hidden=hidden, blocked=blocked)
         if not PROJECT_RE.match(name):
             raise ManifestError(f"projects[{i}]: '{name}' is not a Compose project name")
@@ -1164,6 +1659,9 @@ def plan(
 
     commands = {key: {"argv": argv(t, f"commands.{key}"), "stream": manifest.streams.get(key)}
                 for key, t in manifest.commands.items()}
+    if role == "server" and server is not None:
+        for key, t in server.commands.items():  # the server's own commands replace the app's (no streams)
+            commands[key] = {"argv": argv(t, f"data.server.commands.{key}"), "stream": None}
     for key, cmd in commands.items():
         program_ok(cmd["argv"][0], f"commands.{key}[0]")
     first_admin = None
@@ -1176,7 +1674,12 @@ def plan(
         }
         program_ok(first_admin["argv"][0], "first_admin.command[0]")
     volumes: list[dict[str, str]] = []
+    on_server = set(server.volumes if server.volumes is not None else [v.name for v in manifest.data.volumes]) \
+        if server is not None else set()
     for i, vol in enumerate(manifest.data.volumes):
+        # An app slot keeps only the volumes that aren't on the data server; the data server only those.
+        if (role == "slot" and vol.name in on_server) or (role == "server" and vol.name not in on_server):
+            continue
         where = f"data.volumes[{i}].name"
         name = render(vol.name, builtins, usable, where, hidden=hidden, blocked=blocked)
         if not VOLUME_RE.match(name):
@@ -1184,10 +1687,18 @@ def plan(
         if any(v["name"] == name for v in volumes):
             raise ManifestError(f"{where}: '{name}' is listed twice")
         volumes.append({"name": name, "holds": vol.holds})
+    provides: dict[str, dict[str, str]] = {}
+    if role == "server" and server is not None:
+        given = {**server_env, **{f"secret.{k}": v for k, v in effective.items()}}
+        for need, fields in server.provides.items():
+            provides[need] = {fld: render(tmpl, builtins, usable, f"data.server.provides.{need}.{fld}", hidden=hidden,
+                                          blocked=blocked, values=given)
+                              for fld, tmpl in fields.items()}
     for key in written:
         format_value(values[key], key)  # refuse a value the .env can't hold before anything runs
     return AppPlan(env=values, written=written, public_env=public, services=on, routes=routes, projects=projects, images=images,
-                   commands=commands, volumes=volumes, first_admin=first_admin)
+                   commands=commands, volumes=volumes, first_admin=first_admin, role=role, secret_values=secret_values,
+                   server_ports=server_ports, identity=identity, provides=provides)
 
 
 def command_argv(command: Any) -> list[Any] | None:

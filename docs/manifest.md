@@ -15,6 +15,9 @@ The file has two parts:
   snapshots, starter content and the first admin use. A `slipway.yml` without them deploys
   exactly as before; its deploys show a skipped `backup` step that says
   `slipway.yml declares no data`.
+- **Environments** (phase 3, all optional): health paths for smoke tests, and how the app runs as
+  Blue/Green app slots that share a data server (`data.migrations`, `data.attach`, `data.server`).
+  An instance outside an environment ignores them.
 
 A complete example is [examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml).
 Slipway checks the whole file before anything runs, and a mistake fails the deploy with a message
@@ -42,7 +45,8 @@ An app's commands run on the host as trusted code, like a compose file.
 14. [timeouts](#timeouts)
 15. [Which commands go together](#which-commands-go-together)
 16. [What Slipway offers an app](#what-slipway-offers-an-app)
-17. [Examples](#examples)
+17. [Environments: attach and server](#environments-attach-and-server)
+18. [Examples](#examples)
 
 ---
 
@@ -62,7 +66,7 @@ An app's commands run on the host as trusted code, like a compose file.
 | `projects` | no | The Compose projects the app's commands create (at most 20). |
 | `images` | no | The images a release builds (at most 30). |
 | `commands` | yes (`start`) | How to build, start and stop the app, and its data commands. |
-| `data` | no | What the app's data is. |
+| `data` | no | What the app's data is, and how it runs in an environment. |
 | `first_admin` | no | How to create the app's first administrator. |
 | `timeouts` | no | How long commands may run, in minutes. |
 
@@ -85,6 +89,8 @@ Most values are templates:
   | `slipway.sha`, `slipway.sha12` | the commit, in full or its first 12 characters |
   | `slipway.host` | the host's address |
   | `slipway.deployment` | the first 8 characters of the deployment's id |
+  | `slipway.environment` | the environment's name, such as `uat`; empty for an instance outside an environment |
+  | `slipway.slot` | the slot: `blue`, `green` or `data` (the data server); empty outside an environment |
 
 - `{KEY}` is the value `KEY` has in the app's `.env`: a setting, a var, a port variable or an
   `env_file` default.
@@ -95,6 +101,11 @@ templates render is stored with the instance and shown in the deploy log, and ei
 password. An `env_file` default that Compose would expand (`${OTHER}`, unquoted or in double
 quotes) can't be used either, because Slipway would copy its unexpanded text; set it in `settings`
 or `vars` instead.
+
+`{data.<endpoint>.<field>}`, `{secret.<KEY>}`, `{server.host}`, `{server.port.<name>}` and
+`{server.clients}` are values of an environment, allowed only in `data.attach` and `data.server`
+([Environments](#environments-attach-and-server)); anywhere else Slipway refuses them and says where
+they can be used.
 
 `{slipway.out}`, `{slipway.in}` and `{admin.<field>}` are not template values. They are
 [slots](#slots-and-stream-mode), filled in when a command runs, and only some commands can use them.
@@ -114,6 +125,10 @@ When the same key comes from several places, the later one in this list wins:
 4. `vars`;
 5. the secrets;
 6. the instance's own environment variables.
+
+In an environment, an app slot whose data is on the data server also gets `data.attach.env`, and
+the data server `data.server.env`, both between `vars` and the secrets
+([Environments](#environments-attach-and-server)).
 
 Their keys never overlap, except that an environment variable of the instance may replace a secret
 or an `env_file` default. It may not replace a setting, a var or a port variable: Slipway refuses
@@ -185,7 +200,7 @@ What the app serves, and on which ports:
 
 ```yaml
 services:
-  api:     {port: 8000, port_var: STACK_API_PORT, hostname: "api.{STACK_DOMAIN}"}
+  api:     {port: 8000, port_var: STACK_API_PORT, hostname: "api.{STACK_DOMAIN}", health: /healthz}
   kiosk:   {port: 8090, port_var: STACK_KIOSK_PORT, hostname: "kiosk.{STACK_DOMAIN}", optional: true}
   mailpit: {port: 8025, port_var: STACK_MAILPIT_PORT, optional: true, default: false}
 
@@ -200,6 +215,7 @@ optional_services: {var: STACK_APPS, none: none}
 | `hostname` | a template for the public name. Slipway publishes it in Switchyard, like any instance's routes. Needs a tcp `port`. |
 | `optional` | the instance chooses whether it runs |
 | `default` | whether an optional service runs when the instance hasn't chosen (default `true`) |
+| `health` | the path an environment's smoke tests request from the service's hostname, such as `/healthz` (default `/`); an answer of 200-399 passes. A path starts with `/` and has at most 200 of `A-Z a-z 0-9 . _ ~ / % ? & = + -`. Needs `hostname`. |
 
 With any optional service, `optional_services.var` names the variable that lists the ones that run,
 comma-separated, and `none` is its value when none do. A service name is lowercase letters, digits,
@@ -277,6 +293,9 @@ data:
 | `files` | Present exactly when `commands.export_files` is: `format` (a label, as for `data.format`) and `label` (what the files are called in the dialogs, at most 40, default `Files`). |
 | `identity_label` | What the [identity secrets](#secrets) are called in the dialogs, at most 60 characters (default `identity keys`). |
 | `identity_help` | What losing them means for this app, at most 300 characters, shown where a restore or snapshot would change them. |
+| `migrations` | `expand_contract` (the only value): each release's migrations only add, and what they remove is removed a release later, so the release before runs on the schema the next one migrates. Two app slots on one set of data need it. |
+| `attach` | How the app runs on a host that doesn't hold its data. See [Environments](#environments-attach-and-server). |
+| `server` | How the app's own data services run alone on a data server. See [Environments](#environments-attach-and-server). |
 
 Volume names may use the app's vars, settings and builtins; they may not use a secret. Two entries
 may not render to the same name.
@@ -444,14 +463,113 @@ What a release's slipway.yml declares decides what the instance page and the API
 | Starting a new instance from a snapshot | `restore` |
 | First admin | `first_admin` |
 | Starter content | `seed` |
+| An environment with a data server (one app slot) | `data.attach` and `data.server` |
+| Blue/Green (two app slots on one data server) | `data.server` and `data.migrations: expand_contract` |
 
 When `has_data` exits 4 (the data lives outside the host), Slipway still backs the data up, but
 won't restore it, roll it back, reset it or seed it.
 
+## Environments: attach and server
+
+An **environment** runs one app as up to two **app slots** (`blue`, `green`) and, with a data
+server, one **data server** (`data`). Every slot is an instance of its own on an SSH host. In mode
+`slot`, the one app slot holds its own data and deploys as any instance does. In mode `server`, the
+data server runs only the app's data services, and the app slots reach it over the network;
+`data.attach` and `data.server` say how. Slipway knows nothing more about the app than this.
+
+```yaml
+data:
+  migrations: expand_contract
+  attach:                            # an app slot whose data is on the data server
+    needs: {db: postgres, objects: s3}
+    env:
+      STACK_EXTERNAL_DATA: "1"
+      STACK_DB_HOST: "{data.db.host}"
+      SS_DATABASE_URL: "postgresql+asyncpg://{data.db.user}:{data.db.password}@{data.db.host}:{data.db.port}/{data.db.database}"
+      SS_DATABASE_CA_B64: "{data.db.ca_b64}"
+      SS_SPACES_SECRET_KEY: "{data.objects.secret_key}"
+  server:                            # the data server
+    services: [spaces]
+    ports: {db: {port: 5432, port_var: STACK_DB_PORT}}
+    secrets: [POSTGRES_PASSWORD, SPACES_SECRET_KEY]
+    env: {STACK_DB_PUBLISH: "1", STACK_DB_ALLOW: "{server.clients}"}
+    projects: ["ss-{STACK_ENV}-db", "ss-{STACK_ENV}-storage"]
+    volumes: ["ss-{STACK_ENV}-db_pgdata", "ss-{STACK_ENV}-storage_seaweeddata"]
+    commands:
+      start:    [deploy/stack/ss-stack, data, "{slipway.env_dir}"]
+      has_data: [deploy/stack/ss-stack, has-data, "{slipway.env_dir}", --server]
+    provides:
+      db: {host: "{server.host}", port: "{server.port.db}", database: serversherpa, user: serversherpa,
+           password: "{secret.POSTGRES_PASSWORD}", tls: disable, ca_b64: ""}
+      objects: {endpoint: "https://spaces.{STACK_DOMAIN}", region: us-east-1, bucket: "{SS_SPACES_BUCKET}",
+                access_key: serversherpa, secret_key: "{secret.SPACES_SECRET_KEY}", path_style: "true"}
+```
+
+**`data.attach`**
+
+| Key | Meaning |
+|---|---|
+| `needs` | The data endpoints the app reads: 1 to 4 names (a lowercase letter, then lowercase letters, digits and `_`), each with its kind, `postgres` or `s3`. |
+| `env` | 1 to 40 `.env` keys written into every app slot's `.env` when its data isn't on the slot (after `vars`, before the secrets). A key may not be a setting, a var, a secret or a port variable. Values may use `{data.<endpoint>.<field>}` (a declared endpoint and a field of its kind) and `{secret.<KEY>}`, as well as the usual template values. A value that renders to nothing is **left out** of the `.env`, and the `env_file`'s own line for it, if any, stays as written: one `attach` serves a data server without a CA and a managed database with one. |
+
+**Endpoint kinds and their fields**
+
+| Kind | Fields | Secret fields |
+|---|---|---|
+| `postgres` | `host`, `port`, `database`, `user`, `password`, `tls` (`disable` or `require`), `ca_b64` (may be empty; with `tls: require`, a CA means the app checks the server's certificate and name) | `password` |
+| `s3` | `endpoint`, `region`, `bucket`, `access_key`, `secret_key`, `path_style` (`true` or `false`) | `secret_key` |
+
+A value made with a secret (`{secret.<KEY>}`, or a secret field such as `{data.db.password}`) is a
+**secret value**: like a secret, it is hidden in logs, never stored with the instance, and can't be
+used by another template.
+
+**`data.server`** needs `data.attach` (the app slots must be told where the server is) and
+`commands.dump` (Slipway backs the data up on the server).
+
+| Key | Meaning |
+|---|---|
+| `services` | The services that run on the data server, such as an object store. Each must be declared, not optional, with a `port`. Their hostnames follow the data server, never the active slot. |
+| `ports` | Up to 8 ports only the data server publishes, such as its database: `{port, port_var}`. A name is a lowercase letter, then lowercase letters, digits and `_`, and not a service's name; `port_var` is a variable no service, setting, var or secret sets. |
+| `secrets` | The only secrets written on the data server; every other secret's line is written empty (`KEY=`). It must list every secret `provides` uses. The data's [identity values](#secrets) Slipway records come from the environment, never from these empty lines. |
+| `env` | Up to 20 `.env` keys written only on the data server (after `vars`). Not a setting, var, secret or port variable. Values may use `{server.host}`, `{server.port.<name>}` and `{server.clients}`, never a secret or a `{data.…}` value. |
+| `projects` | The `projects` entries (exactly as written there) that run on the data server. Default: every project. |
+| `volumes` | The `data.volumes` names (exactly as written there) that live on the data server. Default: every volume. The others stay on each app slot (ServerSherpa's status page, for one), and Reset clears them there. |
+| `commands` | Commands that replace the app's own on the data server: `build`, `start`, `stop`, `has_data` and `data_up`, written as in `commands` (no slots). Every other command, `dump` and `restore` included, runs as declared, with the server's `.env`. |
+| `provides` | Every `needs` endpoint, with every field of its kind: what the app slots are told. A secret field is exactly one `{secret.<KEY>}`, so Slipway knows which secret it is. Values may use `{server.host}`, `{server.port.<name>}`, `{secret.<KEY>}` and the usual template values. |
+
+**Environment values**
+
+| Value | Allowed in | Filled with |
+|---|---|---|
+| `{data.<endpoint>.<field>}` | `data.attach.env` | what the environment provides: the data server's rendered `provides` |
+| `{secret.<KEY>}` | `data.attach.env`, `data.server.provides` | the environment's secret (an environment variable of the same name replaces it) |
+| `{server.host}` | `data.server.provides`, `data.server.env` | the data server host's address |
+| `{server.port.<name>}` | `data.server.provides`, `data.server.env` | the host port the data server got for `data.server.ports.<name>`, or for a service in `data.server.services` |
+| `{server.clients}` | `data.server.env` | the app slots' hosts' LAN addresses (or proxy addresses), sorted, each once, comma-separated |
+
+**What each member gets**
+
+| | App slot holding its data, or no environment | App slot, data on the data server | Data server |
+|---|---|---|---|
+| Services, port variables and routes | as declared | without `data.server.services` | `data.server.services` and `data.server.ports` |
+| `.env` keys added | none | `data.attach.env` | `data.server.env` |
+| Secrets | all | all | `data.server.secrets`; the others written empty |
+| Projects | all | all | `data.server.projects` |
+| Volumes | all | `data.volumes` without `data.server.volumes` | `data.server.volumes` |
+| Commands | as declared | as declared | `commands`, with `data.server.commands` in place of the app's |
+
+The environment's own variables may not set a key that `data.attach.env`, `data.server.env` or a
+`data.server.ports` variable sets.
+
+`migrations: expand_contract` is a promise Slipway can't check: during a deploy to the idle slot,
+its `start` migrates the shared database while the active slot keeps serving the release before.
+Two app slots need it.
+
 ## Examples
 
 **ServerSherpa** ([examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml)) uses
-every feature, through its `deploy/stack/ss-stack` script.
+every feature, through its `deploy/stack/ss-stack` script, environments with a data server
+included.
 
 **A Django app with PostgreSQL**, no object store and no wrapper scripts:
 
@@ -490,6 +608,34 @@ first_admin:
 It gets Backups, Restore, Roll back, Reset and database-only snapshots. Its revision is the whole
 migration plan. It has no `accepts`, so the dialogs say Slipway can't check a backup's revision
 against the release.
+
+For Blue/Green, the same app adds a data server that is a plain Postgres container from its compose
+file (its compose file leaves out its `db` service when `DB_EXTERNAL` is set, and the `db` service
+reads `DB_LISTEN` and `DB_ALLOW`):
+
+```yaml
+secrets:
+  DB_PASSWORD: hex
+  FIELD_ENCRYPTION_KEY: {kind: fernet, identity: true}
+data:
+  migrations: expand_contract
+  attach:
+    needs: {db: postgres}
+    env:
+      DATABASE_URL: "postgres://{data.db.user}:{data.db.password}@{data.db.host}:{data.db.port}/{data.db.database}?sslmode={data.db.tls}"
+      DB_EXTERNAL: "1"
+  server:
+    ports: {db: {port: 5432, port_var: DB_PORT}}
+    secrets: [DB_PASSWORD]
+    env: {DB_LISTEN: "0.0.0.0", DB_ALLOW: "{server.clients}"}
+    projects: ["shop-{slipway.slug}"]
+    volumes: ["shop-{slipway.slug}_pgdata"]
+    commands:
+      start: [docker, compose, -p, "shop-{slipway.slug}", --env-file, "{slipway.env_dir}/.env", up, -d, --wait, db]
+    provides:
+      db: {host: "{server.host}", port: "{server.port.db}", database: shop, user: shop,
+           password: "{secret.DB_PASSWORD}", tls: disable, ca_b64: ""}
+```
 
 **An app without data** keeps the phase 1 keys only:
 

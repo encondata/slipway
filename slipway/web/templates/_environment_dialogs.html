@@ -1,0 +1,250 @@
+{# Dialogs of the environment page (phase 3 §12.4). Import with context. Each form posts JSON through slipway.js;
+   typed names are the environment's (data-must-equal keeps the button disabled until it matches, D20). #}
+{% from "_macros.html" import icon %}
+{% from "_data_dialogs.html" import head, foot, confirm_field, then_job with context %}
+
+{# ----------------------------------------------------------------------------------------------- deploy #}
+{% macro deploy_dialog(env, out, slots, actions, two) -%}
+{%- set a = actions.deploy -%}
+{%- set target = slots.get(a.slot) -%}
+{%- set active = (out.slots|selectattr("active")|first) if out.slots|selectattr("active")|list else none -%}
+{%- set active_sha = ((active.live or {}).get("sha") or "")[:7] if active else "" -%}
+{%- set server = env.data_mode != "slot" and "data" in slots -%}
+{%- set first = a.slot == "data" -%}
+<dialog class="modal" id="deploy-env" style="width: min(620px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/deploy" {{ then_job() }}>
+    {{ head("Deploy " ~ env.name) }}
+    <div class="modal-body">
+      {% if first %}
+      <input type="hidden" name="target" value="data">
+      <p style="margin: 0">Deploys <span class="mono">{{ env.branch }}</span> to the data server on {{ target.host.name if target else "its host" }} first, then to {{ "blue" if "blue" in slots else "the first slot" }}, which goes live when its smoke test passes.</p>
+      {% else %}
+      {% if server %}
+      <div class="row wrap" style="gap: 8px 20px">
+        <label class="check"><input type="radio" name="target" value="slot" checked><span>{{ a.slot }}{% if two %} (idle){% endif %}</span></label>
+        <label class="check"><input type="radio" name="target" value="data" {% if not actions.update_data_server.available %}disabled title="{{ actions.update_data_server.reason }}"{% endif %}><span>The data server</span></label>
+      </div>
+      {% else %}
+      <input type="hidden" name="target" value="slot">
+      {% endif %}
+      <div class="stack" style="gap: 10px" {% if server %}data-show-when="target=slot"{% endif %}>
+        {% if two %}
+        <p style="margin: 0">Deploys <span class="mono">{{ env.branch }}</span> to {{ a.slot }} on {{ target.host.name if target else "its host" }}.
+          {%- if a.go_live %} {{ a.slot }} goes live when its smoke test passes.{% elif active %} Traffic stays on {{ active.slot }} until you activate {{ a.slot }}.{% endif %}</p>
+        {% if active %}<p style="margin: 0">{{ active.slot|capitalize }} keeps serving while {{ a.slot }} migrates the database. {{ env.repository.full_name }}'s slipway.yml says its migrations are expand/contract: add columns and tables first, remove them in a later release.</p>{% endif %}
+        {% elif active %}
+        <p style="margin: 0">Updates {{ a.slot }} in place: it is down while it restarts.</p>
+        {% else %}
+        <p style="margin: 0">Deploys <span class="mono">{{ env.branch }}</span> to {{ a.slot }} on {{ target.host.name if target else "its host" }}{% if a.go_live %}, which goes live when its smoke test passes{% endif %}.</p>
+        {% endif %}
+        {% if a.stale %}<p style="margin: 0">{{ a.slot|capitalize }} was {{ (a.stale.reason or "marked stale")|lower|replace("; deploy to it before activating it", "")|replace("; deploy to it first", "") }}; this deploy brings it up to date.</p>{% endif %}
+        {% if a.behind and active %}
+        {#- The lag check (§7.6): shown when the last activate was a switch back; unticked. #}
+        <label class="check"><input type="checkbox" name="acknowledge_schema"><span>This release removes nothing {{ active.slot }} (<span class="mono">{{ active_sha }}</span>) uses <span class="subtle">({{ active.slot }} runs on a database {{ a.slot }} migrated; Slipway refuses the deploy if {{ active.slot }} can't run it, unless this is ticked)</span></span></label>
+        {% endif %}
+      </div>
+      {% if server %}
+      <p style="margin: 0" data-show-when="target=data" hidden>Deploys <span class="mono">{{ env.branch }}</span> to the data server on {{ slots.data.host.name }}. The database and file store restart if their images changed, and {{ active.slot if active else "the slots" }} {{ "loses its" if active else "lose their" }} connection for a moment. The app slots keep running.</p>
+      {% endif %}
+      {% endif %}
+    </div>
+    {{ foot("Deploy", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ---------------------------------------------------------------------------------------------- discard #}
+{% macro discard_dialog(env, actions, active) -%}
+{%- set slot = actions.discard.slot -%}
+{%- set sha7 = ((active.live or {}).get("sha") or "")[:7] if active else "" -%}
+<dialog class="modal" id="discard-slot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/discard" {{ then_job() }}>
+    {{ head("Discard " ~ slot) }}
+    <div class="modal-body">
+      <input type="hidden" name="slot" value="{{ slot }}">
+      <p style="margin: 0">Stops {{ slot }} and leaves {{ env.name }}'s data as it is: {{ active.slot if active else "the live slot" }} (<span class="mono">{{ sha7 }}</span>) keeps serving it. Slipway checks {{ active.slot if active else "it" }} first; deploy to {{ slot }} again when it's fixed.</p>
+    </div>
+    {{ foot("Discard " ~ slot, danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ----------------------------------------------------------------------------------- roll back (§7.3) #}
+{# ``rollback`` is pages.env_rollback_view; the text follows what the job does (D16): mode slot starts the slot's
+   release that was running (phase 2); mode server stops every app slot and starts the lead slot again. #}
+{% macro rollback_text(env, rollback) -%}
+{%- set at = rollback.backup_at|dt if rollback.backup_at else "the backup" -%}
+{%- set lead = rollback.lead or "the live slot" -%}
+{%- set stopped = rollback.stopped -%}
+{%- set stopped_text = (stopped|map("capitalize")|join(" and ") if stopped else "The app slots") ~ (" is" if stopped|length == 1 else " are") ~ " stopped while it runs" -%}
+{%- if rollback.case == "slot" -%}
+Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ rollback.d8 }}, and starts {{ lead }} (<span class="mono">{{ rollback.lead_sha7 }}</span>) again, the release that was running. Slipway first backs up the database as it is now, for diagnosis. <strong>Everything written since {{ at }} is lost.</strong>
+{%- elif rollback.case == "data" -%}
+Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ rollback.d8 }}, and starts the data server (<span class="mono">{{ rollback.data_sha7 }}</span>), the release that was running, and {{ lead }} (<span class="mono">{{ rollback.lead_sha7 }}</span>) again. Slipway first backs up the database as it is now, for diagnosis. <strong>Writes made through {{ lead }} since {{ at }} are lost.</strong> {{ stopped_text }}.
+{%- if rollback.other %} {% if rollback.other.same %}{{ rollback.other.slot|capitalize }} runs the same commit, so it starts again too if it was running.{% else %}{{ rollback.other.slot|capitalize }} runs another commit, so it stays stopped until you deploy to it.{% endif %}{% endif %}
+{%- else -%}
+Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ rollback.d8 }}, and starts {{ lead }} (<span class="mono">{{ rollback.lead_sha7 }}</span>) again. Slipway first backs up the database as it is now, for diagnosis. <strong>Writes made through {{ lead }} since {{ at }} are lost.</strong> {{ stopped_text }}; {{ rollback.slot }} stays stopped until you deploy to it.
+{%- endif %}{% if rollback.also_undoes %} {{ rollback.also_undoes }}{% endif %}
+{%- endmacro %}
+
+{% macro env_rollback_dialog(env, rollback, id="roll-back-env") -%}
+<dialog class="modal" id="{{ id }}">
+  <form method="post" action="/js-required" data-form="POST /api/v1/deployments/{{ rollback.dep.id }}/rollback" {{ then_job() }}>
+    {{ head("Roll back " ~ env.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">{{ rollback_text(env, rollback) }}</p>
+      {{ confirm_field(env.name, id ~ "-confirm") }}
+    </div>
+    {{ foot("Roll back") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------- activate / switch back #}
+{# ``id`` is activate-slot or switch-back; ``s`` is pages._slot_dialog of the slot; ``from_slot`` takes the traffic now. #}
+{% macro activate_dialog(env, id, s, from_slot, names, back=False) -%}
+{%- set n = names|length -%}
+<dialog class="modal" id="{{ id }}" style="width: min(640px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/activate" {{ then_job() }}>
+    {{ head(("Switch back to " if back else "Activate ") ~ s.slot) }}
+    <div class="modal-body">
+      <input type="hidden" name="slot" value="{{ s.slot }}">
+      <p style="margin: 0">Slipway checks {{ s.slot }} (<span class="mono">{{ s.sha7 }}</span>) on {{ s.host }}, then points {{ (n ~ " name" ~ ("" if n == 1 else "s")) if n else env.name ~ "'s names" }} in Switchyard at it and checks them through Switchyard.
+        {%- if from_slot %} If a check fails, every name goes back to {{ from_slot }}. {{ from_slot|capitalize }} keeps running: activate it again to switch back.{% else %} If a check fails, Slipway removes the hosts it made; nothing was live before.{% endif %}</p>
+      {#- The plan is loaded when the dialog opens; a blocker keeps the button disabled (slipway.js renderers.traffic_plan). #}
+      <div class="plan-list" data-lazy data-load="/api/v1/environments/{{ env.id }}/traffic/plan?slot={{ s.slot }}" data-render="traffic_plan" data-mode="list"><p class="muted" style="margin: 0">Reading Switchyard…</p></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn btn-primary" type="submit" data-plan-submit disabled>{{ ("Switch back to " if back else "Activate ") ~ s.slot }}</button>
+    </div>
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ----------------------------------------------------------------------------------------- remove a slot #}
+{# One dialog for either app slot: the button's data-fill sets the action, the slot and its host. #}
+{% macro remove_slot_dialog(env, data_host) -%}
+<dialog class="modal" id="remove-slot">
+  <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}/slots/-" {{ then_job() }}>
+    {{ head("Remove a slot") }}
+    <div class="modal-body">
+      <p style="margin: 0">Stops <span data-slot="slot"></span>'s containers on <span data-slot="host"></span> and removes its folder (its .env is kept in <code>.slipway-kept</code>). {{ env.name }}'s data on {{ data_host }} isn't touched.</p>
+      <p class="help" style="margin: 0">{{ env.name }}'s data server still lets <span data-slot="host"></span> in afterwards: update the data server to stop that.</p>
+      {{ confirm_field(env.name, "remove-slot-confirm") }}
+    </div>
+    {{ foot("Remove") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------- delete the environment #}
+{% macro delete_dialog(env, out, slots, teardown, default_name, can_snapshot) -%}
+{%- set data_host = slots.data.host.name if "data" in slots else (slots.blue.host.name if "blue" in slots else "its host") -%}
+<dialog class="modal" id="delete-env" style="width: min(640px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}" {{ then_job() }}>
+    {{ head("Delete " ~ env.name) }}
+    <div class="modal-body">
+      <div class="grid grid-2" style="gap: 14px">
+        <div><strong>Goes</strong>
+          <ul class="plain-list">
+            {% if teardown.hosts %}<li>{{ teardown.hosts }} Switchyard host{{ "" if teardown.hosts == 1 else "s" }} Slipway created</li>{% endif %}
+            {% if teardown.records %}<li>{{ teardown.records }} DNS record{{ "" if teardown.records == 1 else "s" }} Slipway created</li>{% endif %}
+            {% for s in out.slots %}<li>The containers and folder of {{ "the data server" if s.slot == "data" else s.slot }} on {{ s.host.name }}</li>{% endfor %}
+          </ul></div>
+        <div><strong>Stays</strong>
+          <ul class="plain-list">
+            {% if teardown.claimed %}<li>{{ teardown.claimed }} DNS record{{ "" if teardown.claimed == 1 else "s" }} Slipway claimed</li>{% endif %}
+            <li>The data volumes and backups on {{ data_host }} (backups move to <code>.slipway-kept</code>)</li>
+            <li>Images on the hosts</li>
+            <li>Snapshots kept on this Slipway</li>
+          </ul></div>
+      </div>
+      {% if can_snapshot %}
+      <label class="check"><input type="checkbox" name="snapshot_first" data-no-send><span>Take a snapshot first</span></label>
+      <div class="field" data-show-when="snapshot_first=on" hidden>
+        <label for="delete-snapshot-name">Snapshot name</label>
+        <input class="input mono" id="delete-snapshot-name" name="snapshot.name" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" value="{{ default_name }}" autocomplete="off" spellcheck="false" data-required-when="snapshot_first=on">
+      </div>
+      {% endif %}
+      <p style="margin: 0"><strong>This can't be undone.</strong> To remove the volumes and backups too, delete them on {{ data_host }} afterwards.</p>
+      {{ confirm_field(env.name, "delete-env-confirm") }}
+    </div>
+    {{ foot("Delete environment") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# -------------------------------------------------------------------------------------------- resolve #}
+{% macro resolve_dialog(env) -%}
+<dialog class="modal" id="resolve-traffic">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/traffic/resolve" data-then="reload" data-success="Resolved">
+    {{ head("Resolve " ~ env.name ~ "'s traffic") }}
+    <div class="modal-body">
+      <p style="margin: 0">Slipway reads Switchyard and, when every name points at one slot, records that slot as live.</p>
+      {{ confirm_field(env.name, "resolve-confirm") }}
+    </div>
+    {{ foot("Resolve") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------------ add a slot #}
+{% macro add_slot_dialog(env, add_hosts) -%}
+<dialog class="modal" id="add-slot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/slots" data-then="reload" data-success="Slot added">
+    {{ head("Add a slot to " ~ env.name) }}
+    <div class="modal-body">
+      <div class="field">
+        <label for="add-slot-host">Host</label>
+        <select class="input" id="add-slot-host" name="host_id" required>
+          {% for h in add_hosts %}<option value="{{ h.host.id }}" {% if h.off %}disabled{% endif %}>{{ h.host.name }} ({{ h.host.client_address }}){% if h.off %}: {{ h.off }}{% endif %}</option>{% endfor %}
+        </select>
+      </div>
+      {#- Ticked, it queues a deploy, which needs deployments:create (POST /environments/{id}/slots). #}
+      {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}
+      <label class="check"><input type="checkbox" name="update_data_server" checked><span>Update the data server now so it lets this host in <span class="subtle">(then Slipway deploys the new slot)</span></span></label>
+      {% else %}
+      <label class="check" title="Updating the data server needs the deployments:create permission"><input type="checkbox" name="update_data_server" disabled title="Updating the data server needs the deployments:create permission"><span>Update the data server now so it lets this host in <span class="subtle">(needs the deployments:create permission)</span></span></label>
+      {% endif %}
+      <p class="help" style="margin: 0">Without it, update the data server so it lets the host in, then deploy to the new slot.</p>
+    </div>
+    {{ foot("Add slot", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ---------------------------------------------------------------- retry an environment job (deployment page) #}
+{% macro retry_env_dialog(dep, env, d) -%}
+{%- set r = d.actions.retry -%}
+<dialog class="modal" id="retry-env-job">
+  <form method="post" action="/js-required" data-form="POST /api/v1/deployments/{{ dep.id }}/retry" {{ then_job() }}>
+    {{ head("Retry " ~ d.label|lower) }}
+    <div class="modal-body">
+      <p style="margin: 0">Runs {{ d.label|lower }} of {{ env.name }} again. Steps the first attempt finished are run again too; each one only does what is still left.</p>
+      {% if r.offers_forget_traffic %}
+      <label class="check"><input type="checkbox" name="forget_traffic"><span>Forget the Switchyard hosts and DNS records Slipway can't reach <span class="subtle">(they stay where they are; remove them by hand)</span></span></label>
+      {% endif %}
+      {{ confirm_field(env.name, "retry-env-confirm") }}
+    </div>
+    {{ foot("Retry") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ----------------------------------------------------- deploy again, confirming (deployment page, §7.6) #}
+{# ``again`` is pages.deploy_again. The acknowledgement is asked again, unticked: the branch may have moved on. #}
+{% macro deploy_again_dialog(dep, again) -%}
+<dialog class="modal" id="deploy-again">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ dep.environment_id }}/deploy" {{ then_job() }}>
+    {{ head("Deploy " ~ again.slot ~ " again") }}
+    <div class="modal-body">
+      <input type="hidden" name="slot" value="{{ again.slot }}">
+      <input type="hidden" name="commit_sha" value="{{ dep.commit_sha }}">
+      <p style="margin: 0">Deploys commit <span class="mono">{{ again.sha7 }}</span> of <span class="mono">{{ again.branch }}</span> to {{ again.slot }} again (the commit deployment {{ dep.id.hex[:8] }} was refused at, even if the branch has moved on), past the check that refused it: {{ again.active }} (<span class="mono">{{ again.active_sha7 }}</span>) keeps serving on the database {{ again.slot }} migrates.{% if again.go_live %} {{ again.slot|capitalize }} goes live when its smoke test passes.{% endif %}</p>
+      <label class="check"><input type="checkbox" name="acknowledge_schema" required><span>This release (<span class="mono">{{ again.sha7 }}</span>) removes nothing {{ again.active }} (<span class="mono">{{ again.active_sha7 }}</span>) uses</span></label>
+    </div>
+    {{ foot("Deploy " ~ again.slot, danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}

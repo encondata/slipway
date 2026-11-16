@@ -127,7 +127,10 @@
       <li>
         <span class="tl-icon {{ kind }}">{{ icon({"succeeded": "check", "failed": "x"}.get(d.status, "clock")) }}</span>
         <a href="/deployments/{{ d.id }}" style="color:inherit">
-          {% if can_hosts %}
+          {% if d.instance is none %}
+          {#- A job of a whole environment (activate, publish, discard, remove slot, delete) has no instance. #}
+          <div class="tl-title">{{ d.environment.name if d.environment else "An environment" }}<span>{{ d|dep_label }}: {{ {"succeeded": "done", "failed": "failed", "running": "running", "queued": "queued", "cancelled": "cancelled"}.get(d.status, "") }}</span></div>
+          {% elif can_hosts %}
           <div class="tl-title">{{ d.instance.name }}<span>{% if d.kind and d.kind != "deploy" %}{{ d.kind|kind_label }}: {{ {"succeeded": "done on", "failed": "failed on", "running": "running on", "queued": "queued for", "cancelled": "cancelled on"}.get(d.status, "") }}{% else %}{{ {"succeeded": "Deployed to", "failed": "Failed on", "running": "Building on", "queued": "Queued for", "cancelled": "Cancelled on"}.get(d.status, "") }}{% endif %} {{ d.instance.host.name }}</span></div>
           {% else %}
           <div class="tl-title">{{ d.instance.name }}<span>{% if d.kind and d.kind != "deploy" %}{{ d.kind|kind_label }}: {{ {"succeeded": "done", "failed": "failed", "running": "running", "queued": "queued", "cancelled": "cancelled"}.get(d.status, "") }}{% else %}{{ {"succeeded": "Deployed", "failed": "Failed", "running": "Building", "queued": "Queued", "cancelled": "Cancelled"}.get(d.status, "") }}{% endif %}</span></div>

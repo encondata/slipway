@@ -176,7 +176,15 @@ def create_admin(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
-_REENTER_COLUMNS = {("instances", "env"), ("instances", "app_secrets"), ("instances", "live_identity")}
+_REENTER_COLUMNS = {
+    ("instances", "env"),
+    ("instances", "app_secrets"),
+    ("instances", "live_identity"),
+    # An environment's variables and shared secrets (phase 3 D5): its member jobs refuse to run rather
+    # than regenerate secrets the environment's data won't open with.
+    ("environments", "env"),
+    ("environments", "app_secrets"),
+}
 
 
 async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -> tuple[int, list[str]]:
@@ -202,9 +210,9 @@ async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -
                 unreadable.append(f"{source.name}.{col.name} (id {row_id})")
                 if not clear_unreadable:
                     continue
-                # Instance env and app secrets become an encrypted JSON null, not NULL: the deployer treats
-                # that as "needs re-entry" and refuses to deploy, instead of deploying with no variables or
-                # generating new secrets the app's existing data won't open with.
+                # Instance and environment env and app secrets become an encrypted JSON null, not NULL: the
+                # deployer treats that as "needs re-entry" and refuses to deploy, instead of deploying with no
+                # variables or generating new secrets the app's existing data won't open with.
                 new = encrypt("null") if (source.name, col.name) in _REENTER_COLUMNS else None
             else:
                 rotated += 1
@@ -273,6 +281,10 @@ def rotate_encryption_key(args: argparse.Namespace) -> None:
         print("Instances listed here refuse to deploy until their variables are re-entered or cleared, or, for")
         print("app secrets, until each secret is set as an instance variable (its old value, to keep the app's data):")
         print("\n".join(f"  {u}" for u in unreadable))
+        if any(u.startswith("environments.") for u in unreadable):
+            print("Environments listed here refuse their jobs until their variables are re-entered in the")
+            print("environment's settings, or, for environments.app_secrets, until each secret is set as a variable")
+            print("of the environment (its old value); the next deploy in it then keeps them as its secrets.")
         if fixed:
             print("\n".join(fixed))
         return
