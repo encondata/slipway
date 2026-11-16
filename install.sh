@@ -80,9 +80,11 @@ report() {
 # The compose file lives in the repository, so the code has to come first.
 if [ -d "$DIR/.git" ]; then
   say "Updating $DIR"
-  git -C "$DIR" fetch --depth 1 origin "$BRANCH"
-  git -C "$DIR" checkout -q "$BRANCH"
-  git -C "$DIR" reset --hard "origin/$BRANCH"
+  # The clone tracks only the branch it was made from, so name where the fetched branch goes:
+  # then SLIPWAY_BRANCH can switch an existing install to another branch (and back).
+  git -C "$DIR" fetch --depth 1 origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
+    || die "Could not fetch branch '$BRANCH' from $(git -C "$DIR" remote get-url origin)."
+  git -C "$DIR" checkout -q -f -B "$BRANCH" "origin/$BRANCH"
 else
   say "Cloning into $DIR"
   git clone --depth 1 --branch "$BRANCH" "$REPO" "$DIR"
