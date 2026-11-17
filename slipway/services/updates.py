@@ -686,6 +686,64 @@ async def _compare(remote: Remote, folder: str, base: str, head: str, others: li
     return {"commits": commits, "ahead": ahead, "migrations": added, "descends": descends, "privileged": privileged}
 
 
+def _ls_remote_command(folder: str) -> str:
+    """The branch heads on origin (GitHub), read live: ``git ls-remote`` changes nothing in the checkout, so it
+    doesn't take the upgrade lock."""
+    return (f"cd -- {shlex.quote(folder)} || exit 3; export GIT_TERMINAL_PROMPT=0; "
+            "git ls-remote --heads origin </dev/null 2>&1 || exit 4")
+
+
+MAX_LISTED_BRANCHES = 1000
+
+
+def parse_ls_remote(output: str, followed: str | None) -> dict[str, Any]:
+    """``{branches, hidden, truncated}``: the valid branch names in ``git ls-remote --heads`` output, the followed
+    branch first, then main, then the rest by name (at most MAX_LISTED_BRANCHES); ``hidden`` counts names Slipway
+    won't use, ``truncated`` the valid ones past the cap."""
+    names: set[str] = set()
+    hidden = 0
+    for line in output.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) != 2 or not valid_sha(parts[0]) or not parts[1].startswith("refs/heads/"):
+            continue
+        name = parts[1][len("refs/heads/"):]
+        if valid_branch(name):
+            names.add(name)
+        else:
+            hidden += 1
+    ordered = order_branches(names, followed)
+    return {"branches": ordered[:MAX_LISTED_BRANCHES], "hidden": hidden,
+            "truncated": max(0, len(ordered) - MAX_LISTED_BRANCHES)}
+
+
+def order_branches(names: Any, followed: str | None) -> list[str]:
+    """Valid branch names without repeats: the followed branch first, then main, then the rest by name."""
+    unique = {n for n in names if isinstance(n, str) and valid_branch(n)}
+    return sorted(unique, key=lambda n: (n != followed, n != "main", n.lower(), n))
+
+
+async def remote_branches(db: AsyncSession, *, actor: User | None = None, request: Request | None = None) -> dict[str, Any]:
+    """The branches on the install's origin (GitHub), for the Branch to follow list: ``{branches, followed,
+    hidden}``. Read over SSH from the configured host; nothing is stored."""
+    state = await load_state(db)
+    if not in_docker():
+        raise UpdateError(409, MSG_NOT_IN_DOCKER)
+    if not configured(state):
+        raise UpdateError(409, MSG_NOT_CONFIGURED)
+    host = await verified_host(db, _identity(state), actor=actor, request=request)
+    folder = state["dir"]
+    target = ssh.SSHTarget.from_host(host)
+    await db.commit()
+    async with connect(target) as remote:
+        status, out = await remote.run(_ls_remote_command(folder), check=False, timeout=QUICK_TIMEOUT * 2)
+    if status == 3:
+        raise UpdateError(502, f"Can't open {folder} on {host.name}")
+    if status != 0:
+        tail = redact(ssh.clip("\n".join(out.strip().splitlines()[-ssh.TAIL_LINES:]), 1000))
+        raise UpdateError(502, f"Couldn't list the branches on origin from {host.name}: {tail}")
+    return {**parse_ls_remote(out, state["branch"]), "followed": state["branch"]}
+
+
 async def check(
     db: AsyncSession, *, actor: User | None = None, request: Request | None = None, manual: bool = True
 ) -> dict[str, Any]:

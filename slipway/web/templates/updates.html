@@ -99,7 +99,17 @@
             </div>
             <div class="field">
               <label for="upd-branch">Branch to follow</label>
-              <input class="input mono" id="upd-branch" name="branch" maxlength="100" value="{{ config.branch if config else '' }}" placeholder="The install's branch, else main">
+              {#- The branches on GitHub (the install's origin). Before the host is saved Slipway can't read them, so
+                  it follows the install's own branch; after that the list is read live (data-update-branches). #}
+              <select class="input mono" id="upd-branch" name="branch"{% if config and not config.host_changed %} data-update-branches="{{ config.branch }}"{% endif %}>
+                {% if config %}
+                  {% for name in branch_names %}<option value="{{ name }}" {{ 'selected' if name == config.branch }}>{{ name }}</option>{% endfor %}
+                  <option value="" data-own-branch>The install's own branch (detect it again)</option>
+                {% else %}
+                  <option value="" selected>The install's own branch</option>
+                {% endif %}
+              </select>
+              <span class="help muted" data-update-branches-note>{% if config %}Branches on GitHub.{% else %}Choose another branch once the host is saved.{% endif %}</span>
             </div>
           </div>
           <span class="help muted">Slipway connects to this host, finds its own container there and reads the install folder from it.</span>

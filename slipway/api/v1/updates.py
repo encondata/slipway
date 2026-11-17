@@ -85,6 +85,17 @@ async def put_config(body: ConfigIn, ctx: Upgrader, request: Request, db: DB) ->
         return _ssh_failed(exc)
 
 
+@router.get("/branches")
+async def get_branches(ctx: Upgrader, request: Request, db: DB) -> Any:
+    """The branches on GitHub (the install's origin), read live over SSH, for Branch to follow."""
+    try:
+        return await updates.remote_branches(db, actor=ctx.user, request=request)
+    except updates.UpdateError as exc:
+        return _refusal(exc)
+    except ssh.SSHError as exc:
+        return _ssh_failed(exc)
+
+
 @router.post("/check")
 async def post_check(ctx: Upgrader, request: Request, db: DB) -> Any:
     try:

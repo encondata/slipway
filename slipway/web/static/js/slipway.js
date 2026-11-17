@@ -762,6 +762,48 @@
     if (label && text) label.textContent = text;
   }
 
+  // ---------------------------------------------------- updates: Branch to follow
+  // <select data-update-branches="<followed>"> lists the branches on GitHub, read live through the server
+  // (GET /api/v1/updates/branches). Names go in with textContent; the followed branch stays selected and stays
+  // in the list even if GitHub no longer has it. On a failure the list Slipway saw last stays, with the reason.
+  async function loadUpdateBranches(sel) {
+    const followed = sel.dataset.updateBranches;
+    const field = sel.closest(".field");
+    const note = field && field.querySelector("[data-update-branches-note]");
+    const say = (t) => { if (note) note.textContent = t; };
+    say("Reading the branches on GitHub...");
+    let body;
+    try {
+      const res = await fetch("/api/v1/updates/branches", { method: "GET", headers: { Accept: "application/json" }, credentials: "same-origin" });
+      body = await res.json().catch(() => ({}));
+      if (!res.ok) { say(`Couldn't read GitHub's branches: ${body.detail || res.status}. Showing the last known list.`); return; }
+    } catch (e) {
+      say("Couldn't read GitHub's branches. Showing the last known list.");
+      return;
+    }
+    const live = Array.isArray(body.branches) ? body.branches.filter((n) => typeof n === "string") : [];
+    // What is chosen now (the user may have picked one while the list loaded): kept, and marked when GitHub
+    // doesn't have it, like the followed branch. "" is "the install's own branch".
+    const current = sel.value;
+    const names = live.slice();
+    [current, followed].forEach((n) => { if (n && !names.includes(n)) names.unshift(n); });
+    const own = $("[data-own-branch]", sel);
+    $$("option", sel).forEach((o) => o.remove());
+    names.forEach((n) => {
+      const o = document.createElement("option");
+      o.setAttribute("value", n);
+      o.textContent = live.includes(n) ? n : `${n} (not on GitHub any more)`;
+      if (n === (current === "" ? null : current || followed)) o.selected = true;
+      sel.appendChild(o);
+    });
+    if (own) { sel.appendChild(own); if (current === "") own.selected = true; }
+    const hidden = Number(body.hidden) || 0, cut = Number(body.truncated) || 0;
+    say(`${live.length + cut} branch${live.length + cut === 1 ? "" : "es"} on GitHub.` +
+        (cut ? ` The list shows the first ${live.length}.` : "") +
+        (hidden === 1 ? " 1 more with a name Slipway doesn't use is left out."
+          : hidden ? ` ${hidden} more with names Slipway doesn't use are left out.` : ""));
+  }
+
   function watchRun(el) {
     const id = el.dataset.updateRun || "";
     if (!RUN_ID.test(id)) return;
@@ -808,6 +850,7 @@
     } catch (e) { /* ignore */ }
     $$("[data-deploy-log]").forEach(streamLog);
     $$("[data-update-run]").forEach(watchRun);
+    $$("[data-update-branches]").forEach(loadUpdateBranches);
     $$("[data-load]").forEach(load);
     $$("select[data-fill]").forEach(wireFill);
     $$("select[data-branches]").forEach(wireBranches);

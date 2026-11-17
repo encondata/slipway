@@ -582,9 +582,13 @@ async def updates_page(request: Request, db: DB, ctx: PageAuth, run: str = "") -
         run_id = ov["run"]["id"]
     selected = next((r for r in ov["runs"] if r["id"] == run_id), None)
     steps = [(name, UPDATE_STEPS.get(name, name)) for name in ov["steps"]]
+    # Branch to follow: what Slipway saw last (the page then reads GitHub's list live), the followed one first.
+    followed = (ov["config"] or {}).get("branch")
+    known = [b["name"] for b in ov["branches"] if b.get("valid", True) and updates.valid_branch(b["name"])]
+    branch_names = updates.order_branches([*([followed] if followed else []), *known], followed)
     return await render(
         request, db, "updates.html", ctx, ov=ov, hosts=hosts, run_id=run_id, selected_run=selected,
-        steps=steps, switch_reason=switch_reason(ov),
+        steps=steps, switch_reason=switch_reason(ov), branch_names=branch_names,
     )
 
 

@@ -82,6 +82,7 @@ class FakeServer:
         self.write_status_on_launch = True
         self.launch_pid = 4242
         self.listing: list[str] | None = None
+        self.ls_remote_fails = ""
 
     # The service's commands, recognised by a part of their text.
     async def run(self, command, *, check=True, on_line=None, timeout=None):
@@ -98,6 +99,10 @@ class FakeServer:
             if self.container is None:
                 return 1, "Error: No such object: " + CID
             return 0, self.container + "\n" + json.dumps(self.labels)
+        if "git ls-remote --heads origin" in command:
+            if self.ls_remote_fails:
+                return 4, self.ls_remote_fails
+            return 0, "".join(f"{b[0]}\trefs/heads/{n}\n" for n, b in self.branches.items())
         if command.startswith("test -f"):
             return (0, "") if self.install_ok else (1, "")
         if "git symbolic-ref" in command:
@@ -1118,3 +1123,58 @@ def test_parse_status_reads_the_failed_step():
     assert updates.parse_status(status_json(rid, failed_step="health"), rid)["failed_step"] == "health"
     assert updates.parse_status(status_json(rid), rid)["failed_step"] is None
     assert updates.parse_status(status_json(rid, failed_step="pwned"), rid)["status"] == "unknown"
+
+
+# ------------------------------------------------------------------- Branch to follow: GitHub's branches
+
+
+async def test_branches_lists_githubs_branches_followed_first(admin_client, server):
+    server.branches["feature/next"] = ("e" * 40, "2026-11-16T11:00:00+00:00", "Ada", "Try something")
+    server.branches["Alpha"] = ("9" * 40, "2026-11-16T11:00:00+00:00", "Ada", "A")
+    server.symbolic_ref = "sideways"
+    await _configured(admin_client, server)
+    resp = await admin_client.get("/api/v1/updates/branches")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The followed branch, then main, then the rest by name; the name Slipway won't use is only counted.
+    assert body == {"branches": ["sideways", "main", "Alpha", "feature/next"], "hidden": 1, "truncated": 0,
+                    "followed": "sideways"}
+    command = server.commands[-1]
+    assert command.startswith("cd -- /mnt/user/slipway || exit 3;") and "GIT_TERMINAL_PROMPT=0" in command
+    assert "git ls-remote --heads origin" in command and "fetch" not in command  # the checkout isn't touched
+
+
+async def test_branches_refusals_and_failures(admin_client, make_client, server):
+    viewer = make_client()
+    await make_user("dev@example.com", roles=["developer"])
+    await login(viewer, "dev@example.com")
+    assert (await viewer.get("/api/v1/updates/branches")).status_code == 403
+    resp = await admin_client.get("/api/v1/updates/branches")
+    assert resp.status_code == 409 and resp.json()["detail"] == updates.MSG_NOT_CONFIGURED
+    await _configured(admin_client, server)
+    server.ls_remote_fails = "fatal: could not read Username for 'https://github.com'"
+    resp = await admin_client.get("/api/v1/updates/branches")
+    assert resp.status_code == 502
+    assert resp.json()["detail"].startswith("Couldn't list the branches on origin from tower: fatal: could not read")
+
+
+def test_parse_ls_remote_ignores_odd_lines():
+    out = "\n".join([
+        f"{'a' * 40}\trefs/heads/main",
+        f"{'b' * 40}\trefs/heads/-x",          # not a name Slipway uses
+        f"{'c' * 40}\trefs/tags/v1",           # not a branch
+        "garbage",
+        f"{'d' * 39}\trefs/heads/short-sha",   # not a sha
+        f"{'e' * 40}\trefs/heads/main",        # a repeat
+        f"{'f' * 40}\trefs/heads/zeta",
+    ])
+    assert updates.parse_ls_remote(out, "zeta") == {"branches": ["zeta", "main"], "hidden": 1, "truncated": 0}
+
+
+def test_parse_ls_remote_counts_branches_past_the_cap_apart_from_bad_names(monkeypatch):
+    monkeypatch.setattr(updates, "MAX_LISTED_BRANCHES", 3)
+    names = ["main", "zz-followed", "a", "b", "c", "-bad"]
+    out = "\n".join(f"{'a' * 40}\trefs/heads/{n}" for n in names)
+    # The followed branch and main always make the cut; valid names past it are "truncated", not "hidden".
+    assert updates.parse_ls_remote(out, "zz-followed") == {"branches": ["zz-followed", "main", "a"], "hidden": 1,
+                                                           "truncated": 2}

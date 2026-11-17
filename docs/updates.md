@@ -23,6 +23,13 @@ The script that runs is always the one from the running version of Slipway, neve
 Then open Updates, choose the host and save. Slipway finds its own container on that host, reads the install
 folder from the container's compose labels and follows the branch the checkout is on (or `main`).
 
+After that, **Branch to follow** lists the branches on GitHub, read live from the install's `origin` with
+`git ls-remote --heads` over the same SSH connection (it changes nothing in the checkout, and works for a private
+repository the server can read). Choose one and save; the next check compares against it. **The install's own
+branch** goes back to following whatever branch the checkout is on. Names Slipway won't use (anything beyond
+letters, digits and `. _ / -`) are left out and counted, and the list stops at 1000 branches (the followed branch
+and `main` always make it), saying how many more there are.
+
 ## Security
 
 Read this before you set it up.

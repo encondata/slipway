@@ -458,7 +458,7 @@ document.dispatchEvent(new Event("DOMContentLoaded"));
 await settle();
 var el = document.querySelector("[data-update-run]");
 var msg = el.querySelector("[data-run-message]");
-done({ timers: timers.length, gets: fetchCalls.length, message: msg.hidden ? null : msg.className + "|" + msg.textContent,
+done({ timers: timers.length, gets: fetchCalls.filter(function (c) { return c.indexOf("/updates/runs/") >= 0; }).length, message: msg.hidden ? null : msg.className + "|" + msg.textContent,
        reload: !el.querySelector("[data-run-reload]").hidden, badge: el.querySelector("[data-run-status]").textContent });
 """ % url)
     assert result["timers"] == 0 and result["gets"] == 1
@@ -487,3 +487,113 @@ async def test_the_confirm_dialog_says_when_the_backup_is_restored(admin_client,
     assert "it rolls back to this version and restores the backup" not in page
     assert ("If the new version doesn't start, it rolls back to this version. If the new version already changed "
             "the database, the backup is restored too.") in page
+
+
+# ------------------------------------------------------------------- Branch to follow: GitHub's branches
+
+
+async def test_branch_to_follow_is_a_list(admin_client, server):
+    await _host(name="spare", hostname="10.0.0.9")
+    page = (await admin_client.get("/updates")).text
+    select = re.search(r'<select[^>]*id="upd-branch".*?</select>', page, re.S).group(0)
+    assert "data-update-branches" not in select  # nothing to read before the host is saved
+    assert re.findall(r"<option[^>]*>([^<]*)</option>", select) == ["The install's own branch"]
+
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    select = re.search(r'<select[^>]*id="upd-branch".*?</select>', page, re.S).group(0)
+    assert 'data-update-branches="main"' in select
+    options = re.findall(r'<option value="([^"]*)"\s*(selected)?[^>]*>', select)
+    assert options[0] == ("main", "selected") and ("sideways", "") in options
+    # Going back to "the install's own branch" stays possible: its value is empty, so no branch is sent.
+    assert options[-1] == ("", "") and "The install's own branch (detect it again)" in select
+    assert "onerror" not in select  # a name Slipway won't use isn't offered
+
+
+async def test_js_branch_list_reads_github_and_keeps_the_followed_branch(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 200, body: { branches: ["dev", "<b>x</b>", "release/2"], hidden: 2, followed: "main" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+var sel = document.querySelector("#upd-branch");
+done({ options: sel.querySelectorAll("option").map(function (o) { return [o.getAttribute("value") || o.value, o.textContent, !!o.selected]; }),
+       note: document.querySelector("[data-update-branches-note]").textContent });
+""")
+    assert result["options"][0] == ["main", "main (not on GitHub any more)", True]
+    assert [o[0] for o in result["options"]] == ["main", "dev", "<b>x</b>", "release/2", ""]
+    assert result["options"][-1] == ["", "The install's own branch (detect it again)", False]
+    assert result["options"][2][1] == "<b>x</b>"  # set as text
+    assert result["note"] == "3 branches on GitHub. 2 more with names Slipway doesn't use are left out."
+
+
+async def test_js_branch_list_note_for_one_left_out(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 200, body: { branches: ["main"], hidden: 1, followed: "main" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+done({ note: document.querySelector("[data-update-branches-note]").textContent });
+""")
+    assert result["note"] == "1 branch on GitHub. 1 more with a name Slipway doesn't use is left out."
+
+
+async def test_js_branch_list_keeps_the_last_list_when_github_cant_be_read(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 502, body: { detail: "Couldn't list the branches on origin from tower: boom" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+var sel = document.querySelector("#upd-branch");
+done({ n: sel.querySelectorAll("option").length, note: document.querySelector("[data-update-branches-note]").textContent });
+""")
+    assert result["n"] >= 2
+    assert result["note"] == ("Couldn't read GitHub's branches: Couldn't list the branches on origin from tower: boom. "
+                              "Showing the last known list.")
+
+
+async def test_js_branch_list_keeps_a_choice_made_while_it_loads(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 200, body: { branches: ["main", "dev"], hidden: 0, truncated: 0, followed: "main" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+var sel = document.querySelector("#upd-branch");
+sel.value = "sideways";              // picked from the last known list while GitHub is read
+await settle();
+done({ after: sel.value, options: sel.querySelectorAll("option").map(function (o) { return [o.getAttribute("value"), o.textContent]; }) });
+""")
+    assert result["after"] == "sideways"
+    assert ["sideways", "sideways (not on GitHub any more)"] in result["options"]
+
+
+async def test_js_branch_list_keeps_the_own_branch_choice(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 200, body: { branches: ["main", "dev"], hidden: 0, truncated: 0, followed: "main" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+var sel = document.querySelector("#upd-branch");
+sel.value = "";
+await settle();
+var form = sel.closest("form");
+done({ after: sel.value, body: window.slipway.serialize(form) });
+""")
+    assert result["after"] == ""
+    assert "branch" not in result["body"]  # configure() detects the install's branch again
+
+
+async def test_js_branch_list_says_when_it_stops_at_the_cap(tmp_path, admin_client, server):
+    await _checked(admin_client, server)
+    page = (await admin_client.get("/updates")).text
+    result = run_js(tmp_path, PAGE.replace("__TREE__", json.dumps(_tree(page))) + """
+routes["GET /api/v1/updates/branches"] = { status: 200, body: { branches: ["main", "dev"], hidden: 1, truncated: 5, followed: "main" } };
+document.dispatchEvent(new Event("DOMContentLoaded"));
+await settle();
+done({ note: document.querySelector("[data-update-branches-note]").textContent });
+""")
+    assert result["note"] == ("7 branches on GitHub. The list shows the first 2. "
+                              "1 more with a name Slipway doesn't use is left out.")
