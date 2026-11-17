@@ -137,7 +137,7 @@ async def test_overview_deployments_without_hosts_read_hide_host_names(admin_cli
     await _seed_world(admin_client)
     c = await _client_with(make_client, "deps@example.com", ["deployments:read"])
     dep_id = (await c.get("/api/v1/deployments")).json()[0]["id"]
-    for path in ("/", "/deployments", f"/deployments/{dep_id}"):
+    for path in ("/", "/deployments", "/deployments/history", f"/deployments/{dep_id}"):
         page = (await c.get(path)).text
         assert "payroll-internal" in page and "release-x" in page, path
         assert "prod-secret-01" not in page and "secret-payroll" not in page, path
@@ -453,6 +453,7 @@ El.prototype.setAttribute = function (k, v) {
   if (k === "selected") this.selected = true;
 };
 El.prototype.getAttribute = function (k) { return k in this.attrs ? this.attrs[k] : null; };
+El.prototype.hasAttribute = function (k) { return k in this.attrs; };
 El.prototype.appendChild = function (c) { if (c.parentNode) c.remove(); c.parentNode = this; this.children.push(c); return c; };
 El.prototype.remove = function () { var p = this.parentNode; if (p) { p.children.splice(p.children.indexOf(this), 1); this.parentNode = null; } };
 El.prototype.descendants = function () { var all = []; this.children.forEach(function (c) { all.push(c); all.push.apply(all, c.descendants()); }); return all; };

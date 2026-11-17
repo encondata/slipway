@@ -633,3 +633,25 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
   .repeater-row.route [data-f="hostname"] { grid-column: 1 / -1; }
   .repeater-row .arrow { display: none; }
 }
+
+/* ------------------------------------------------- deployments and history */
+.nav a.nav-sub { padding: 8px 14px 8px 48px; font-size: 14px; gap: 10px; margin-top: -2px; }
+.nav a.nav-sub .i { width: 16px; height: 16px; }
+/* /deployments: one <tbody> per instance, and a hidden one after it with its earlier deployments. */
+.dep-table tbody tr:last-child td { border-bottom: 1px solid var(--border); }
+.dep-table tbody:last-child tr:last-child td,
+.dep-table tbody:has(+ tbody[hidden]:last-child) tr:last-child td { border-bottom: 0; }
+.dep-table .dep-toggle { width: 28px; height: 28px; flex: none; border-radius: 8px; }
+.dep-table .dep-name { white-space: nowrap; }
+.dep-table tr.dep-row.selected td { border-bottom-color: transparent; }
+.dep-table tr.dep-also td:first-child { padding-left: 54px; }
+.dep-table tbody:has(> tr.dep-row.selected) > tr.dep-also td { background: var(--primary-soft); border-bottom-color: transparent; }
+.dep-table tbody:has(> tr.dep-row.selected) > tr.dep-also td:first-child { box-shadow: inset 3px 0 0 var(--primary-text); }
+.dep-table tbody.dep-earlier td { background: var(--primary-soft); border-bottom-color: transparent; }
+.dep-table tbody.dep-earlier td:first-child { box-shadow: inset 3px 0 0 var(--primary-text); padding-left: 54px; }
+.dep-table tbody.dep-earlier tr.dep-more td { padding-top: 6px; padding-bottom: 14px; }
+.dep-table tbody.dep-earlier tr:hover td { background: var(--primary-soft); }
+.dep-table tbody.dep-earlier:not(:last-child) tr.dep-more td { border-bottom: 1px solid var(--border); }
+.filter-chip { height: 34px; padding: 0 12px; color: var(--text); }
+.filter-chip:hover { text-decoration: none; background: var(--surface-hover); }
+.pager { justify-content: space-between; align-items: center; }
