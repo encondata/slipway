@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, badge, empty %}
+{#- /deployments: one group per instance. Every deployment, flat, is the History page (deployments.html). #}
+{% block title %}Deployments{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Deployments</h1>
+    <p class="lede">The latest deployment of each instance. Open a row to see earlier ones.</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/deployments/history">{{ icon("clock") }} History</a>
+  </div>
+</div>
+
+{% macro cells(d, can_hosts, first) -%}
+  <td>{{ badge("deployment", d.status) }}</td>
+  <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span><div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div>
+    {%- if first and d.status != "succeeded" and d.instance.current_commit_sha and d.instance.current_commit_sha != d.commit_sha %}<div class="subtle">Live: <span class="mono">{{ d.instance.current_commit_sha[:7] }}</span></div>{% endif %}</td>
+  {% if can_hosts %}<td class="muted nowrap">{{ d.instance.host.name if first else "" }}</td>{% endif %}
+  <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>
+  <td class="muted nowrap" title="{{ d.created_at|dt }}">{{ d.created_at|timeago }}</td>
+  <td class="muted">{{ d.duration_seconds|duration }}</td>
+  <td class="actions-cell"><a class="btn btn-sm" href="/deployments/{{ d.id }}">View log</a></td>
+{%- endmacro %}
+
+<section class="card">
+  {% if groups %}
+  {% set can_hosts, can_repos, can_instances = auth.can(Perm.HOSTS_READ), auth.can(Perm.REPOS_READ), auth.can(Perm.INSTANCES_READ) %}
+  {% set cols = 8 if can_hosts else 7 %}
+  <div class="table-wrap"><table class="table dep-table">
+    <thead><tr><th>Instance</th><th>Status</th><th>Commit</th>{% if can_hosts %}<th>Host</th>{% endif %}<th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
+    {% for g in groups %}
+    {% set inst, d = g.instance, g.latest %}
+    {% set fold = g.earlier or g.more > 0 %}
+    {% set fold_id = "dep-earlier-" ~ inst.id %}
+    <tbody class="dep-group">
+      <tr class="dep-row" {% if fold %}data-expand="{{ fold_id }}" aria-expanded="false"{% endif %}>
+        <td><div class="primary-cell">
+          {%- if fold %}<button type="button" class="icon-btn dep-toggle" data-expand="{{ fold_id }}" aria-controls="{{ fold_id }}" aria-expanded="false" aria-label="Show earlier deployments of {{ inst.name }}">{{ icon("chevron-right", "i-sm expand-chevron") }}</button>
+          {%- else %}<span class="dep-toggle" aria-hidden="true"></span>{% endif %}
+          <span class="dep-name">{% if can_instances %}<a href="/instances/{{ inst.id }}"><strong>{{ inst.name }}</strong></a>{% else %}<strong>{{ inst.name }}</strong>{% endif %}{% if can_repos %}<small class="subtle">{{ inst.repository.full_name }}</small>{% endif %}</span>
+        </div></td>
+        {{ cells(d, can_hosts, true) }}
+      </tr>
+      {% for a in g.active %}
+      <tr class="dep-also">
+        <td class="nowrap"><span class="subtle">{{ "Also building" if a.status == "running" else "Also queued" }}</span></td>
+        {{ cells(a, can_hosts, false) }}
+      </tr>
+      {% endfor %}
+    </tbody>
+    {% if fold %}
+    <tbody class="dep-earlier" id="{{ fold_id }}" hidden>
+      {% for e in g.earlier %}
+      <tr>
+        <td>{% if loop.first %}<span class="subtle">Earlier</span>{% endif %}</td>
+        {{ cells(e, can_hosts, false) }}
+      </tr>
+      {% endfor %}
+      <tr class="dep-more">
+        <td colspan="{{ cols }}"><a class="link-more" href="/deployments/history?instance={{ inst.id }}">{% if g.more > 0 %}{{ g.more }} more{% else %}All {{ g.total }}{% endif %} in History {{ icon("arrow-right", "i-sm") }}</a></td>
+      </tr>
+    </tbody>
+    {% endif %}
+    {% endfor %}
+  </table></div>
+  {% else %}
+    {{ empty("rocket", "No deployments yet", "Deploy an instance and its build output will show up here.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) else None, "Create instance") }}
+  {% endif %}
+</section>
+{% endblock %}

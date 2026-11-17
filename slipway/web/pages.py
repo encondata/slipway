@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -513,14 +514,88 @@ async def edit_instance(request: Request, db: DB, ctx: PageAuth, instance_id: uu
     )
 
 
+GROUP_EARLIER = 5  # earlier deployments folded under each instance on /deployments; the rest are in History
+HISTORY_PAGE_SIZE = 50
+ACTIVE_DEPLOYMENTS = (DeploymentStatus.QUEUED, DeploymentStatus.RUNNING)
+
+
 @router.get("/deployments")
-async def deployments_page(request: Request, db: DB, ctx: PageAuth, status: str = "") -> HTMLResponse:
+async def deployments_page(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
+    """One row per instance: its latest deployment, anything else still queued or building, and a few earlier ones."""
     need(ctx, Perm.DEPLOYMENTS_READ)
-    stmt = select(Deployment).options(NO_LOG).order_by(Deployment.created_at.desc()).limit(100)
+    rank = func.row_number().over(
+        partition_by=Deployment.instance_id, order_by=(Deployment.created_at.desc(), Deployment.id.desc())
+    ).label("rank")
+    ranked = select(Deployment.id, rank).subquery()
+    rows = (await db.execute(
+        select(Deployment, ranked.c.rank).options(NO_LOG).join(ranked, ranked.c.id == Deployment.id)
+        .where(or_(ranked.c.rank <= 1 + GROUP_EARLIER, Deployment.status.in_(ACTIVE_DEPLOYMENTS)))
+        .order_by(Deployment.instance_id, ranked.c.rank)
+    )).all()
+    totals = dict((await db.execute(
+        select(Deployment.instance_id, func.count()).group_by(Deployment.instance_id)
+    )).all())
+    groups: dict[uuid.UUID, dict[str, Any]] = {}
+    for dep, n in rows:
+        group = groups.setdefault(dep.instance_id, {
+            "instance": dep.instance, "latest": dep, "active": [], "earlier": [], "total": totals.get(dep.instance_id, 0),
+        })
+        if n == 1:
+            continue
+        if dep.is_active:
+            group["active"].append(dep)
+        elif n <= 1 + GROUP_EARLIER:
+            group["earlier"].append(dep)
+    for group in groups.values():
+        group["more"] = group["total"] - 1 - len(group["active"]) - len(group["earlier"])
+        group["busy"] = group["latest"].is_active or bool(group["active"])
+
+    def attention(group: dict[str, Any]) -> int:
+        return 0 if group["busy"] else 1 if group["latest"].status == DeploymentStatus.FAILED else 2
+
+    # Newest first, then anything building or queued on top, then failures.
+    ordered = sorted(groups.values(), key=lambda g: g["latest"].created_at, reverse=True)
+    ordered.sort(key=attention)
+    return await render(request, db, "deployment_groups.html", ctx, groups=ordered)
+
+
+@router.get("/deployments/history")
+async def deployment_history(
+    request: Request, db: DB, ctx: PageAuth, status: str = "", instance: str = "", page: str = "1",
+) -> HTMLResponse:
+    """Every deployment, newest first, a page at a time; filter by status and by instance."""
+    need(ctx, Perm.DEPLOYMENTS_READ)
+    where = []
     if status:
-        stmt = stmt.where(Deployment.status == status)
-    deployments = (await db.scalars(stmt)).all()
-    return await render(request, db, "deployments.html", ctx, deployments=deployments, status=status)
+        where.append(Deployment.status == status)
+    selected = None
+    if instance:
+        try:
+            selected = await db.get(Instance, uuid.UUID(instance))
+        except ValueError:
+            selected = None
+        if selected is None:
+            instance = ""
+        else:
+            where.append(Deployment.instance_id == selected.id)
+    total = await db.scalar(select(func.count()).select_from(Deployment).where(*where)) or 0
+    pages = max(1, -(-total // HISTORY_PAGE_SIZE))
+    page_no = min(max(1, int(page) if page.isdigit() else 1), pages)
+    deployments = (await db.scalars(
+        select(Deployment).options(NO_LOG).where(*where)
+        .order_by(Deployment.created_at.desc(), Deployment.id.desc())
+        .offset((page_no - 1) * HISTORY_PAGE_SIZE).limit(HISTORY_PAGE_SIZE)
+    )).all()
+
+    def url(**changes: Any) -> str:
+        params = {"status": status, "instance": instance, "page": 1} | changes
+        query = {k: v for k, v in params.items() if v and not (k == "page" and v == 1)}
+        return "/deployments/history" + (f"?{urlencode(query)}" if query else "")
+
+    return await render(
+        request, db, "deployments.html", ctx, deployments=deployments, status=status, instance=selected,
+        page=page_no, pages=pages, total=total, first=(page_no - 1) * HISTORY_PAGE_SIZE + 1 if total else 0, url=url,
+    )
 
 
 @router.get("/deployments/{deployment_id}")

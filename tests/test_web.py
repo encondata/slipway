@@ -49,6 +49,7 @@ async def test_every_page_renders_for_admin(admin_client, monkeypatch):
     pages = [
         "/", "/repositories", f"/repositories?repo={repo_id}", "/hosts", f"/hosts/{host['id']}", "/instances",
         "/instances/new", f"/instances/{inst['id']}", f"/instances/{inst['id']}/edit", "/deployments",
+        "/deployments/history",
         "/analytics", "/logs", "/search?q=web", "/settings", "/settings/tokens", "/settings/users",
         "/settings/roles", "/settings/audit",
     ]

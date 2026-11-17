@@ -1,17 +1,22 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, empty %}
-{% block title %}Deployments{% endblock %}
+{#- The History page (/deployments/history): every deployment, flat. /deployments itself is deployment_groups.html. #}
+{% block title %}Deployment history{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
-    <h1>Deployments</h1>
+    <div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}<span>History</span></div>
+    <h1>History</h1>
     <p class="lede">Every build and release Slipway has run, newest first.</p>
   </div>
+  <div class="actions">
+  {% if instance %}<a class="chip filter-chip" href="{{ url(instance='') }}" title="Show every instance">{{ instance.name }} {{ icon("x", "i-sm") }}</a>{% endif %}
   <nav class="segmented" aria-label="Filter by status">
     {% for key, label in [("", "All"), ("running", "Building"), ("succeeded", "Deployed"), ("failed", "Failed")] %}
-    <a href="/deployments{% if key %}?status={{ key }}{% endif %}" class="{{ 'active' if status == key }}">{{ label }}</a>
+    <a href="{{ url(status=key) }}" class="{{ 'active' if status == key }}">{{ label }}</a>
     {% endfor %}
   </nav>
+  </div>
 </div>
 
 <section class="card">
@@ -34,8 +39,17 @@
     {% endfor %}
     </tbody>
   </table></div>
+  {% if pages > 1 %}
+  <nav class="card-foot pager" aria-label="Pages">
+    <span class="muted">{{ first }}–{{ first + deployments|length - 1 }} of {{ total }}</span>
+    <span class="actions">
+      {% if page > 1 %}<a class="btn btn-sm" href="{{ url(page=page - 1) }}" rel="prev">Newer</a>{% endif %}
+      {% if page < pages %}<a class="btn btn-sm" href="{{ url(page=page + 1) }}" rel="next">Older</a>{% endif %}
+    </span>
+  </nav>
+  {% endif %}
   {% else %}
-    {{ empty("rocket", "No deployments" ~ (" with this status" if status else " yet"), "Deploy an instance and its build output will show up here.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) and not status else None, "Create instance") }}
+    {{ empty("rocket", "No deployments" ~ (" with this status" if status else " for this instance" if instance else " yet"), "Deploy an instance and its build output will show up here.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) and not (status or instance) else None, "Create instance") }}
   {% endif %}
 </section>
 {% endblock %}
