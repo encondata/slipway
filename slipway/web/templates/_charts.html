@@ -1,0 +1,123 @@
+{#- Charts drawn by Slipway itself: inline SVG, no library.
+
+  The plot is an SVG with preserveAspectRatio="none" at a fixed CSS height, so it fills the card's width at
+  any size. Every text (axis ticks, labels) is HTML placed by percentage beside or over it, so it keeps its
+  size on a phone. Lines and gridlines use non-scaling strokes. Markers are HTML too, so they stay round.
+
+  The models come from slipway/web/pages.py (_deploy_chart, _line_chart): numbers and fixed labels only.
+  Colours are the --chart-* tokens in slipway.css. The hover layer is in slipway.js (data-chart).
+-#}
+{% from "_macros.html" import icon %}
+
+{% macro legend(series) -%}
+<ul class="chart-legend">
+  {%- for s in series %}<li><i class="chart-swatch {{ s.key }}" aria-hidden="true"></i>{{ s.name }}</li>{% endfor -%}
+</ul>
+{%- endmacro %}
+
+{% macro xaxis(labels) -%}
+<div class="chart-x" aria-hidden="true">
+  {%- for l in labels %}<span class="{{ l.edge }}{{ ' minor' if l.minor }}" style="left: {{ (l.pos * 100)|round(2) }}%">{{ l.text }}</span>{% endfor -%}
+</div>
+{%- endmacro %}
+
+{#- Stacked bars, one slot per day. Succeeded sits on the baseline, then failed, then cancelled, with a 2px gap
+    between segments and a rounded top on the last one. The whole slot is the hover target. -#}
+{% macro bar_chart(c, label) -%}
+{%- set W = 720 -%}
+{%- set H = 180 -%}
+{%- set slot = W / c.n -%}
+{%- set bw = [24, slot - 2]|min -%}
+{%- set radius = [4, bw / 2]|min -%}
+<div class="chart" style="--chart-h: {{ H }}px">
+  <div class="chart-y" aria-hidden="true">
+    {%- for t in c.ticks %}<span style="top: {{ (100 - t / c.top * 100)|round(2) }}%">{{ t }}</span>{% endfor -%}
+  </div>
+  <div class="chart-plot" tabindex="0" role="group" aria-label="{{ label }}" data-chart='{{ c.data|tojson }}'>
+    <svg viewBox="0 0 {{ W }} {{ H }}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+      {%- for t in c.ticks %}
+      {%- set y = (H - t / c.top * H)|round(2) %}
+      <line class="{{ 'chart-base' if t == 0 else 'chart-grid' }}" x1="0" x2="{{ W }}" y1="{{ y }}" y2="{{ y }}"/>
+      {%- endfor %}
+      {%- for row in c.rows %}
+      {%- set i = loop.index0 %}
+      {%- set x = i * slot + (slot - bw) / 2 %}
+      {%- set ns = namespace(y=H, top=-1) %}
+      {%- for v in row["values"] %}{% if v %}{% set ns.top = loop.index0 %}{% endif %}{% endfor %}
+      <g class="chart-bar" data-i="{{ i }}">
+        <rect class="chart-hit" x="{{ (i * slot)|round(2) }}" y="0" width="{{ slot|round(2) }}" height="{{ H }}"><title>{{ row.label }}: {{ row["values"][0] }} succeeded, {{ row["values"][1] }} failed, {{ row["values"][2] }} cancelled</title></rect>
+        {%- for v in row["values"] %}{% if v %}
+        {%- set h = [v / c.top * H, 2]|max %}
+        {%- set gap = 0 if ns.y >= H else 2 %}
+        {%- set bottom = ns.y - gap %}
+        {%- set top = [ns.y - h, bottom - 1]|min %}
+        {%- set ns.y = ns.y - h %}
+        {%- set key = c.series[loop.index0].key %}
+        {%- if loop.index0 == ns.top %}
+        {%- set r = [radius, bottom - top]|min %}
+        <path class="chart-seg {{ key }}" d="M{{ x|round(2) }} {{ bottom|round(2) }}V{{ (top + r)|round(2) }}Q{{ x|round(2) }} {{ top|round(2) }} {{ (x + r)|round(2) }} {{ top|round(2) }}H{{ (x + bw - r)|round(2) }}Q{{ (x + bw)|round(2) }} {{ top|round(2) }} {{ (x + bw)|round(2) }} {{ (top + r)|round(2) }}V{{ bottom|round(2) }}Z"/>
+        {%- else %}
+        <rect class="chart-seg {{ key }}" x="{{ x|round(2) }}" y="{{ top|round(2) }}" width="{{ bw|round(2) }}" height="{{ (bottom - top)|round(2) }}"/>
+        {%- endif %}
+        {%- endif %}{% endfor %}
+      </g>
+      {%- endfor %}
+    </svg>
+  </div>
+  {{ xaxis(c.xlabels) }}
+</div>
+{%- endmacro %}
+
+{#- One host series on a fixed 0-100% axis, one hue, no legend (the title names it). A new run starts after
+    every gap in the checks, so missing checks show as breaks in the line. -#}
+{% macro line_chart(c) -%}
+{%- set W = 720 -%}
+{%- set H = 120 -%}
+<div class="chart-block">
+  <div class="chart-title">
+    <h3>{{ c.name }}{% if c.note %} <small class="chart-note">{{ c.note }}</small>{% endif %}</h3>
+    {%- if c.stats %}
+    <dl class="chart-stats">
+      <div><dt>Latest</dt><dd>{{ c.stats.latest|pct }}</dd></div>
+      <div><dt>Avg</dt><dd>{{ c.stats.avg|pct }}</dd></div>
+      <div><dt>{{ c.max_label }}</dt><dd>{{ c.stats.max|pct }}</dd></div>
+    </dl>
+    {%- endif %}
+  </div>
+  <div class="chart" style="--chart-h: {{ H }}px">
+    <div class="chart-y" aria-hidden="true">
+      {%- for t in (100, 50, 0) %}<span style="top: {{ 100 - t }}%">{{ t }}%</span>{% endfor -%}
+    </div>
+    <div class="chart-plot" tabindex="0" role="group" aria-label="{{ c.label }}" data-chart='{{ c.data|tojson }}'>
+      <svg viewBox="0 0 {{ W }} {{ H }}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <line class="chart-grid" x1="0" x2="{{ W }}" y1="0" y2="0"/>
+        <line class="chart-grid" x1="0" x2="{{ W }}" y1="{{ H / 2 }}" y2="{{ H / 2 }}"/>
+        <line class="chart-base" x1="0" x2="{{ W }}" y1="{{ H }}" y2="{{ H }}"/>
+        {%- for run in c.runs %}
+        <path class="chart-line" d="{% for x, v in run %}{{ 'M' if loop.first else 'L' }}{{ (x * W)|round(1) }} {{ (H - v / 100 * H)|round(1) }}{% endfor %}{% if run|length == 1 %}h0.5{% endif %}"/>
+        {%- endfor %}
+      </svg>
+      <span class="chart-end" aria-hidden="true" style="left: {{ (c.last[0] * 100)|round(2) }}%; top: {{ (100 - c.last[1])|round(2) }}%"></span>
+    </div>
+    {{ xaxis(c.xlabels) }}
+  </div>
+</div>
+{%- endmacro %}
+
+{#- The change on a stat tile: an arrow and the change, coloured by whether it is good, and which way is good. -#}
+{% macro delta(d) -%}
+{%- if d.text -%}
+<span class="delta {{ d.tone }}">{{ icon("arrow-right", "i-sm delta-" ~ d.dir) }} {{ d.text }}</span>
+<span>vs previous {{ d.days }} days</span>
+{%- else -%}
+{%- if d.note %}<span>{{ d.note }}</span>{% endif %}
+{%- endif %}
+<span class="delta-note">{{ d.better }}</span>
+{%- endmacro %}
+
+{% macro table_view(summary="Show as table") -%}
+<details class="table-view">
+  <summary>{{ icon("chevron-right", "i-sm") }} {{ summary }}</summary>
+  <div class="table-wrap">{{ caller() }}</div>
+</details>
+{%- endmacro %}

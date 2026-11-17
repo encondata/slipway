@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, badge, empty, stat %}
+{% from "_charts.html" import bar_chart, line_chart, legend, delta, table_view %}
+{% block title %}Analytics{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Analytics</h1>
+    <p class="lede">How deploys went and how hosts held up over the last {{ days }} days.</p>
+  </div>
+  <nav class="segmented" aria-label="Time range">
+    {%- for d in ranges %}
+    <a href="/analytics?days={{ d }}" class="{{ 'active' if d == days }}"{% if d == days %} aria-current="page"{% endif %}>{{ d }} days</a>
+    {%- endfor %}
+  </nav>
+</div>
+
+{% if deploys is none and hosts is none %}
+<section class="card">
+  {{ empty("analytics", "Nothing to show", "Analytics shows deploys and hosts. Your roles can't see either.") }}
+</section>
+{% endif %}
+
+{% if deploys is not none %}
+{% set t = deploys.totals %}
+<section class="analytics-section" aria-labelledby="deploys-title" data-section="deploys">
+  <h2 id="deploys-title" class="section-title">Deploys</h2>
+  {% if not t.deploys %}
+  <section class="card">
+    {{ empty("rocket", "No deploys in the last " ~ days ~ " days", "Deploys show up here once an instance is deployed.") }}
+  </section>
+  {% else %}
+  <div class="grid grid-4">
+    {% call stat("rocket", "Deploys", t.deploys) %}{{ delta(tiles.deploys) }}{% endcall %}
+    {% call stat("check", "Success rate", t.success_rate|rate) %}{{ delta(tiles.rate) }}{% endcall %}
+    {% call stat("clock", "Median time", t.median_seconds|span) %}
+      {%- if t.p90_seconds is not none %}<span class="stat-sub">p90 {{ t.p90_seconds|span }}</span>{% endif %}{{ delta(tiles.median) }}
+    {%- endcall %}
+    {% call stat("restart", "Time to recover", t.mttr_seconds|span) %}{{ delta(tiles.mttr) }}{% endcall %}
+  </div>
+  {% if t.running or t.queued %}
+  <p class="subtle">Now: {{ t.running }} building, {{ t.queued }} queued.</p>
+  {% endif %}
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Deploys per day</h2><p>Finished deploys by outcome, per UTC day.</p></div>
+      <div class="spacer"></div>
+      {{ legend(deploy_chart.series) }}
+    </div>
+    <div class="card-body">
+      {{ bar_chart(deploy_chart, "Deploys per day, last " ~ days ~ " days. Use the arrow keys to read each day; the values are also in the table below.") }}
+      {% call table_view() %}
+      <table class="table">
+        <caption class="sr-only">Deploys per day</caption>
+        <thead><tr><th>Day</th><th class="num">Succeeded</th><th class="num">Failed</th><th class="num">Cancelled</th></tr></thead>
+        <tbody>
+          {%- for row in deploy_chart.rows|reverse %}
+          <tr><td>{{ row.label }}</td><td class="num">{{ row["values"][0] }}</td><td class="num">{{ row["values"][1] }}</td><td class="num">{{ row["values"][2] }}</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+      {% endcall %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>By instance</h2><p>Instances with deploys in the last {{ days }} days.</p></div></div>
+    <div class="card-body flush table-wrap">
+      <table class="table">
+        <thead><tr>
+          <th>Instance</th><th class="num">Deploys</th><th class="num">Failed</th><th class="num">Success rate</th>
+          <th class="num">Median time</th><th>Last deploy</th>
+        </tr></thead>
+        <tbody>
+          {%- set can_repos, can_hosts = auth.can(Perm.REPOS_READ), auth.can(Perm.HOSTS_READ) %}
+          {%- for row in deploys.by_instance %}
+          <tr>
+            <td>
+              <div class="primary-cell nowrap"><div>
+                <strong>{% if auth.can(Perm.INSTANCES_READ) %}<a href="/instances/{{ row.id }}">{{ row.name }}</a>{% else %}{{ row.name }}{% endif %}
+                  {%- if row.recovering %} <span class="badge error">Failing</span>{% endif %}</strong>
+                {%- set names = [row.repository if can_repos, row.host if can_hosts]|select|list %}
+                {%- if names %}<small>{{ names|join(" · ") }}</small>{% endif %}
+              </div></div>
+            </td>
+            <td class="num">{{ row.deploys }}</td>
+            <td class="num">{{ row.failed }}</td>
+            <td class="num">{{ row.success_rate|rate }}</td>
+            <td class="num">{{ row.median_seconds|span }}</td>
+            <td class="nowrap">
+              {%- if row.last_deploy %}
+              <a class="row" href="/deployments/{{ row.last_deploy.id }}">{{ badge("deployment", row.last_deploy.status) }} <span class="muted">{{ row.last_deploy.at|timeago }}</span></a>
+              {%- else %}—{% endif %}
+            </td>
+          </tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid grid-main">
+    <section class="card">
+      <div class="card-head"><div><h2>Recent failures</h2><p>The latest failed deploys, with the first line of the error.</p></div></div>
+      {% if deploys.recent_failures %}
+      <ul class="failure-list">
+        {%- for f in deploys.recent_failures %}
+        <li>
+          <a href="/deployments/{{ f.id }}">
+            <span class="row between"><strong>{{ f.instance.name }}</strong><time class="subtle" datetime="{{ f.at.isoformat() }}" title="{{ f.at|dt }}">{{ f.at|timeago }}</time></span>
+            {%- if f.error %}<code class="failure-error">{{ f.error }}</code>{% endif %}
+            {%- if f.commit_sha %}<span class="subtle">{{ icon("commit", "i-sm") }} <span class="mono">{{ f.commit_sha }}</span>{% if f.commit_message %} {{ f.commit_message }}{% endif %}</span>{% endif %}
+          </a>
+        </li>
+        {%- endfor %}
+      </ul>
+      {% else %}
+      <div class="card-body"><p class="muted">No failed deploys in the last {{ days }} days.</p></div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>By person</h2><p>Who started the deploys.</p></div></div>
+      <div class="card-body flush table-wrap">
+        <table class="table">
+          <thead><tr><th>Person</th><th class="num">Deploys</th><th class="num">Failed</th></tr></thead>
+          <tbody>
+            {%- for p in deploys.by_person %}
+            <tr><td>{{ p.name }}</td><td class="num">{{ p.deploys }}</td><td class="num">{{ p.failed }}</td></tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if hosts is not none %}
+{% set history_note = "Host history starts with the next health check; hosts are checked " ~ check_every ~ "." if check_every else "Host history starts with the next health check. Background checks are off, so run Check on the host page." %}
+<section class="analytics-section" aria-labelledby="hosts-title" data-section="hosts">
+  <h2 id="hosts-title" class="section-title">Hosts</h2>
+  {% if not hosts %}
+  <section class="card">
+    {{ empty("hosts", "No checked hosts yet", "Hosts show up here after their first successful health check.") }}
+  </section>
+  {% elif not hosts|selectattr("charts")|list %}
+  <section class="card">
+    {{ empty("activity", "No host history yet", history_note) }}
+  </section>
+  {% else %}
+  <div class="grid grid-2">
+    {%- for h in hosts %}
+    <section class="card host-trend">
+      <div class="card-head">
+        <span class="head-icon accent">{{ icon("hosts") }}</span>
+        <div>
+          <h2><a href="/hosts/{{ h.id }}">{{ h.name }}</a></h2>
+          <p>
+            {%- if h.cpus %}{{ h.cpus }} CPU{{ "s" if h.cpus != 1 }} · {% endif %}
+            {%- if h.mem_total_mb %}{{ (h.mem_total_mb / 1024)|round(1) }} GB memory · {% endif -%}
+            {% if h.last_checked_at %}Checked {{ h.last_checked_at|timeago }}{% else %}Not checked yet{% endif %}
+          </p>
+        </div>
+      </div>
+      <div class="card-body host-charts"{% if h.charts %} id="{{ h.points_id }}" data-points='{{ h.points|tojson }}'{% endif %}>
+        {%- if not h.charts %}
+        <p class="muted">No checks in the last {{ days }} days. {{ history_note }}</p>
+        {%- else %}
+        {%- for c in h.charts %}{{ line_chart(c) }}{% endfor %}
+        {% call table_view() %}
+        <table class="table">
+          <caption class="sr-only">{{ h.name }}: {{ h.table_caption|lower }} averages and peaks</caption>
+          <thead><tr>
+            <th>{{ "Day" if h.table_caption == "Daily" else "Hour" }}</th>
+            <th class="num">CPU avg</th><th class="num">CPU max</th><th class="num">Memory avg</th><th class="num">Memory max</th>
+            {%- if h.has_disk %}<th class="num">Disk max</th>{% endif %}
+          </tr></thead>
+          <tbody>
+            {%- for r in h.table %}
+            <tr><td class="nowrap">{{ r.label }}</td><td class="num">{{ r.cpu_avg|pct }}</td><td class="num">{{ r.cpu_max|pct }}</td>
+              <td class="num">{{ r.mem_avg|pct }}</td><td class="num">{{ r.mem_max|pct }}</td>
+              {%- if h.has_disk %}<td class="num">{{ r.disk_max|pct }}</td>{% endif %}</tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+        {% endcall %}
+        {%- endif %}
+      </div>
+    </section>
+    {%- endfor %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

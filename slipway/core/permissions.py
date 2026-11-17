@@ -51,7 +51,7 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
         "Trigger deployments (for compose instances, together with push access to the branch "
         "this means root on the host, including other instances' secrets there)"
     ),
-    Perm.ANALYTICS_READ: "View mobile and web analytics",
+    Perm.ANALYTICS_READ: "View deploy and host analytics (also needs deployments:read or hosts:read)",
     Perm.LOGS_READ: "View platform and application logs",
     Perm.AUDIT_READ: "View the audit log",
     Perm.SETTINGS_WRITE: "Change Slipway-wide settings",
