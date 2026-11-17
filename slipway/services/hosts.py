@@ -14,7 +14,7 @@ from slipway.core.config import get_settings
 from slipway.db.base import utcnow
 from slipway.db.session import session_scope
 from slipway.models import Host, HostStatus, Instance, InstanceStatus, User
-from slipway.services import audit, ssh
+from slipway.services import audit, host_metrics, ssh
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +82,7 @@ async def check_host(
         current.docker_version = ssh.clip(result.docker_version, 64) if result.docker_version else None
         current.os_info = ssh.clip(result.os_info, 255)
         current.metrics = result.metrics
+        host_metrics.record_sample(db, current.id, result.metrics)
         await _unraid_deploy_root(db, current, actor=actor, request=request)
     await db.commit()
     return current

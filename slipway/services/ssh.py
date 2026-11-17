@@ -99,16 +99,20 @@ class ProbeResult:
     docker_version: str | None
     docker_error: str | None
     containers_running: int
+    disk_percent: float | None = None  # use of the disk holding Docker's data (or /); None when unknown
 
     @property
     def metrics(self) -> dict[str, float | int]:
-        return {
+        metrics: dict[str, float | int] = {
             "cpus": self.cpus,
             "cpu_percent": round(self.cpu_percent, 1),
             "mem_total_mb": self.mem_total_mb,
             "mem_percent": round(self.mem_percent, 1),
             "containers_running": self.containers_running,
         }
+        if self.disk_percent is not None:
+            metrics["disk_percent"] = round(self.disk_percent, 1)
+        return metrics
 
 
 # ---------------------------------------------------------------------------- keys
@@ -359,8 +363,12 @@ nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1; echo '{_SE
 cat /proc/loadavg 2>/dev/null; echo '{_SEP}'
 grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null; echo '{_SEP}'
 docker version --format '{{{{.Server.Version}}}}' 2>&1; echo "rc=$?"; echo '{_SEP}'
-docker ps -q 2>/dev/null | wc -l
+docker ps -q 2>/dev/null | wc -l; echo '{_SEP}'
+d=$(docker info -f '{{{{.DockerRootDir}}}}' 2>/dev/null | head -n 1); case "$d" in /*) [ -d "$d" ] || d=/ ;; *) d=/ ;; esac
+{{ df -P "$d" 2>/dev/null || df -P / 2>/dev/null; }} | tail -n 1
 """.strip()
+# df -P's capacity column ("45%") followed by the mount point.
+_DF_CAPACITY = re.compile(r"\s(\d{1,3})%\s+/")
 
 
 def _first_int(text: str, default: int = 0) -> int:
@@ -376,11 +384,21 @@ def _first_float(text: str) -> float:
     return value if math.isfinite(value) and value >= 0 else 0.0
 
 
+def _disk_percent(df_line: str) -> float | None:
+    """The capacity from the last line of ``df -P``; None if it cannot be read."""
+    lines = df_line.splitlines()
+    match = _DF_CAPACITY.search(" " + lines[-1]) if lines else None
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return float(value) if value <= 100 else None
+
+
 def parse_probe(output: str, host_key: str) -> ProbeResult:
     """Parse PROBE_COMMAND output. Never raises: the output comes from the remote machine."""
     parts = [p.strip() for p in output.split(_SEP)]
-    parts += [""] * (6 - len(parts))
-    os_info, nproc_s, loadavg, meminfo, docker_s, containers_s = parts[:6]
+    parts += [""] * (7 - len(parts))
+    os_info, nproc_s, loadavg, meminfo, docker_s, containers_s, df_s = parts[:7]
 
     cpus = max(1, _first_int(nproc_s, 1))
     load1 = _first_float(loadavg)
@@ -413,6 +431,7 @@ def parse_probe(output: str, host_key: str) -> ProbeResult:
         docker_version=docker_version,
         docker_error=docker_error,
         containers_running=_first_int(containers_s),
+        disk_percent=_disk_percent(df_s),
     )
 
 

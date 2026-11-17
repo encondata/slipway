@@ -3,6 +3,7 @@
 from slipway.models.audit import AuditEvent
 from slipway.models.host import Host, HostAuthMethod, HostStatus
 from slipway.models.instance import BuildSource, Deployment, DeploymentStatus, Instance, InstanceStatus
+from slipway.models.metrics import HostSample, HostSampleHourly
 from slipway.models.repository import Repository
 from slipway.models.setting import AppSetting
 from slipway.models.user import ApiToken, OAuthAccount, Role, User, UserSession, user_roles
@@ -16,6 +17,8 @@ __all__ = [
     "DeploymentStatus",
     "Host",
     "HostAuthMethod",
+    "HostSample",
+    "HostSampleHourly",
     "HostStatus",
     "Instance",
     "InstanceStatus",

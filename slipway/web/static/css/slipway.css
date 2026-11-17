@@ -605,6 +605,107 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
 :root[data-theme="dark"] .btn-github { background: #F4F4F5; color: #18181B; border-color: #F4F4F5; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn-github { background: #F4F4F5; color: #18181B; border-color: #F4F4F5; } }
 
+/* ------------------------------------------------------------------ charts */
+/* Drawn by templates/_charts.html; tooltips by slipway.js. Deploy outcomes wear status colours (succeeded,
+   failed, a neutral for cancelled), stepped per theme so they stay apart for colour-blind readers: checked
+   with the dataviz palette validator against --surface (#FFFFFF light, #18181B dark). Host lines use one hue. */
+:root {
+  --chart-ok: #16A34A;
+  --chart-fail: #B91C1C;
+  --chart-cancel: #64748B;
+  --chart-line: #0B74A6;
+  --chart-grid: var(--border);
+  --chart-axis: var(--border-strong);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --chart-ok: #059669; --chart-fail: #EF4444; --chart-cancel: #8B8B94; --chart-line: #1590C8; }
+}
+:root[data-theme="dark"] { --chart-ok: #059669; --chart-fail: #EF4444; --chart-cancel: #8B8B94; --chart-line: #1590C8; }
+
+.analytics-section { display: flex; flex-direction: column; gap: 16px; }
+.section-title { font-size: 19px; font-weight: 700; }
+.stat .hint .stat-sub { flex-basis: 100%; color: var(--text); font-weight: 600; }
+.delta { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; color: var(--text-muted); }
+.delta.good { color: var(--success-text); }
+.delta.bad { color: var(--error-text); }
+.delta .i { stroke-width: 2.4; }
+.delta .delta-up { transform: rotate(-90deg); }
+.delta .delta-down { transform: rotate(90deg); }
+.stat .hint .delta-note { flex-basis: 100%; color: var(--text-subtle); font-size: 12px; }
+
+.chart { --chart-h: 160px; container-type: inline-size; display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; }
+.chart-y { position: relative; height: var(--chart-h); min-width: 26px; font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.chart-y span { position: absolute; right: 0; transform: translateY(-50%); line-height: 1; white-space: nowrap; }
+.chart-plot { position: relative; height: var(--chart-h); touch-action: pan-y; border-radius: 4px; outline: none; }
+.chart-plot:focus-visible { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--primary); }
+.chart-plot svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.chart-x { grid-column: 2; position: relative; height: 16px; margin-top: 6px; font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.chart-x span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; line-height: 16px; }
+.chart-x span.start { transform: none; }
+.chart-x span.end { transform: translateX(-100%); }
+@container (max-width: 440px) { .chart-x .minor { display: none; } }
+.chart-grid, .chart-base { stroke-width: 1; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
+.chart-grid { stroke: var(--chart-grid); }
+.chart-base { stroke: var(--chart-axis); }
+.chart-seg.ok, .chart-swatch.ok, .chart-key.ok { fill: var(--chart-ok); background: var(--chart-ok); border-color: var(--chart-ok); }
+.chart-seg.fail, .chart-swatch.fail, .chart-key.fail { fill: var(--chart-fail); background: var(--chart-fail); border-color: var(--chart-fail); }
+.chart-seg.cancel, .chart-swatch.cancel, .chart-key.cancel { fill: var(--chart-cancel); background: var(--chart-cancel); border-color: var(--chart-cancel); }
+.chart-hit { fill: transparent; }
+.chart-bar { transition: opacity .12s ease; }
+.chart-plot.has-active .chart-bar:not(.is-active) { opacity: .4; }
+.chart-line { fill: none; stroke: var(--chart-line); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.chart-end, .chart-dot {
+  position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%;
+  background: var(--chart-line); box-shadow: 0 0 0 2px var(--surface); pointer-events: none;
+}
+.chart-cross { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px solid var(--chart-axis); pointer-events: none; }
+.chart-tip {
+  position: absolute; top: 0; z-index: 5; transform: translateX(14px); min-width: 150px; padding: 8px 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow-lg);
+  font-size: 12.5px; line-height: 1.45; white-space: nowrap; pointer-events: none;
+}
+.chart-tip.flip { transform: translateX(calc(-100% - 14px)); }
+.chart-tip.pin { transform: none; top: auto; bottom: calc(100% + 6px); }
+.chart-tip-head { color: var(--text-muted); margin-bottom: 4px; }
+.chart-tip-row { display: flex; align-items: center; gap: 8px; }
+.chart-tip-row b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 2ch; }
+.chart-tip-name { color: var(--text-muted); }
+.chart-key { flex: none; width: 12px; height: 0; border-top: 2px solid; border-radius: 2px; background: none !important; }
+.chart-key.line { border-color: var(--chart-line); }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 4px 0 0; padding: 0; list-style: none; font-size: 12.5px; color: var(--text-muted); }
+.chart-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.chart-swatch { width: 10px; height: 10px; border-radius: 3px; }
+.chart-block + .chart-block { margin-top: 18px; }
+.chart-note { margin-left: 4px; font-size: 12px; font-weight: 400; color: var(--text-muted); }
+.chart-title { display: flex; align-items: baseline; justify-content: space-between; gap: 6px 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.chart-stats { display: flex; gap: 14px; margin: 0; font-size: 12.5px; }
+.chart-stats div { display: flex; gap: 5px; }
+.chart-stats dt { color: var(--text-muted); }
+.chart-stats dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.table-view { margin-top: 14px; font-size: 13px; }
+.table-view summary { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--primary-text); font-weight: 600; list-style: none; }
+.table-view summary::-webkit-details-marker { display: none; }
+.table-view summary .i { transition: transform .15s ease; }
+.table-view[open] summary .i { transform: rotate(90deg); }
+.table-view .table-wrap { margin-top: 10px; max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+.table-view .table th { position: sticky; top: 0; background: var(--surface); }
+.table-view .table td, .table-view .table th { padding: 8px 12px; }
+.table .num { font-variant-numeric: tabular-nums; }
+.failure-list { list-style: none; margin: 0; padding: 0 0 6px; }
+.failure-list li + li { border-top: 1px solid var(--border); }
+.failure-list a { display: flex; flex-direction: column; gap: 6px; padding: 12px 20px; color: inherit; min-width: 0; }
+.failure-list a:hover { background: var(--surface-hover); text-decoration: none; }
+.failure-error { display: block; color: var(--error-text); background: var(--error-soft); white-space: pre-wrap; overflow-wrap: anywhere; padding: 4px 8px; }
+.failure-list .subtle { overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) { .chart-bar, .table-view summary .i { transition: none; } }
+@media (forced-colors: active) {
+  /* Three system colours, so the legend still maps to the segments. */
+  .chart-seg.ok, .chart-swatch.ok { fill: CanvasText; background: CanvasText; forced-color-adjust: none; }
+  .chart-seg.fail, .chart-swatch.fail { fill: Highlight; background: Highlight; forced-color-adjust: none; }
+  .chart-seg.cancel, .chart-swatch.cancel { fill: GrayText; background: GrayText; forced-color-adjust: none; }
+  .chart-line { stroke: CanvasText; }
+}
+
 /* ------------------------------------------------------------- responsive */
 @media (max-width: 1280px) {
   .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -624,6 +725,7 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
 }
 @media (max-width: 560px) {
   .grid-4 { grid-template-columns: minmax(0, 1fr); }
+  .chart-x .minor { display: none; }
   .choice { flex-wrap: wrap; }
   .choice .choice-meta { margin-left: 26px; width: 100%; justify-content: flex-start; }
   h1 { font-size: 23px; }

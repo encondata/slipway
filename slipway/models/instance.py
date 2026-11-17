@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import ForeignKey, String, Text, text, true
+from sqlalchemy import ForeignKey, Index, String, Text, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from slipway.core.crypto import EncryptedJSON
@@ -123,6 +123,8 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
 
 class Deployment(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "deployments"
+    # Analytics and the deployments list read by when a deploy was created (migration 0006b).
+    __table_args__ = (Index("ix_deployments_created_at", "created_at"),)
 
     instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("instances.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(16), default=DeploymentStatus.QUEUED, index=True)

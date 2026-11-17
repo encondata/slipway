@@ -7,7 +7,8 @@
 
 **Deploy. Run. Observe.** Slipway lists your GitHub repositories and deploys any of them as Docker
 containers on your own Linux hosts over SSH, with user accounts, roles and an audit trail.
-Mobile/web analytics and centralized logging are scaffolded for the next phase.
+An Analytics page shows how deploys went and how hosts held up; centralized logging is scaffolded for the
+next phase.
 
 Stack: **FastAPI** · **PostgreSQL** (SQLAlchemy 2 async + Alembic) · server-rendered Jinja UI with
 vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
@@ -24,6 +25,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
 | Instances | Repo + branch + host + Dockerfile *or* docker compose; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
+| Analytics | Over the last 7, 30 or 90 days: deploy count, success rate, median and p90 deploy time and time to recover, each against the previous period; deploys per day by outcome; per instance (with the ones still failing marked), recent failures with their first error line, and who deployed. Per host: CPU load, memory and Docker disk use over time, from a sample stored at every successful health check (raw samples kept 8 days, hourly averages and peaks 400 days; `SLIPWAY_METRICS_RETENTION_INTERVAL` sets how often old samples are rolled up, 0 turns it off). Charts are drawn by Slipway itself, with tooltips and a table view; `GET /api/v1/analytics/deploys` and `/hosts` return the same numbers |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
 | UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
 
@@ -362,7 +364,8 @@ slipway/
   db/          engine/session, declarative base + portable column types
   models/      users/roles/sessions/tokens, hosts, repositories, instances/deployments, audit
   services/    auth, users, github, ssh, hosts (health), repos (sync), deployer (pipeline + runner),
-               ports (host port checks), discovery (unmanaged containers)
+               ports (host port checks), discovery (unmanaged containers), analytics (deploy stats),
+               host_metrics (host history and retention)
   api/v1/      JSON API routers
   web/         page routes, GitHub OAuth flow, Jinja templates, static CSS/JS/icons
 alembic/       migrations
@@ -373,7 +376,7 @@ tests/         pytest suite
 
 ## Roadmap
 
-- **Analytics:** ingest API with per-app keys for Android/iOS/web SDKs, sessions, crashes, ANR, release health.
+- **App analytics:** ingest API with per-app keys for Android/iOS/web SDKs, sessions, crashes, ANR, release health.
 - **Logs:** structured log ingestion, search, live streaming across instances.
 - **GitHub App** instead of user OAuth tokens for repo access, plus push webhooks for auto-deploy.
 - **Job queue** (e.g. arq + Redis) so deployments survive restarts and run on several Slipway replicas.

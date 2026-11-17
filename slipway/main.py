@@ -29,6 +29,7 @@ from slipway.db.base import Base
 from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
 from slipway.services import updates
 from slipway.services.deployer import runner
+from slipway.services.host_metrics import retention_forever
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
 from slipway.web import oauth, pages
@@ -93,13 +94,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     poller = asyncio.create_task(poll_hosts_forever(), name="host-poller")
     update_checker = asyncio.create_task(updates.check_forever(), name="update-checker")
     update_runs = asyncio.create_task(updates.reconcile_forever(), name="update-runs")
+    host_history = asyncio.create_task(retention_forever(), name="host-history")
     log.info("Slipway %s started (%s)", __version__, get_settings().env)
     try:
         yield
     finally:
-        for task in (poller, update_checker, update_runs):
+        for task in (poller, update_checker, update_runs, host_history):
             task.cancel()
-        for task in (poller, update_checker, update_runs):
+        for task in (poller, update_checker, update_runs, host_history):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await runner.shutdown()
