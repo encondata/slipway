@@ -40,6 +40,11 @@ class BackupStatus(StrEnum):
     CHANGED = "changed"  # a host check found another size or checksum
 
 
+class BackupLocation(StrEnum):
+    HOST = "host"  # in the instance folder's backups/ on its host
+    SLIPWAY = "slipway"  # on the Slipway server (a managed environment's data owner has no host)
+
+
 class Backup(UUIDPrimaryKey, Timestamps, Base):
     """A dump of an instance's data, taken on its host by a job (or by "Back up now")."""
 
@@ -49,6 +54,8 @@ class Backup(UUIDPrimaryKey, Timestamps, Base):
         Index("ix_backups_instance_id_taken_at", "instance_id", "taken_at"),
         CheckConstraint("status <> 'ready' OR db_bytes IS NOT NULL", name="ready_has_db_bytes"),
         CheckConstraint("NOT has_files OR status <> 'ready' OR files_bytes IS NOT NULL", name="ready_has_files_bytes"),
+        # Phase 4: a ready backup stored on the Slipway server always has the key its files are under.
+        CheckConstraint("location = 'host' OR data_key IS NOT NULL OR status <> 'ready'", name="slipway_key"),
     )
 
     instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("instances.id", ondelete="CASCADE"), index=True)
@@ -83,6 +90,11 @@ class Backup(UUIDPrimaryKey, Timestamps, Base):
     taken_at: Mapped[datetime]
     finished_at: Mapped[datetime | None]
     checked_at: Mapped[datetime | None]  # last time a host check confirmed the file
+    # Phase 4: ``host`` (the file is on the owner's host) or ``slipway`` (a managed environment's backup,
+    # stored encrypted in <storage_dir>/backups/ under ``data_key``; ``stored_bytes`` is what it takes there).
+    location: Mapped[str] = mapped_column(String(8), default=BackupLocation.HOST, server_default="host")
+    data_key: Mapped[str | None] = mapped_column(EncryptedText)
+    stored_bytes: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class SnapshotStatus(StrEnum):

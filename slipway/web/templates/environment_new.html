@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, empty %}
+{% from "_environment_dialogs.html" import vm_host_options, vm_machine_fields with context %}
 {% block title %}New environment{% endblock %}
 
 {% macro env_row(k="", v="") -%}
@@ -19,6 +20,8 @@
 {%- set label = h.host.name ~ " (" ~ h.host.client_address ~ ")" %}
 <option value="{{ h.host.id }}" data-label="{{ label }}" data-ip="{{ '1' if h.ip else '' }}" {% if not h.pinned %}data-unpinned disabled{% endif %}>{{ label }}{% if not h.pinned %}: Check it first{% endif %}</option>
 {% endfor %}
+{#- New VMs (P5 §12.2): one option per Proxmox or ESXi account, its sub-form below the select. #}
+{{ vm_host_options(vm_accounts) }}
 {%- endmacro %}
 
 {% block content %}
@@ -30,7 +33,7 @@
   </div>
 </div>
 
-{% if not repos or not hosts %}
+{% if not repos or (not hosts and not do_accounts and not vm_accounts and not has_provider_accounts) %}
 <section class="card">
   {% if not repos %}
     {{ empty("repositories", "No repository with a slipway.yml", "An environment runs an app whose repository has a slipway.yml at its root. Sync your repositories from GitHub first.", None) }}
@@ -40,17 +43,17 @@
 </section>
 {% else %}
 {#- slipway.js wireEnvFlow drives the steps; wireAppForm reads the branch's slipway.yml into steps 4 and 6. #}
-<form class="env-flow stack" method="post" action="/js-required" novalidate data-env-flow
+<form class="env-flow stack" id="env-flow" method="post" action="/js-required" novalidate data-env-flow
       data-app-form data-repo-select="#env-repo" data-branch-select="#env-branch"
       data-settings-field="settings" data-services-field="services"
       data-settings='{}' data-services='null' data-fallback='null'
       data-traffic-address="{{ traffic_address }}" data-default-tls="{{ default_tls }}"
-      {% if switchyard_configured %}data-switchyard{% endif %} {% if cloudflare %}data-cloudflare{% endif %}>
+      {% if switchyard_configured %}data-switchyard{% endif %} {% if cloudflare %}data-cloudflare data-zone="{{ cloudflare.zone }}"{% endif %}>
   <input type="radio" name="build_source" value="app" checked hidden data-no-send>
   <input type="hidden" name="data_mode" value="slot" data-no-send>
 
   <ol class="stepper flow-stepper" data-stepper>
-    {% for name in steps %}<li class="step" data-step-tab="{{ loop.index }}"><b>{{ loop.index }}</b> {{ name }}</li>{% if not loop.last %}<li class="line" aria-hidden="true"></li>{% endif %}{% endfor %}
+    {% for name in steps %}<li class="step" data-step-tab="{{ loop.index }}"><b>{{ loop.index }}</b> <span data-step-label>{{ name }}</span></li>{% if not loop.last %}<li class="line" aria-hidden="true"></li>{% endif %}{% endfor %}
   </ol>
   <p class="sr-only" aria-live="polite" data-flow-live></p>
 
@@ -96,36 +99,89 @@
     <div class="card-head"><span class="head-icon">{{ icon("hosts", "i-lg") }}</span><div><h2>Servers</h2><p>One slot, or two that take turns serving the traffic.</p></div></div>
     <div class="card-body stack" style="gap: 16px">
       <div class="callout error" role="alert" data-step-error hidden></div>
+      {#- Where (P4 §17.2): hosts, or DigitalOcean (disabled with the reason). #}
+      <div class="field" data-field="placement.provider">
+        <span class="label-text">Where</span>
+        <div class="choice-grid">
+          <label class="choice"><input type="radio" name="where" value="hosts" checked data-no-send>{{ icon("hosts") }}<span><strong>Hosts</strong><small>(servers you added, or new VMs on Proxmox or ESXi)</small></span></label>
+          <label class="choice" {% if do_off %}title="{{ do_off }}"{% endif %}><input type="radio" name="where" value="digitalocean" data-no-send {{ 'disabled' if do_off }}>{{ icon("globe") }}<span><strong>DigitalOcean</strong><small>Slipway makes the droplets, a managed database, a load balancer and a Spaces bucket.</small><small class="subtle" data-do-reason>{{ do_off or "" }}</small></span></label>
+        </div>
+      </div>
+      {% if do_production and not do_off %}
+      <label class="check" data-show-when="where=digitalocean" hidden data-field="production"><input type="checkbox" name="production" data-no-send><span><strong>Production</strong><br><span class="subtle">Production runs Blue and Green, waits for Activate, and is deleted only after it is retired and snapshotted.</span></span></label>
+      {% endif %}
       <div class="choice-grid" data-field="data_mode">
         <label class="choice"><input type="radio" name="shape" value="single" checked data-no-send>{{ icon("box") }}<span><strong>Single slot</strong><small>One slot: each deploy updates it in place.</small></span></label>
         <label class="choice"><input type="radio" name="shape" value="bluegreen" data-no-send disabled>{{ icon("environments") }}<span><strong>Blue/Green</strong><small>Each deploy goes to the idle slot; Activate moves the traffic to it. A third host holds the data both slots use.</small><small class="subtle" data-bluegreen-reason>Read slipway.yml first.</small></span></label>
       </div>
+      <div data-show-when="where=hosts">
       <label class="check" data-show-when="shape=single"><input type="checkbox" name="keep_data" data-no-send disabled><span><strong>Keep the data on a server of its own</strong><br><span class="subtle" data-server-reason>The database and file store run on a host of their own, so a second slot can be added later.</span></span></label>
+      </div>
+      <p class="help" style="margin: 0" data-show-when="where=digitalocean" hidden>On DigitalOcean the data is in a managed database and a Spaces bucket, so a second slot can be added later.</p>
     </div>
   </section>
 
   {# ------------------------------------------------------------------------------------ 3. Hosts #}
   <section class="card flow-step" data-step="3" data-step-name="{{ steps[2] }}">
-    <div class="card-head"><span class="head-icon">{{ icon("hosts", "i-lg") }}</span><div><h2>Hosts</h2><p>Where each slot runs. Slipway checks a host's key before it uses it.</p></div></div>
+    <div class="card-head"><span class="head-icon">{{ icon("hosts", "i-lg") }}</span>
+      <div data-show-when="where=hosts"><h2>Hosts</h2><p>{% if vm_accounts %}Where each slot runs: a host you added (Slipway checks its key before it uses it), or a new VM Slipway makes.{% else %}Where each slot runs. Slipway checks a host's key before it uses it.{% endif %}</p></div>
+      <div data-show-when="where=digitalocean" hidden><h2>DigitalOcean</h2><p>The account Slipway makes the environment's objects with, and their sizes. The prices come from the account's catalog.</p></div></div>
     <div class="card-body stack" style="gap: 16px">
       <div class="callout error" role="alert" data-step-error hidden></div>
-      <div class="form-grid">
+      {% if do_accounts and not do_off %}
+      <div class="stack" style="gap: 14px" data-show-when="where=digitalocean" hidden data-do-fields>
+        <div class="form-grid">
+          <div class="field">
+            <label for="env-do-account">Account</label>
+            <select class="input" id="env-do-account" name="placement.account_id" data-do-account data-required-when="where=digitalocean">
+              {% for a in do_accounts %}<option value="{{ a.id }}" data-region="{{ a.region }}" data-label="{{ a.name }}" {% if a.production %}data-production{% endif %} {% if not a.usable %}data-unusable disabled{% endif %}>{{ a.name }}{% if a.production %} (production){% endif %}{% if not a.usable %}: test it in Settings › Integrations first{% endif %}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="field">
+            <label for="env-do-region">Region</label>
+            <select class="input" id="env-do-region" name="placement.region" data-do-region data-required-when="where=digitalocean"><option value="">Choose a region</option></select>
+            <span class="help">Regions with Spaces: the bucket is made there too.</span>
+          </div>
+          <div class="field">
+            <label for="env-do-droplet">Droplet size</label>
+            <select class="input" id="env-do-droplet" name="placement.droplet_size" data-do-droplet data-required-when="where=digitalocean"><option value="">Choose a size</option></select>
+            <span class="help">Each slot's droplet, with its price a month.</span>
+          </div>
+          <div class="field">
+            <label for="env-do-db">Database size</label>
+            <select class="input" id="env-do-db" name="placement.db_size" data-do-db data-required-when="where=digitalocean"><option value="">Choose a size</option></select>
+            <span class="help">The managed PostgreSQL cluster both slots use.</span>
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" name="placement.db_standby" data-do-standby><span>Standby node <span class="subtle">(a second database node that takes over if the first fails; it can't be removed later)</span></span></label>
+        <label class="check" data-do-staging><input type="checkbox" name="placement.acme_staging"><span>Let's Encrypt staging <span class="subtle">(a test certificate browsers don't trust; not for production)</span></span></label>
+        <div data-do-catalog-status></div>
+      </div>
+      {% endif %}
+      <div class="form-grid" data-show-when="where=hosts">
         <div class="field">
           <label for="env-host-blue">Blue</label>
-          <select class="input" id="env-host-blue" name="hosts.blue" required data-host-select="blue">{{ host_options("blue") }}</select>
+          <select class="input" id="env-host-blue" name="hosts.blue" required data-host-select="blue" data-vm-host="blue">{{ host_options("blue") }}</select>
+          {% if vm_accounts %}{{ vm_machine_fields("blue", vm_accounts, "hosts.blue.machine", "env-vm-blue") }}{% endif %}
         </div>
         <div class="field" data-show-when="shape=bluegreen" hidden>
           <label for="env-host-green">Green</label>
-          <select class="input" id="env-host-green" name="hosts.green" data-host-select="green" data-required-when="shape=bluegreen">{{ host_options("green") }}</select>
+          <select class="input" id="env-host-green" name="hosts.green" data-host-select="green" data-vm-host="green" data-required-when="shape=bluegreen">{{ host_options("green") }}</select>
+          {% if vm_accounts %}{{ vm_machine_fields("green", vm_accounts, "hosts.green.machine", "env-vm-green") }}{% endif %}
         </div>
         <div class="field" data-show-when="data_mode=server" hidden>
           <label for="env-host-data">Data server</label>
-          <select class="input" id="env-host-data" name="hosts.data" data-host-select="data" data-required-when="data_mode=server">{{ host_options("data") }}</select>
+          <select class="input" id="env-host-data" name="hosts.data" data-host-select="data" data-vm-host="data" data-required-when="data_mode=server">{{ host_options("data") }}</select>
+          {% if vm_accounts %}{{ vm_machine_fields("data", vm_accounts, "hosts.data.machine", "env-vm-data") }}{% endif %}
           <span class="help">The data server lets the app slots in by their IP addresses (their LAN address, or the proxy address).</span>
         </div>
       </div>
-      <div class="callout warning" data-same-host hidden>{{ icon("alert") }}<span>Blue and Green are on the same host: a problem with that host takes both slots down.</span></div>
-      {% if auth.can(Perm.HOSTS_WRITE) and auth.can(Perm.HOSTS_READ) %}<p class="help" style="margin: 0"><a href="/hosts?add=1">Add a host</a> (it opens the Hosts page; come back here once its key is checked).</p>{% endif %}
+      {% if vm_accounts %}<p class="help" style="margin: 0" data-show-when="where=hosts">An environment's new VMs share one account and one network.{% if not auth.can(Perm.MACHINES_WRITE) %} Making VMs needs the machines:write permission.{% endif %}</p>{% endif %}
+      {% if vm_off %}<p class="help" style="margin: 0" data-show-when="where=hosts" data-vm-reason>{{ vm_off }}.</p>{% endif %}
+      {#- The wrapper follows the Where choice; the callout itself is shown only by the same-host check, which
+          data-show-when would otherwise overwrite on every change. #}
+      <div data-show-when="where=hosts"><div class="callout warning" data-same-host hidden>{{ icon("alert") }}<span>Blue and Green are on the same host: a problem with that host takes both slots down.</span></div></div>
+      {% if auth.can(Perm.HOSTS_WRITE) and auth.can(Perm.HOSTS_READ) %}<p class="help" style="margin: 0" data-show-when="where=hosts"><a href="/hosts?add=1">Add a host</a> (it opens the Hosts page; come back here once its key is checked).</p>{% endif %}
     </div>
   </section>
 
@@ -163,6 +219,13 @@
         <thead><tr><th>Public name</th><th>Through</th><th>To</th><th>TLS</th></tr></thead>
         <tbody data-traffic-rows><tr><td colspan="4" class="muted">Slipway lists the names once the earlier steps are filled in.</td></tr></tbody>
       </table></div>
+      {#- DigitalOcean (P4 §17.2): the load balancer, and DNS always on. #}
+      <div class="stack" style="gap: 10px" data-show-when="where=digitalocean" hidden data-do-traffic>
+        <p style="margin: 0"><strong>Through:</strong> DigitalOcean load balancer</p>
+        <label class="check"><input type="checkbox" checked disabled data-no-send><span>Publish DNS records in Cloudflare{% if cloudflare %} <span class="subtle">({{ cloudflare.zone }}; the records point at the load balancer)</span>{% endif %}</span></label>
+        <label class="check"><input type="checkbox" name="do_proxied" data-no-send {{ 'checked' if cloudflare and cloudflare.proxied }}><span>Proxied <span class="subtle">(through Cloudflare's proxy)</span></span></label>
+      </div>
+      <div class="stack" style="gap: 16px" data-show-when="where=hosts">
       <div class="field" data-field="traffic">
         <span class="label-text">Switch</span>
         <div class="row wrap" style="gap: 8px 20px">
@@ -182,6 +245,7 @@
           <label class="check" style="align-self: end"><input type="checkbox" name="traffic.dns.proxied" {{ 'checked' if cloudflare.proxied }}><span>Proxied <span class="subtle">(through Cloudflare's proxy)</span></span></label>
         </div>
         {% endif %}
+      </div>
       </div>
       <label class="check" data-show-when="shape=bluegreen" hidden data-field="auto_activate"><input type="checkbox" name="auto_activate"><span><strong>Activate automatically when the smoke test passes</strong><br><span class="subtle">Otherwise traffic stays on the live slot until you choose Activate.</span></span></label>
     </div>
@@ -224,6 +288,14 @@
     <div class="card-body stack" style="gap: 16px">
       <div class="callout error" role="alert" data-step-error hidden></div>
       <dl class="kv" data-review></dl>
+      {#- The estimate and its typed total (P4 §12.2, §17.2): Deploy stays disabled until it matches. #}
+      <div class="stack" style="gap: 10px" data-show-when="where=digitalocean" hidden data-do-review data-field="confirm_cost">
+        <div data-cost-table><p class="muted" style="margin: 0">Slipway prices the environment once the earlier steps are filled in.</p></div>
+        <div class="field confirm-field">
+          <label for="env-confirm-cost">Type <strong class="mono" data-cost-figure></strong> to confirm about $<span data-cost-figure></span> a month</label>
+          <input class="input mono" id="env-confirm-cost" name="confirm_cost" data-no-send data-flow-cost autocomplete="off" spellcheck="false" maxlength="20">
+        </div>
+      </div>
       <p style="margin: 0"><strong>Secrets:</strong> generated by Slipway and never shown.</p>
       <div class="callout warning">{{ icon("alert") }}<span>An app's commands run as trusted code with host-level access: anyone who can push to this branch and deploy it can take control of its hosts.</span></div>
       <p class="help" style="margin: 0">Deploy creates the environment and starts its first deployment, then opens it.</p>

@@ -3,13 +3,81 @@
 {% from "_macros.html" import icon %}
 {% from "_data_dialogs.html" import head, foot, confirm_field, then_job with context %}
 
+{# The cost a DigitalOcean change confirms (P4 §12.2, §17.4). The form carries data-cost-confirm: Check the price
+   sends it without confirm_cost to the API's dry run (?check=true), whose cost names the new total, and the field
+   then asks for it typed (slipway.js costPrice). ``old_cents`` is the estimate now, for the delta. #}
+{% macro cost_confirm(id) -%}
+<div class="cost-box stack" style="gap: 8px" data-cost-box hidden>
+  <p style="margin: 0" data-cost-text></p>
+  <div class="field confirm-field">
+    <label for="{{ id }}">Type <strong class="mono" data-cost-figure></strong> to confirm about $<span data-cost-figure></span> a month</label>
+    <input class="input mono" id="{{ id }}" name="confirm_cost" data-must-equal="" data-cost-input autocomplete="off" spellcheck="false" maxlength="20">
+  </div>
+</div>
+{%- endmacro %}
+
+{% macro cost_foot(label) -%}
+<div class="modal-foot">
+  <button class="btn" type="button" data-close>Cancel</button>
+  <button class="btn" type="button" data-cost-price>Check the price</button>
+  <button class="btn btn-primary" type="submit" disabled>{{ label }}</button>
+</div>
+{%- endmacro %}
+
+{# A new VM on a Proxmox or ESXi account (P5 §12.2, §12.4). ``accounts`` is pages.vm_account_view's list. The host
+   select offers ``New VM on <account>`` (value vm:<id>); its sub-form, shown while one is chosen (slipway.js
+   wireVmForms), holds the network, the address (the pool's free ones from GET /provider-accounts/{id}/addresses,
+   or typed) and the size. Every field is data-no-send: slipway.js vmSpec builds the body's ``machine``. #}
+{% macro vm_host_options(accounts) -%}
+{% for a in accounts %}<option value="vm:{{ a.id }}" data-vm-account="{{ a.id }}" data-provider="{{ a.provider }}" data-label="{{ a.label }}" {% if a.off %}data-vm-off disabled{% endif %}>{{ a.label }}{% if a.off %}: {{ a.off }}{% endif %}</option>
+{% endfor %}
+{%- endmacro %}
+
+{% macro vm_machine_fields(slot, accounts, prefix, id_prefix, env_name="<name>") -%}
+<div class="vm-form stack" data-vm-form="{{ slot }}" hidden>
+  <div class="form-grid">
+    <div class="field">
+      <label for="{{ id_prefix }}-network">Network</label>
+      <select class="input" id="{{ id_prefix }}-network" name="{{ prefix }}.network" data-vm="network" data-no-send>
+        {% for a in accounts %}{% for n in a.networks %}<option value="{{ n.name }}" data-account="{{ a.id }}" data-label="{{ n.name }}">{{ n.name }}{% if n.subnet %} ({{ n.subnet }}){% endif %}</option>{% endfor %}{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <span class="label-text">Address</span>
+      <div class="row wrap" style="gap: 6px 16px">
+        <label class="check"><input type="radio" name="{{ prefix }}.address_from" value="pool" checked data-vm="from" data-no-send><span>Pick one from the pool</span></label>
+        <label class="check"><input type="radio" name="{{ prefix }}.address_from" value="typed" data-vm="from" data-no-send><span>Type it</span></label>
+      </div>
+      <select class="input mono" name="{{ prefix }}.address" data-vm="pick" data-no-send aria-label="Address from the pool" data-show-when="{{ prefix }}.address_from=pool"><option value="auto">The next free address</option></select>
+      <input class="input mono" name="{{ prefix }}.address" data-vm="typed" data-no-send aria-label="Address" placeholder="10.0.0.12" autocomplete="off" spellcheck="false" maxlength="15" data-show-when="{{ prefix }}.address_from=typed" hidden>
+      <span class="help" data-vm-taken></span>
+    </div>
+    <div class="field">
+      <label for="{{ id_prefix }}-cores">vCPU</label>
+      <input class="input" id="{{ id_prefix }}-cores" name="{{ prefix }}.cores" type="number" min="1" max="64" value="4" data-vm="cores" data-no-send>
+    </div>
+    <div class="field">
+      <label for="{{ id_prefix }}-memory">Memory (GB)</label>
+      <input class="input" id="{{ id_prefix }}-memory" name="{{ prefix }}.memory_mb" type="number" min="2" max="256" value="8" data-vm="memory_gb" data-no-send>
+    </div>
+    <div class="field">
+      <label for="{{ id_prefix }}-disk">Disk (GB)</label>
+      <input class="input" id="{{ id_prefix }}-disk" name="{{ prefix }}.disk_gb" type="number" min="20" max="4096" value="64" data-vm="disk_gb" data-no-send>
+    </div>
+  </div>
+  <p class="help" style="margin: 0">Slipway makes <span class="mono">slipway-<span data-vm-env>{{ env_name }}</span>-{{ slot }}</span> at this address when its first deploy starts.</p>
+</div>
+{%- endmacro %}
+
 {# ----------------------------------------------------------------------------------------------- deploy #}
-{% macro deploy_dialog(env, out, slots, actions, two) -%}
+{% macro deploy_dialog(env, out, slots, actions, two, host_cells=None, vmenv=None) -%}
 {%- set a = actions.deploy -%}
+{%- set cell = (host_cells or {}).get(a.slot) -%}
+{%- set view = cell.view if cell else none -%}
 {%- set target = slots.get(a.slot) -%}
 {%- set active = (out.slots|selectattr("active")|first) if out.slots|selectattr("active")|list else none -%}
 {%- set active_sha = ((active.live or {}).get("sha") or "")[:7] if active else "" -%}
-{%- set server = env.data_mode != "slot" and "data" in slots -%}
+{%- set server = env.data_mode == "server" and "data" in slots -%}
 {%- set first = a.slot == "data" -%}
 <dialog class="modal" id="deploy-env" style="width: min(620px, calc(100vw - 32px))">
   <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/deploy" {{ then_job() }}>
@@ -18,6 +86,7 @@
       {% if first %}
       <input type="hidden" name="target" value="data">
       <p style="margin: 0">Deploys <span class="mono">{{ env.branch }}</span> to the data server on {{ target.host.name if target else "its host" }} first, then to {{ "blue" if "blue" in slots else "the first slot" }}, which goes live when its smoke test passes.</p>
+      {% for line in ((vmenv.slots.get("data") or {}).deploy if vmenv else []) %}<p style="margin: 0" data-deploy-vm>{{ line }}</p>{% endfor %}
       {% else %}
       {% if server %}
       <div class="row wrap" style="gap: 8px 20px">
@@ -37,6 +106,11 @@
         {% else %}
         <p style="margin: 0">Deploys <span class="mono">{{ env.branch }}</span> to {{ a.slot }} on {{ target.host.name if target else "its host" }}{% if a.go_live %}, which goes live when its smoke test passes{% endif %}.</p>
         {% endif %}
+        {#- A droplet Slipway makes, or grows (P4 §9.4, §17.4). #}
+        {% if view and view.provider == "digitalocean" and not view.built %}<p style="margin: 0" data-deploy-builds>Slipway makes {{ a.slot }}'s droplet {{ view.host.name }} first{% if not out.slots|selectattr("live")|list %}, with the database cluster, the bucket and the load balancer{% endif %}; DigitalOcean bills them from then on.</p>
+        {% elif view and view.provider == "digitalocean" and cell.pending %}<p style="margin: 0" data-deploy-resize>The deploy grows {{ a.slot }}'s droplet to <span class="mono">{{ (env.cloud or {}).get("droplet_size") }}</span> after its backup: the droplet stops for a few minutes, and its disk grows and can't shrink again.</p>{% endif %}
+        {#- A VM Slipway makes, or resizes after the backup (P5 §9.4, §12.4). #}
+        {% for line in ((vmenv.slots.get(a.slot) or {}).deploy if vmenv else []) %}<p style="margin: 0" data-deploy-vm>{{ line }}</p>{% endfor %}
         {% if a.stale %}<p style="margin: 0">{{ a.slot|capitalize }} was {{ (a.stale.reason or "marked stale")|lower|replace("; deploy to it before activating it", "")|replace("; deploy to it first", "") }}; this deploy brings it up to date.</p>{% endif %}
         {% if a.behind and active %}
         {#- The lag check (§7.6): shown when the last activate was a switch back; unticked. #}
@@ -102,21 +176,29 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
 
 {# ------------------------------------------------------------------------------- activate / switch back #}
 {# ``id`` is activate-slot or switch-back; ``s`` is pages._slot_dialog of the slot; ``from_slot`` takes the traffic now. #}
-{% macro activate_dialog(env, id, s, from_slot, names, back=False) -%}
+{% macro activate_dialog(env, id, s, from_slot, names, back=False, lb=False, production=False) -%}
 {%- set n = names|length -%}
 <dialog class="modal" id="{{ id }}" style="width: min(640px, calc(100vw - 32px))">
   <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/activate" {{ then_job() }}>
     {{ head(("Switch back to " if back else "Activate ") ~ s.slot) }}
     <div class="modal-body">
       <input type="hidden" name="slot" value="{{ s.slot }}">
+      {% if lb %}
+      <p style="margin: 0">Slipway checks {{ s.slot }} (<span class="mono">{{ s.sha7 }}</span>) on {{ s.host }}, then points the load balancer at its droplet and checks {{ (n ~ " name" ~ ("" if n == 1 else "s")) if n else env.name ~ "'s names" }} through it.
+        {%- if from_slot %} If a check fails, the load balancer goes back to {{ from_slot }}. {{ from_slot|capitalize }} keeps running: activate it again to switch back.{% else %} If a check fails, the load balancer is left with no droplet; nothing was live before.{% endif %}</p>
+      {% else %}
       <p style="margin: 0">Slipway checks {{ s.slot }} (<span class="mono">{{ s.sha7 }}</span>) on {{ s.host }}, then points {{ (n ~ " name" ~ ("" if n == 1 else "s")) if n else env.name ~ "'s names" }} in Switchyard at it and checks them through Switchyard.
         {%- if from_slot %} If a check fails, every name goes back to {{ from_slot }}. {{ from_slot|capitalize }} keeps running: activate it again to switch back.{% else %} If a check fails, Slipway removes the hosts it made; nothing was live before.{% endif %}</p>
-      {#- The plan is loaded when the dialog opens; a blocker keeps the button disabled (slipway.js renderers.traffic_plan). #}
-      <div class="plan-list" data-lazy data-load="/api/v1/environments/{{ env.id }}/traffic/plan?slot={{ s.slot }}" data-render="traffic_plan" data-mode="list"><p class="muted" style="margin: 0">Reading Switchyard…</p></div>
+      {% endif %}
+      {#- The plan is loaded when the dialog opens; until it has loaded with no blocker the button stays disabled
+          (data-plan-blocked, slipway.js load and renderers.traffic_plan), whatever name is typed. #}
+      <div class="plan-list" data-lazy data-load="/api/v1/environments/{{ env.id }}/traffic/plan?slot={{ s.slot }}" data-render="traffic_plan" data-mode="list" {% if lb %}data-switch-label="Load balancer"{% endif %}><p class="muted" style="margin: 0">Reading {{ "the load balancer" if lb else "Switchyard" }}…</p></div>
+      {#- A production environment's Activate and Switch back take its name typed (P4 §13, Decision 39). #}
+      {% if production %}{{ confirm_field(env.name, id ~ "-confirm") }}{% endif %}
     </div>
     <div class="modal-foot">
       <button class="btn" type="button" data-close>Cancel</button>
-      <button class="btn btn-primary" type="submit" data-plan-submit disabled>{{ ("Switch back to " if back else "Activate ") ~ s.slot }}</button>
+      <button class="btn btn-primary" type="submit" data-plan-submit data-plan-blocked="1" disabled>{{ ("Switch back to " if back else "Activate ") ~ s.slot }}</button>
     </div>
   </form>
 </dialog>
@@ -124,13 +206,34 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
 
 {# ----------------------------------------------------------------------------------------- remove a slot #}
 {# One dialog for either app slot: the button's data-fill sets the action, the slot and its host. #}
-{% macro remove_slot_dialog(env, data_host) -%}
+{% macro remove_slot_dialog(env, data_host, doenv=None, vmenv=None) -%}
 <dialog class="modal" id="remove-slot">
   <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}/slots/-" {{ then_job() }}>
     {{ head("Remove a slot") }}
     <div class="modal-body">
+      {% if vmenv %}
+      {#- P5 §9.5, §12.4: a slot on a VM Slipway made loses its VM; the button's fill says which (vm, account), and
+          whether its VM has a blocker forget_vms gets past (forgettable, set by the Slots card's live read too). #}
+      <p style="margin: 0" data-show-if="vm" hidden>Removes <span data-slot="slot"></span> and its VM <span class="mono" data-slot="host"></span> from <span data-slot="account"></span>, with its disks. {{ env.name }}'s data on {{ data_host }} isn't touched.</p>
+      <p style="margin: 0" data-show-if="ssh" hidden>Stops <span data-slot="slot"></span>'s containers on <span data-slot="host"></span> and removes its folder (its .env is kept in <code>.slipway-kept</code>). {{ env.name }}'s data on {{ data_host }} isn't touched.</p>
+      <p class="help" style="margin: 0">{{ env.name }}'s data server still lets <span data-slot="host"></span> in afterwards: update the data server to stop that.</p>
+      <div data-show-if="forgettable" hidden data-remove-forget>
+        {#- Read when the dialog opens (GET .../machines?blockers=true): offered only when forget_vms gets past
+            every blocker of the slot's VM, and the blockers named (slipway.js renderers.vm_forget). #}
+        <p class="help" style="margin: 0" data-lazy data-load="/api/v1/environments/{{ env.id }}/machines?blockers=true" data-render="vm_forget" data-forget-scope="slot"></p>
+        {% if vmenv.can_forget %}
+        <label class="check"><input type="checkbox" name="forget_vms"><span>Forget the VM Slipway can't remove <span class="subtle">(you remove it by hand)</span></span></label>
+        {% else %}
+        <label class="check" title="Forgetting a VM needs the machines:write and environments:delete permissions"><input type="checkbox" name="forget_vms" disabled><span>Forget the VM Slipway can't remove <span class="subtle">(needs the machines:write and environments:delete permissions)</span></span></label>
+        {% endif %}
+      </div>
+      {% elif doenv %}
+      <p style="margin: 0">Removes <span data-slot="slot"></span>'s droplet <span class="mono" data-slot="host"></span> from DigitalOcean (its .env is kept in <code>.slipway-kept</code> first). {{ env.name }}'s data in its managed database isn't touched.</p>
+      {% if doenv.droplet_cents %}<p class="help" style="margin: 0">The estimate drops by about ${{ doenv.droplet_figure }} a month once the droplet is gone.</p>{% endif %}
+      {% else %}
       <p style="margin: 0">Stops <span data-slot="slot"></span>'s containers on <span data-slot="host"></span> and removes its folder (its .env is kept in <code>.slipway-kept</code>). {{ env.name }}'s data on {{ data_host }} isn't touched.</p>
       <p class="help" style="margin: 0">{{ env.name }}'s data server still lets <span data-slot="host"></span> in afterwards: update the data server to stop that.</p>
+      {% endif %}
       {{ confirm_field(env.name, "remove-slot-confirm") }}
     </div>
     {{ foot("Remove") }}
@@ -139,12 +242,60 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
 {%- endmacro %}
 
 {# ------------------------------------------------------------------------------- delete the environment #}
-{% macro delete_dialog(env, out, slots, teardown, default_name, can_snapshot) -%}
-{%- set data_host = slots.data.host.name if "data" in slots else (slots.blue.host.name if "blue" in slots else "its host") -%}
+{#- ``doenv`` is pages.do_view (a DigitalOcean environment's lists), ``deleting`` pages.delete_view (the snapshot box's
+    state, drop_data and the production phrases, P4 §13 and §17.4). A phase 3 environment keeps phase 3's dialog. #}
+{% macro delete_dialog(env, out, slots, teardown, default_name, can_snapshot, doenv=None, deleting=None, vmenv=None) -%}
+{%- set data_host = slots.data.host.name if "data" in slots and slots.data.host else (slots.blue.host.name if "blue" in slots and slots.blue.host else "its host") -%}
+{%- set guarded = deleting and (deleting.home or deleting.production) -%}
 <dialog class="modal" id="delete-env" style="width: min(640px, calc(100vw - 32px))">
   <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}" {{ then_job() }}>
     {{ head("Delete " ~ env.name) }}
     <div class="modal-body">
+      {% if doenv %}
+      <div class="grid grid-2" style="gap: 14px" data-delete-lists>
+        <div><strong>Goes</strong>
+          <ul class="plain-list">
+            {% for o in doenv.objects %}<li>The {{ o.kind }} <span class="mono">{{ o.name }}</span> <span class="subtle">· {{ "create not answered yet" if o.pending else o.monthly }}</span></li>
+            {% else %}<li class="muted">Nothing on DigitalOcean yet</li>{% endfor %}
+            {% if teardown.records %}<li>{{ teardown.records }} DNS record{{ "" if teardown.records == 1 else "s" }} Slipway created in Cloudflare</li>{% endif %}
+          </ul></div>
+        <div><strong>Stays</strong>
+          <ul class="plain-list">
+            {% if teardown.claimed %}<li>{{ teardown.claimed }} DNS record{{ "" if teardown.claimed == 1 else "s" }} Slipway claimed</li>{% endif %}
+            <li>The backups stored on this Slipway server (moved to <code>kept/</code>)</li>
+            <li>Snapshots kept on this Slipway</li>
+          </ul></div>
+      </div>
+      {% elif vmenv %}
+      {#- P5 §9.9, §12.4: the VMs go with their disks, and the data with them unless a snapshot is taken. #}
+      {%- set data_vm = vmenv.slots.get("data") or (vmenv.slots.get("blue") if env.data_mode == "slot" else none) %}
+      <p style="margin: 0" data-delete-vms>These VMs are destroyed with their disks: {{ vmenv.names|join(", ") }}.</p>
+      <div class="grid grid-2" style="gap: 14px" data-delete-lists>
+        <div><strong>Goes</strong>
+          <ul class="plain-list">
+            {% if teardown.hosts %}<li>{{ teardown.hosts }} Switchyard host{{ "" if teardown.hosts == 1 else "s" }} Slipway created</li>{% endif %}
+            {% if teardown.records %}<li>{{ teardown.records }} DNS record{{ "" if teardown.records == 1 else "s" }} Slipway created</li>{% endif %}
+            {% for s in out.slots %}{%- set vm = vmenv.slots.get(s.slot) %}
+            {% if vm %}<li>The VM <span class="mono">{{ vm.name }}</span> on {{ vm.account }}, with its disks{% if data_vm and vm.name == data_vm.name %} and {{ env.name }}'s data and backups{% endif %}</li>
+            {% else %}<li>The containers and folder of {{ "the data server" if s.slot == "data" else s.slot }} on {{ s.host.name }}</li>{% endif %}
+            {% endfor %}
+          </ul></div>
+        <div><strong>Stays</strong>
+          <ul class="plain-list">
+            {% if teardown.claimed %}<li>{{ teardown.claimed }} DNS record{{ "" if teardown.claimed == 1 else "s" }} Slipway claimed</li>{% endif %}
+            {% if not data_vm %}<li>The data volumes and backups on {{ data_host }} (backups move to <code>.slipway-kept</code>)</li>{% endif %}
+            <li>Snapshots kept on this Slipway</li>
+          </ul></div>
+      </div>
+      <div {% if not vmenv.forgettable %}hidden{% endif %} data-forget-vms>
+        <p class="help" style="margin: 0" data-lazy data-load="/api/v1/environments/{{ env.id }}/machines?blockers=true" data-render="vm_forget" data-forget-scope="all"></p>
+        {% if vmenv.can_forget %}
+        <label class="check"><input type="checkbox" name="forget_vms"><span>Forget the VMs Slipway can't remove <span class="subtle">(you remove them by hand)</span></span></label>
+        {% else %}
+        <label class="check" title="Forgetting a VM needs the machines:write and environments:delete permissions"><input type="checkbox" name="forget_vms" disabled><span>Forget the VMs Slipway can't remove <span class="subtle">(needs the machines:write and environments:delete permissions)</span></span></label>
+        {% endif %}
+      </div>
+      {% else %}
       <div class="grid grid-2" style="gap: 14px">
         <div><strong>Goes</strong>
           <ul class="plain-list">
@@ -160,6 +311,62 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
             <li>Snapshots kept on this Slipway</li>
           </ul></div>
       </div>
+      {% endif %}
+      {% if guarded %}
+      {#- Decision 26 and P4 §13: the data's only home goes with the environment. #}
+      {%- set st = deleting.state %}
+      <div class="stack" style="gap: 8px" data-snapshot-state="{{ st }}">
+        {% if st == "unticked" %}
+        <label class="check"><input type="checkbox" name="snapshot_first" data-no-send {{ 'disabled' if not can_snapshot }}><span>Take a snapshot first</span></label>
+        <p class="help" style="margin: 0">{{ deleting.never_held }}.</p>
+        {% elif st == "disabled" %}
+        <label class="check" title="{{ deleting.no_runner }}"><input type="checkbox" name="snapshot_first" data-no-send disabled><span>Take a snapshot first</span></label>
+        <p class="help" style="margin: 0">{{ deleting.no_runner }}.</p>
+        {% elif st == "forced" and not can_snapshot %}
+        {#- A production environment that holds data is deleted only after a snapshot (delete_problem answers 422
+            otherwise), so without one there is no way to delete it from here: no drop_data, and Delete stays off. #}
+        <p class="error-text" style="margin: 0" data-snapshot-needed>A production environment is deleted only after a snapshot, {{ "and taking one needs the data:backup permission" if not auth.can(Perm.DATA_BACKUP) else "and this app's slipway.yml declares no dump command, so Slipway can't take one" }}.</p>
+        {% elif not can_snapshot %}
+        <p class="help" style="margin: 0">{{ "Taking a snapshot first needs the data:backup permission" if not auth.can(Perm.DATA_BACKUP) else "This app's slipway.yml declares no dump command, so Slipway can't take a snapshot first" }}.</p>
+        {% elif st == "forced" %}
+        <label class="check" title="A production environment is deleted only after a snapshot"><input type="checkbox" name="snapshot_first" data-no-send checked disabled><span>Take a snapshot first <span class="subtle">(a production environment is deleted only after one)</span></span></label>
+        {% else %}
+        <label class="check"><input type="checkbox" name="snapshot_first" data-no-send checked><span>Take a snapshot first</span></label>
+        {% endif %}
+        {% if st in ("ticked", "forced", "unticked") and can_snapshot %}
+        <div class="field" data-show-when="snapshot_first=on" {% if st == "unticked" %}hidden{% endif %}>
+          <label for="delete-snapshot-name">Snapshot name</label>
+          <input class="input mono" id="delete-snapshot-name" name="snapshot.name" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" value="{{ default_name }}" autocomplete="off" spellcheck="false" data-required-when="snapshot_first=on">
+        </div>
+        {% endif %}
+        {% if st not in ("unticked", "forced") %}
+        <div class="stack" style="gap: 6px" {% if st == "ticked" and can_snapshot %}data-show-when="snapshot_first=" hidden{% endif %} data-drop-data>
+          <p class="error-text" style="margin: 0">{{ deleting.gone_text }}</p>
+          {% if deleting.can_drop %}
+          <label class="check"><input type="checkbox" name="drop_data" required><span>Delete {{ env.name }}'s data with it</span></label>
+          {% else %}
+          <label class="check" title="Deleting the data with it needs the data:reset permission"><input type="checkbox" name="drop_data" disabled><span>Delete {{ env.name }}'s data with it <span class="subtle">(needs the data:reset permission)</span></span></label>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% if deleting.production %}
+      <div class="field confirm-field">
+        <label for="delete-env-production">Type <strong class="mono">{{ deleting.phrase }}</strong> to confirm</label>
+        <input class="input mono" id="delete-env-production" name="confirm_production" data-must-equal="{{ deleting.phrase }}" autocomplete="off" spellcheck="false" maxlength="100">
+      </div>
+      {% if st == "disabled" %}
+      <div class="stack" style="gap: 6px" data-no-snapshot>
+        <div class="row wrap">{% if auth.can(Perm.DEPLOYMENTS_CREATE) %}<button class="btn btn-sm" type="button" data-api="POST /api/v1/environments/{{ env.id }}/deploy" data-body='{{ {"slot": deleting.runner}|tojson }}' {{ then_job() }}>Deploy to {{ deleting.runner }} first</button>{% endif %}<span class="subtle">then delete with a snapshot, or:</span></div>
+        <div class="field confirm-field">
+          <label for="delete-env-no-snapshot">Type <strong class="mono">{{ deleting.no_snapshot_phrase }}</strong> to confirm</label>
+          <input class="input mono" id="delete-env-no-snapshot" name="confirm_no_snapshot" data-must-equal="{{ deleting.no_snapshot_phrase }}" autocomplete="off" spellcheck="false" maxlength="100">
+        </div>
+      </div>
+      {% endif %}
+      {% endif %}
+      <p style="margin: 0"><strong>This can't be undone.</strong></p>
+      {% else %}
       {% if can_snapshot %}
       <label class="check"><input type="checkbox" name="snapshot_first" data-no-send><span>Take a snapshot first</span></label>
       <div class="field" data-show-when="snapshot_first=on" hidden>
@@ -168,9 +375,17 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
       </div>
       {% endif %}
       <p style="margin: 0"><strong>This can't be undone.</strong> To remove the volumes and backups too, delete them on {{ data_host }} afterwards.</p>
+      {% endif %}
       {{ confirm_field(env.name, "delete-env-confirm") }}
     </div>
+    {% if guarded and deleting.state == "forced" and not can_snapshot %}
+    <div class="modal-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn btn-danger solid" type="submit" data-blocked disabled title="A production environment is deleted only after a snapshot">Delete environment</button>
+    </div>
+    {% else %}
     {{ foot("Delete environment") }}
+    {% endif %}
   </form>
 </dialog>
 {%- endmacro %}
@@ -190,17 +405,35 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
 {%- endmacro %}
 
 {# ------------------------------------------------------------------------------------------ add a slot #}
-{% macro add_slot_dialog(env, add_hosts) -%}
+{% macro add_slot_dialog(env, add_hosts, doenv=None, vm_accounts=None) -%}
+{% if doenv %}
+{#- DigitalOcean (P4 §15.5, §17.4): no host to choose; the new total is priced when the dialog opens, then typed. #}
 <dialog class="modal" id="add-slot">
-  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/slots" data-then="reload" data-success="Slot added">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/slots" data-then="reload" data-success="Slot added"
+        data-cost-confirm data-cost-auto data-old-cents="{{ doenv.total_cents }}">
+    {{ head("Add a slot to " ~ env.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">Adds a second slot, so each deploy goes to the idle one and Activate moves the traffic. Slipway makes its droplet (<span class="mono">{{ (doenv.sizes or {}).droplet_size }}</span>) at the slot's first deploy, adds it to the database's trusted sources, and runs the role setup on it.</p>
+      {% if doenv.droplet_cents %}<p class="help" style="margin: 0">One more droplet: about ${{ doenv.droplet_figure }} a month more, by the prices confirmed before.</p>{% endif %}
+      {{ cost_confirm("add-slot-cost") }}
+    </div>
+    {{ cost_foot("Add slot") }}
+  </form>
+</dialog>
+{% else %}
+<dialog class="modal" id="add-slot">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/slots" data-then="reload" data-success="Slot added" {% if vm_accounts %}data-vm-slot-form{% endif %}>
     {{ head("Add a slot to " ~ env.name) }}
     <div class="modal-body">
       <div class="field">
         <label for="add-slot-host">Host</label>
-        <select class="input" id="add-slot-host" name="host_id" required>
+        <select class="input" id="add-slot-host" name="host_id" required {% if vm_accounts %}data-vm-host="green"{% endif %}>
           {% for h in add_hosts %}<option value="{{ h.host.id }}" {% if h.off %}disabled{% endif %}>{{ h.host.name }} ({{ h.host.client_address }}){% if h.off %}: {{ h.off }}{% endif %}</option>{% endfor %}
+          {% if vm_accounts %}{{ vm_host_options(vm_accounts) }}{% endif %}
         </select>
       </div>
+      {#- A new VM (P5 §9.5): on the account and network the environment's VMs share, if it has any. #}
+      {% if vm_accounts %}{{ vm_machine_fields("green", vm_accounts, "machine", "add-slot-vm", env.name) }}{% endif %}
       {#- Ticked, it queues a deploy, which needs deployments:create (POST /environments/{id}/slots). #}
       {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}
       <label class="check"><input type="checkbox" name="update_data_server" checked><span>Update the data server now so it lets this host in <span class="subtle">(then Slipway deploys the new slot)</span></span></label>
@@ -210,6 +443,173 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
       <p class="help" style="margin: 0">Without it, update the data server so it lets the host in, then deploy to the new slot.</p>
     </div>
     {{ foot("Add slot", danger=False) }}
+  </form>
+</dialog>
+{% endif %}
+{%- endmacro %}
+
+{# ---------------------------------------------------------- production: retire, un-retire, off the air (P4 §13) #}
+{% macro retire_dialog(env) -%}
+<dialog class="modal" id="retire-env">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/retire" data-then="reload" data-success="Retiring">
+    {{ head("Retire " ~ env.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">{{ env.name }} keeps serving. While it retires, no slot can be activated; when the new production is live, take {{ env.name }} off the air and delete it.</p>
+      {{ confirm_field(env.name, "retire-confirm") }}
+    </div>
+    {{ foot("Retire") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro unretire_dialog(env) -%}
+<dialog class="modal" id="unretire-env">
+  <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}/retire" data-then="reload" data-success="No longer retiring">
+    {{ head("Un-retire " ~ env.name) }}
+    <div class="modal-body">
+      <p style="margin: 0">{{ env.name }} is a production environment again: its slots can be activated, and it can't be deleted until it is retired again. Refused while another production environment of the same app isn't retiring.</p>
+      {{ confirm_field(env.name, "unretire-confirm") }}
+    </div>
+    {{ foot("Un-retire", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{#- ``names`` are the names that follow the live slot (hostnames). #}
+{% macro deactivate_dialog(env, active, names) -%}
+{%- set n = names|length -%}
+{%- set listed = ("Its names (" ~ (names|map(attribute="hostname")|join(", ")) ~ ")") if n and n <= 3 else ("Its " ~ n ~ " names") if n else "Its names" -%}
+<dialog class="modal" id="deactivate-env">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/deactivate" {{ then_job() }}>
+    {{ head("Take " ~ env.name ~ " off the air") }}
+    <div class="modal-body">
+      <p style="margin: 0">The load balancer stops sending traffic to {{ active.slot if active else "the live slot" }}. {{ listed }} answer 503 until the DNS records are moved or removed.</p>
+      {{ confirm_field(env.name, "deactivate-confirm") }}
+    </div>
+    {{ foot("Take off the air") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ---------------------------------------------------------------------------- grow the sizes (P4 §15.7) #}
+{#- The size selects are filled from the account's catalog when the dialog opens (renderers.grow_sizes). #}
+{% macro grow_dialog(env, doenv) -%}
+{%- set sizes = doenv.sizes or {} -%}
+{%- set nodes = sizes.db_nodes or 1 -%}
+<dialog class="modal" id="grow-env" style="width: min(620px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="PATCH /api/v1/environments/{{ env.id }}" data-then="reload" data-success="Sizes confirmed"
+        data-cost-confirm data-old-cents="{{ doenv.total_cents }}">
+    {{ head("Grow " ~ env.name) }}
+    <div class="modal-body">
+      <div data-lazy data-load="/api/v1/provider-accounts/{{ doenv.account.id if doenv.account else '' }}/catalog?region={{ doenv.region }}" data-render="grow_sizes"
+           data-droplet="{{ sizes.droplet_size or '' }}" data-db="{{ sizes.db_size or '' }}" data-nodes="{{ nodes }}"><p class="muted" style="margin: 0">Reading DigitalOcean's sizes…</p></div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="grow-droplet">Droplet size</label>
+          <select class="input" id="grow-droplet" name="cloud.droplet_size" data-grow-droplet><option value="{{ sizes.droplet_size or '' }}">{{ sizes.droplet_size or "" }} (now)</option></select>
+        </div>
+        <div class="field">
+          <label for="grow-db">Database size</label>
+          <select class="input" id="grow-db" name="cloud.db_size" data-grow-db><option value="{{ sizes.db_size or '' }}">{{ sizes.db_size or "" }} (now)</option></select>
+        </div>
+      </div>
+      {% if nodes >= 2 %}
+      <label class="check" title="A standby node can be added but not removed"><input type="checkbox" checked disabled><span>Standby node <span class="subtle">(a standby node can be added but not removed)</span></span></label>
+      {% else %}
+      <label class="check"><input type="checkbox" name="cloud.db_standby" data-grow-standby><span>Add a standby node <span class="subtle">(it can't be removed again)</span></span></label>
+      {% endif %}
+      <p class="help" style="margin: 0">The droplet stops for a few minutes when a deploy resizes it; its disk grows and can't shrink again. The database stays up while it resizes.</p>
+      {{ cost_confirm("grow-cost") }}
+    </div>
+    {{ cost_foot("Grow") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------------------------------------------------ VMs (P5 §12.4) #}
+{#- Resize one slot's VM (PATCH .../machines/{slot}): the size is stored, the slot's next deploy applies it.
+    ``vm`` is pages.vm_view's slot entry. Memory is typed in GB and sent in MB (data-scale). #}
+{% macro resize_vm_dialog(env, slot, vm) -%}
+{%- set size = vm.size or {} -%}
+<dialog class="modal" id="resize-vm-{{ slot }}">
+  <form method="post" action="/js-required" data-form="PATCH /api/v1/environments/{{ env.id }}/machines/{{ slot }}" data-then="reload" data-success="Size saved">
+    {{ head("Resize " ~ vm.name) }}
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field"><label for="resize-{{ slot }}-cores">vCPU</label><input class="input" id="resize-{{ slot }}-cores" name="cores" type="number" min="1" max="64" value="{{ size.cores or 4 }}"></div>
+        <div class="field"><label for="resize-{{ slot }}-memory">Memory (GB)</label><input class="input" id="resize-{{ slot }}-memory" name="memory_mb" type="number" min="2" max="256" step="0.5" value="{{ vm.memory_gb }}" data-scale="1024"></div>
+        <div class="field"><label for="resize-{{ slot }}-disk">Disk (GB)</label><input class="input" id="resize-{{ slot }}-disk" name="disk_gb" type="number" min="{{ vm.min_disk }}" max="4096" value="{{ size.disk_gb or vm.min_disk }}">
+          <span class="help">Disks only grow: {{ vm.name }} has {{ vm.min_disk }} GB.</span></div>
+        <div class="field"><label for="resize-{{ slot }}-keep">VM snapshots Slipway keeps</label><input class="input" id="resize-{{ slot }}-keep" name="keep_vm_snapshots" type="number" min="1" max="10" value="{{ vm.keep }}">
+          <span class="help">The newest it takes by itself, before a resize or a revert.</span></div>
+      </div>
+      <p style="margin: 0">Applies at {{ slot }}'s next deploy, after its backup: Slipway shuts {{ vm.name }} down, resizes it and starts it again.</p>
+      {% if vm.active %}<p style="margin: 0" data-resize-waits>{{ slot|capitalize }} takes the traffic now, so this waits until you deploy to it after activating the other slot.</p>{% endif %}
+    </div>
+    {{ foot("Save size", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{#- Forget a lost VM (POST .../machines/{slot}/forget): the button's data-fill sets the action, the VM, its account,
+    address and slot. #}
+{% macro forget_vm_dialog(env) -%}
+<dialog class="modal" id="forget-vm">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/machines/-/forget" data-then="reload" data-success="Slipway forgot the VM">
+    {{ head("Forget the VM") }}
+    <div class="modal-body">
+      <p style="margin: 0"><span class="mono" data-slot="vm"></span> isn't on <span data-slot="account"></span> any more. Slipway forgets it and makes a new VM at <span class="mono" data-slot="address"></span> when you next deploy to <span data-slot="slot"></span>.</p>
+      {{ confirm_field(env.name, "forget-vm-confirm") }}
+    </div>
+    {{ foot("Forget the VM") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{#- The VM snapshots card's dialogs (P5 §12.4). ``card`` is pages.vm_view's card. #}
+{% macro vm_snapshot_take_dialog(env, card) -%}
+<dialog class="modal" id="vm-snapshot-take">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/vm-snapshots" {{ then_job() }}>
+    {{ head("Take a VM snapshot of " ~ card.vm) }}
+    <div class="modal-body">
+      <div class="field"><label for="vm-snapshot-note">Note</label><input class="input" id="vm-snapshot-note" name="note" maxlength="300" autocomplete="off"></div>
+      <p class="help" style="margin: 0">ESXi and Proxmox keep it beside the VM. VM snapshots slow some storage down: Slipway keeps the newest {{ card.keep }} it takes by itself, and those you take until you delete them.</p>
+    </div>
+    {{ foot("Take a VM snapshot", danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro vm_revert_dialog(env, card) -%}
+<dialog class="modal" id="vm-revert" style="width: min(620px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/vm-snapshots/-/revert" {{ then_job() }}>
+    {{ head("Revert " ~ card.vm) }}
+    <div class="modal-body">
+      <p style="margin: 0">Puts {{ card.vm }}'s whole disk back to <span class="mono" data-slot="snapshot"></span> (<span data-slot="taken"></span>, commit <span class="mono" data-slot="sha7"></span>). <span data-slot="lost"></span>
+        {%- if card.mode != "newest_only" %} Slipway first takes a VM snapshot of {{ card.vm }} as it is now, so you can revert this too.{% endif %}</p>
+      {% if card.mode == "newest_only" %}
+      <p style="margin: 0" data-zfs>On ZFS storage this revert can't be undone: Slipway can't keep a VM snapshot of {{ card.vm }} as it is now.</p>
+      {% else %}
+      <label class="check"><input type="checkbox" name="skip_pre_revert"><span>Don't take that snapshot</span></label>
+      {% endif %}
+      {{ confirm_field(env.name, "vm-revert-confirm") }}
+    </div>
+    {{ foot("Revert") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro vm_drop_dialog(env, card) -%}
+<dialog class="modal" id="vm-drop">
+  <form method="post" action="/js-required" data-form="DELETE /api/v1/environments/{{ env.id }}/vm-snapshots/-" {{ then_job() }}>
+    {{ head("Delete VM snapshot") }}
+    <div class="modal-body">
+      <p style="margin: 0">Deletes <span class="mono" data-slot="snapshot"></span> from {{ card.account }}. It can't be undone.</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn btn-danger solid" type="submit">Delete</button>
+    </div>
   </form>
 </dialog>
 {%- endmacro %}
@@ -225,6 +625,33 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
       {% if r.offers_forget_traffic %}
       <label class="check"><input type="checkbox" name="forget_traffic"><span>Forget the Switchyard hosts and DNS records Slipway can't reach <span class="subtle">(they stay where they are; remove them by hand)</span></span></label>
       {% endif %}
+      {#- P5 §12.5: a VM Slipway can't remove (hidden, moved, its account gone) is forgotten instead. The step
+          that failed says a VM blocker may be the cause; the blockers read when the dialog opens say whether
+          forget_vms gets past them now (slipway.js renderers.vm_forget). #}
+      {% if d.offers_forget_vms %}
+      <div class="stack" style="gap: 6px" data-forget-vms>
+      <p class="help" style="margin: 0" data-lazy data-load="/api/v1/environments/{{ env.id }}/machines?blockers=true" data-render="vm_forget" data-forget-scope="{{ 'slot' if (dep.options or {}).get('slot') and dep.kind == 'remove_slot' else 'all' }}" data-forget-slot="{{ (dep.options or {}).get('slot') or '' }}"></p>
+      {% if auth.can(Perm.MACHINES_WRITE) and auth.can(Perm.ENVIRONMENTS_DELETE) %}
+      <label class="check"><input type="checkbox" name="forget_vms"><span>Forget the VMs Slipway can't remove <span class="subtle">(you remove them by hand)</span></span></label>
+      {% else %}
+      <label class="check" title="Forgetting a VM needs the machines:write and environments:delete permissions"><input type="checkbox" name="forget_vms" disabled><span>Forget the VMs Slipway can't remove <span class="subtle">(needs the machines:write and environments:delete permissions)</span></span></label>
+      {% endif %}
+      </div>
+      {% endif %}
+      {#- Asked again on every retry (P4 §13, §16): the production phrases, and drop_data when the delete used it. #}
+      {% if d.offers_drop_data %}
+      {% if auth.can(Perm.DATA_RESET) %}
+      <label class="check"><input type="checkbox" name="drop_data"><span>Delete {{ env.name }}'s data with it <span class="subtle">(as the delete did; there is no snapshot)</span></span></label>
+      {% else %}
+      <label class="check"><input type="checkbox" name="drop_data" disabled><span>Delete {{ env.name }}'s data with it <span class="subtle">(needs the data:reset permission)</span></span></label>
+      {% endif %}
+      {% endif %}
+      {% for p in d.phrases or [] %}
+      <div class="field confirm-field">
+        <label for="retry-env-{{ p.name }}">Type <strong class="mono">{{ p.phrase }}</strong> to confirm</label>
+        <input class="input mono" id="retry-env-{{ p.name }}" name="{{ p.name }}" data-must-equal="{{ p.phrase }}" autocomplete="off" spellcheck="false" maxlength="100">
+      </div>
+      {% endfor %}
       {{ confirm_field(env.name, "retry-env-confirm") }}
     </div>
     {{ foot("Retry") }}
@@ -245,6 +672,37 @@ Puts {{ env.name }}'s database back as it was at {{ at }}, before deployment {{ 
       <label class="check"><input type="checkbox" name="acknowledge_schema" required><span>This release (<span class="mono">{{ again.sha7 }}</span>) removes nothing {{ again.active }} (<span class="mono">{{ again.active_sha7 }}</span>) uses</span></label>
     </div>
     {{ foot("Deploy " ~ again.slot, danger=False) }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+
+{# --------------------------------------------- make a gone cluster or bucket again (deployment page, P4 §10.1) #}
+{#- ``rebuild`` is pages.rebuild_offer: the retry with rebuild_data, the name typed and data:reset. #}
+{% macro rebuild_retry_dialog(dep, rebuild) -%}
+<dialog class="modal" id="retry-rebuild">
+  <form method="post" action="/js-required" data-form="POST /api/v1/deployments/{{ dep.id }}/retry" {{ then_job() }}>
+    {{ head("Make it again, empty") }}
+    <div class="modal-body">
+      <input type="hidden" name="rebuild_data" value="true" data-type="json">
+      <p style="margin: 0">Retries this deploy, and Slipway makes {{ rebuild.name }}'s {{ rebuild.what }} again, <strong>empty</strong>. The data that was in it is gone with it: restore a backup afterwards.</p>
+      {{ confirm_field(rebuild.name, "retry-rebuild-confirm") }}
+    </div>
+    {{ foot("Make it again, empty") }}
+  </form>
+</dialog>
+{%- endmacro %}
+
+{# ------------------------------------------- the chain notice's Continue, for a production Activate (Decision 39) #}
+{% macro continue_dialog(env, label) -%}
+<dialog class="modal" id="continue-chain">
+  <form method="post" action="/js-required" data-form="POST /api/v1/environments/{{ env.id }}/notice/continue" {{ then_job() }}>
+    {{ head(label) }}
+    <div class="modal-body">
+      <p style="margin: 0">{{ env.name }} is a production environment and a slot is live, so its traffic moves when this runs.</p>
+      {{ confirm_field(env.name, "continue-chain-confirm") }}
+    </div>
+    {{ foot(label, danger=False) }}
   </form>
 </dialog>
 {%- endmacro %}

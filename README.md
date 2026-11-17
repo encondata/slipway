@@ -25,6 +25,8 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
 | Environments | An app from one branch in one slot or in Blue/Green slots that share a data server, on your SSH hosts: deploys go to the idle slot, Activate moves the names in Switchyard after a smoke test and puts them back if a check fails, Switch back, Discard, Cloudflare DNS records ([docs/environments.md](docs/environments.md)) |
+| DigitalOcean | An environment's slots on droplets Slipway makes, with managed PostgreSQL, a Spaces bucket, a load balancer with Let's Encrypt certificates and a cloud firewall; a confirmed monthly cost, production safeguards, and backups kept on the Slipway server ([docs/digitalocean.md](docs/digitalocean.md)) |
+| VMs | An environment's slots and data server on VMs Slipway makes on Proxmox (Terraform) or standalone ESXi (pyvmomi), with static addresses, resizes at the next deploy, VM snapshots and revert ([docs/machines.md](docs/machines.md)) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
 | UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
 
@@ -339,6 +341,12 @@ Interactive API docs: `/api/docs`.
 | `data:backup` (back up now, take snapshots), `data:restore` (restore same-key backups, roll back) | ✓ | ✓ | ✓ | |
 | `data:reset` (reset data, seed from snapshots, restore old keys, delete backups and snapshots, overrides), `snapshots:upload` | ✓ | ✓ | | |
 | `snapshots:download` (passphrase-encrypted downloads; seeding another repository's instances) | ✓ | | | |
+| `environments:read` | ✓ | ✓ | ✓ | ✓ |
+| `traffic:switch`, `providers:read` (DigitalOcean, Proxmox and ESXi accounts, never their secrets) | ✓ | ✓ | ✓ | |
+| `environments:write`, `environments:delete`, `providers:spend` (confirm a monthly cost), `machines:write` (make, resize and snapshot VMs) | ✓ | ✓ | | |
+| `providers:write` (add, change, test, trust and remove those accounts) | ✓ | | | |
+
+See [docs/environments.md](docs/environments.md#permissions) for what the environment, traffic, provider and machine permissions allow.
 
 `hosts:write` and `instances:write` are privileged. Whoever holds them controls SSH credentials and
 container mounts, which effectively means root on those hosts. Pinning a host key on first contact

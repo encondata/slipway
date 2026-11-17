@@ -8,6 +8,15 @@ The app (``ENV_SCRIPT``) keeps its "database" in ``<folder>/state/db``. An app s
 server (``APP_EXTERNAL=1`` in its ``.env``) uses the data server's folder instead (``DATA_STATE``, the data
 server's ``shared`` folder its ``provides`` names), so a migration a slot runs is seen on the data host.
 ``ENV_YML`` declares health paths, ``migrations``, ``data.attach`` and ``data.server``.
+
+Phases 4 and 5 reach droplets and VMs by address, so ``MultiRemote`` also answers by address
+(``multi["10.0.0.11"]``) and takes hosts that appear later (``add``). Each host can present its own host key
+(``present_key``, ``pinned_key``): a connect whose pinned key differs raises ``ssh.HostKeyMismatch``, as
+``ssh.connect`` does. A host that has no key of its own checks nothing, as phase 3's tests expect. A host can
+refuse its first connections while it boots (``booting``) or drop every connection from Slipway, as a cloud
+firewall does (``firewalled``). Shims answer ``cloud-init status`` (``$FAKE_CLOUD_INIT``), record the SQL
+``docker run ... psql`` reads from stdin (``$PSQL_LOG``, with a mode that fails right after a ``DROP DATABASE``
+line), and every session sees ``$SSH_CONNECTION`` naming Slipway's address (``slipway_address``).
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from typing import Any
 
 from slipway.db.session import get_sessionmaker
 from slipway.models import AppSetting, Deployment, Environment, Host, Instance, Repository
-from slipway.services import cloudflare
+from slipway.services import cloudflare, ssh
 from tests.conftest import make_user
 from tests.test_data_jobs import DF_SHIM, DataGitHub
 from tests.test_final_remote import DOCKER_SHIM, ShellRemote
@@ -144,15 +153,64 @@ exit 0
 
 # docker: the probe's `docker run ... psql` answers as $FAKE_PSQL says (empty: it signs in); the rest is the shim
 # of test_final_remote.
+#
+# What psql reads on stdin (the SQL of a managed database's setup or reset; the probe sends nothing past the
+# password its shell reads first) is appended to $PSQL_LOG as one block per run, ended by a "-- end" line.
+# With the file $FAKE_PSQL_DROP_FAILS present, psql takes the lines up to and including the first DROP DATABASE,
+# then fails as a connection cut there does; the file is removed, so the next run works (P4 test 84).
 DOCKER_ENV_SHIM = """#!/bin/sh
 if [ "$1" = run ] && echo "$*" | grep -q psql; then
   echo "$*" >> "$DOCKER_LOG"
   [ -n "$PGPASSWORD" ] && echo "probe: PGPASSWORD set (${#PGPASSWORD} characters)" >> "$DOCKER_LOG"
+  sql=$(cat)
+  if [ -n "$sql" ] && [ -n "$PSQL_LOG" ]; then
+    if [ -n "$FAKE_PSQL_DROP_FAILS" ] && [ -f "$FAKE_PSQL_DROP_FAILS" ] && printf '%s\\n' "$sql" | grep -q 'DROP DATABASE'; then
+      printf '%s\\n' "$sql" | awk '{print} /DROP DATABASE/ {exit}' >> "$PSQL_LOG"
+      echo "-- cut" >> "$PSQL_LOG"
+      rm -f "$FAKE_PSQL_DROP_FAILS"
+      echo "psql: error: server closed the connection unexpectedly" >&2
+      exit 2
+    fi
+    printf '%s\\n' "$sql" >> "$PSQL_LOG"
+    echo "-- end" >> "$PSQL_LOG"
+  fi
   if [ -n "$FAKE_PSQL" ]; then echo "$FAKE_PSQL" >&2; exit 2; fi
   echo 1
   exit 0
 fi
 exec "$(dirname "$0")/docker-base" "$@"
+"""
+
+# cloud-init: ``cloud-init status [--wait] [--long] [--format json]`` answers as $FAKE_CLOUD_INIT says (done, the
+# default; running, which --wait waits out; degraded, done with recoverable errors, exit 2; error, exit 1, with
+# $FAKE_CLOUD_INIT_ERROR as its error). Each call's arguments go to $CLOUD_INIT_LOG.
+CLOUD_INIT_SHIM = """#!/bin/sh
+echo "$*" >> "$CLOUD_INIT_LOG"
+[ "$1" = status ] || { echo "cloud-init: only status is faked" >&2; exit 2; }
+shift
+wait=""; json=""
+for a in "$@"; do
+  case "$a" in --wait|-w) wait=1 ;; --format=json|json) json=1 ;; esac
+done
+state=${FAKE_CLOUD_INIT:-done}
+if [ "$state" = running ] && [ -n "$wait" ]; then printf '...\\n'; state=done; fi
+error=${FAKE_CLOUD_INIT_ERROR:-Failed to run module scripts-user}
+case "$state" in
+  done) status=done; extended=done; code=0; errors="" ;;
+  degraded) status=done; extended="degraded done"; code=2; errors="" ;;
+  error) status=error; extended=error; code=1; errors="$error" ;;
+  *) status=running; extended=running; code=0; errors="" ;;
+esac
+if [ -n "$json" ]; then
+  if [ -n "$errors" ]; then list="[\\"$errors\\"]"; else list="[]"; fi
+  printf '{"boot_status_code": "enabled-by-generator", "datasource": "fake", "detail": "DataSourceFake", '
+  printf '"errors": %s, "extended_status": "%s", "last_update": "Thu, 01 Jan 1970 00:00:01 +0000", ' "$list" "$extended"
+  printf '"recoverable_errors": {}, "status": "%s"}\\n' "$status"
+else
+  echo "status: $status"
+  [ -n "$errors" ] && echo "errors: $errors"
+fi
+exit $code
 """
 
 # curl: prints the code $FAKE_HTTP_CODES gives the Host header ("host=code host=code"), else 200.
@@ -184,13 +242,19 @@ def github(yml: str = ENV_YML) -> type[EnvGitHub]:
 
 @dataclass
 class FakeHost:
-    """One host: its folders, its logs, and the ShellRemote every session to it uses."""
+    """One host: its folders, its logs, and the ShellRemote every session to it uses.
+
+    ``host_key`` is the public key it presents (None: it checks no pin, as phase 3's hosts do); ``refuse`` is how
+    many connects it still refuses while it boots; ``firewalled`` drops every connection from Slipway."""
 
     name: str
     address: str
     tmp: Path
     remote: ShellRemote
     env: dict[str, str]
+    host_key: str | None = None
+    refuse: int = 0
+    firewalled: bool = False
 
     @property
     def root(self) -> Path:
@@ -206,55 +270,152 @@ class FakeHost:
     def docker(self) -> list[str]:
         return self.log("DOCKER_LOG")
 
+    def cloud_init(self) -> list[str]:
+        """The arguments of each ``cloud-init`` call."""
+        return self.log("CLOUD_INIT_LOG")
+
+    def sql(self) -> list[str]:
+        """What each ``docker run ... psql`` read on stdin, one string per run (a cut run ends ``-- cut``)."""
+        out, block = [], []
+        for line in self.log("PSQL_LOG"):
+            if line in ("-- end", "-- cut"):
+                out.append("\n".join(block + ([line] if line == "-- cut" else [])))
+                block = []
+            else:
+                block.append(line)
+        return out
+
     def folder(self, slug: str) -> Path:
         return self.root / slug
 
     def clear(self) -> None:
-        for key in ("APP_LOG", "DOCKER_LOG", "CURL_LOG", "ADMIN_LOG"):
+        for key in LOGS:
             Path(self.env[key]).write_text("")
 
 
+# Each host's logs: the variable its shims read, and the file.
+LOGS = {"APP_LOG": "app.log", "DOCKER_LOG": "docker.log", "CURL_LOG": "curl.log", "ADMIN_LOG": "admin.log",
+        "CLOUD_INIT_LOG": "cloud-init.log", "PSQL_LOG": "psql.log"}
+# The address a fake host sees Slipway connect from ($SSH_CONNECTION's first field).
+SLIPWAY_ADDRESS = "198.51.100.7"
+
+
+def _same_key(a: str | None, b: str | None) -> bool:
+    """Two OpenSSH public key lines name the same key (the comment doesn't count)."""
+    return bool(a and b) and a.split()[:2] == b.split()[:2]
+
+
 class MultiRemote:
-    """A ``connect`` factory for several hosts, keyed on the target's hostname (§16.1)."""
+    """A ``connect`` factory for several hosts, found by the target's hostname: an address, or a host's name
+    (§16.1; phases 4 and 5 reach droplets and VMs by address)."""
 
     def __init__(self, tmp: Path, names: dict[str, str] | None = None, shell: str = "sh") -> None:
-        bin_dir = tmp / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
+        self.tmp, self.shell = tmp, shell
+        self.bin_dir = tmp / "bin"
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
         for name, text in (("docker-base", DOCKER_SHIM), ("docker", DOCKER_ENV_SHIM), ("df", DF_SHIM),
-                           ("curl", CURL_SHIM)):
-            (bin_dir / name).write_text(text)
-            (bin_dir / name).chmod(0o755)
+                           ("curl", CURL_SHIM), ("cloud-init", CLOUD_INIT_SHIM)):
+            (self.bin_dir / name).write_text(text)
+            (self.bin_dir / name).chmod(0o755)
         self.hosts: dict[str, FakeHost] = {}
+        self.by_address: dict[str, FakeHost] = {}
         self.opened: list[str] = []  # the hostnames sessions were opened to, in order
+        self.targets: list[Any] = []  # the SSHTarget of every connect, refused ones too
+        self.slipway_address = SLIPWAY_ADDRESS
         for name, address in (names or ADDRESSES).items():
-            base = tmp / f"host-{name}"
-            base.mkdir(parents=True, exist_ok=True)
-            env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(base), "STATE": str(base / "state"),
-                   "FAKE_DF_KB": str(100 * 1024 * 1024)}
-            for key, file in (("APP_LOG", "app.log"), ("DOCKER_LOG", "docker.log"), ("CURL_LOG", "curl.log"),
-                              ("ADMIN_LOG", "admin.log")):
-                env[key] = str(base / file)
-                (base / file).write_text("")
-            self.hosts[name] = FakeHost(name, address, base, ShellRemote(shell, env), env)
-        self.by_address = {h.address: h for h in self.hosts.values()}
+            self.add(name, address)
 
-    def __getitem__(self, name: str) -> FakeHost:
-        return self.hosts[name]
+    def add(self, name: str, address: str, *, host_key: str | None = None) -> FakeHost:
+        """A host that appears now (a droplet or VM once it has its address)."""
+        if name in self.hosts or address in self.by_address:
+            raise ValueError(f"a fake host named {name} or at {address} exists")
+        base = self.tmp / f"host-{name}"
+        base.mkdir(parents=True, exist_ok=True)
+        env = {"PATH": f"{self.bin_dir}:{os.environ['PATH']}", "HOME": str(base), "STATE": str(base / "state"),
+               "FAKE_DF_KB": str(100 * 1024 * 1024),
+               "SSH_CONNECTION": f"{self.slipway_address} 51234 {address} 22"}
+        for key, file in LOGS.items():
+            env[key] = str(base / file)
+            (base / file).write_text("")
+        host = FakeHost(name, address, base, ShellRemote(self.shell, env), env, host_key=host_key)
+        self.hosts[name] = host
+        self.by_address[address] = host
+        return host
+
+    def __getitem__(self, key: str) -> FakeHost:
+        """A host by its name or its address."""
+        return self.hosts[key] if key in self.hosts else self.by_address[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.hosts or key in self.by_address
+
+    # ------------------------------------------------------------------ seams
+
+    def present_key(self, key: str, public_key: str | None) -> None:
+        """The host named or at ``key`` presents ``public_key`` from now on (None: it checks no pin again)."""
+        self[key].host_key = public_key
+
+    def new_key(self, key: str) -> str:
+        """A fresh ed25519 host key for the host named or at ``key``, which presents it from now on."""
+        _private, public = ssh.generate_keypair(f"root@{self[key].name}")
+        self.present_key(key, public)
+        return public
+
+    def pinned_key(self, address: str) -> str | None:
+        """The public key the host at ``address`` presents: what a provider should pin."""
+        return self[address].host_key
+
+    def booting(self, address: str, n: int) -> None:
+        """The next ``n`` connects to ``address`` are refused, as a machine that is still booting refuses them."""
+        self[address].refuse = n
+
+    def firewalled(self, ip: str, on: bool = True) -> None:
+        """Connections from Slipway to ``ip`` time out (a cloud firewall drops them) until called with False."""
+        self[ip].firewalled = on
+
+    def set_slipway_address(self, address: str) -> None:
+        """The address every host sees Slipway connect from (``$SSH_CONNECTION``'s first field)."""
+        self.slipway_address = address
+        for host in self.hosts.values():
+            host.env["SSH_CONNECTION"] = f"{address} 51234 {host.address} 22"
+
+    # ---------------------------------------------------------------- connect
 
     def connect(self, target: Any):
-        host = self.by_address[target.hostname]
-        self.opened.append(target.hostname)
+        """A session to the target's host. Like ``ssh.open_session``, it fails when entered: an unknown name, a
+        firewall drop, a refusal while booting, or a pinned key the host doesn't present."""
+        self.targets.append(target)
 
         @asynccontextmanager
         async def session():
-            yield host.remote
+            yield self._reach(target).remote
 
         return session()
+
+    def _reach(self, target: Any) -> FakeHost:
+        where = f"{target.hostname}:{getattr(target, 'port', 22)}"
+        host = self.by_address.get(target.hostname) or self.hosts.get(target.hostname)
+        if host is None:
+            raise ssh.SSHError(f"Could not connect to {where}: [Errno 8] nodename nor servname provided, or not known")
+        if host.firewalled:
+            raise ssh.SSHError(f"Could not connect to {where}: timed out")
+        if host.refuse > 0:
+            host.refuse -= 1
+            raise ssh.SSHError(f"Could not connect to {where}: [Errno 61] Connect call failed ('{host.address}', 22)")
+        if host.host_key is not None:
+            pinned = getattr(target, "pinned_host_key", None)
+            if not pinned:
+                raise ssh.HostKeyNotPinned("Host key not verified yet: run a connection test on this host first")
+            if not _same_key(pinned, host.host_key):
+                raise ssh.HostKeyMismatch(ssh._KEY_MISMATCH)
+        self.opened.append(target.hostname)
+        return host
 
     def clear(self) -> None:
         for host in self.hosts.values():
             host.clear()
         self.opened.clear()
+        self.targets.clear()
 
 
 @dataclass

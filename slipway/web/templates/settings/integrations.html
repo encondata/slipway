@@ -1,7 +1,72 @@
 {% extends "settings/_layout.html" %}
 {% from "_macros.html" import icon %}
 {% block title %}Integrations{% endblock %}
+
+{#- One account list for the three providers (P4 §17.1, P5 §12.1): the rows need providers:read, the buttons
+    providers:write. ``card`` is one of pages.account_cards; each row is pages.account_view. -#}
+{% macro account_list(card) -%}
+{%- set p = card.provider -%}
+{%- set can_write = auth.can(Perm.PROVIDERS_WRITE) -%}
+<section class="card account-card" id="{{ p }}-accounts" data-provider="{{ p }}">
+  <div class="card-head"><span class="head-icon accent">{{ icon("cloud" if p == "digitalocean" else "hosts", "i-lg") }}</span>
+    <div><h2>{{ card.title }}</h2><p>{{ card.lede }}</p></div>
+    <span class="spacer"></span>
+    {% if can_write %}<button class="btn btn-sm btn-primary" type="button" data-account-open="{{ p }}">{{ icon("plus", "i-sm") }} Add account</button>{% endif %}
+  </div>
+  {% if card.accounts %}
+  <div class="table-wrap"><table class="table accounts">
+    <thead><tr><th>Name</th>
+      {%- if p == "digitalocean" %}<th>Region</th><th>Team</th><th>Estimate</th><th>Environments</th>
+      {%- else %}<th>URL</th><th>Networks</th><th>VMs</th>{% endif %}
+      <th>Status</th>{% if can_write %}<th class="num">Actions</th>{% endif %}</tr></thead>
+    <tbody>
+    {%- for v in card.accounts %}{% set a = v.a %}
+      <tr data-account-row="{{ a.id }}"{% if a.removed %} class="removed"{% endif %}>
+        <td><strong>{{ a.name }}</strong>
+          {%- if a.production %} <span class="chip account-chip production">Production</span>{% endif %}
+          {%- if a.removed %} <span class="badge plain" title="Removed {{ v.removed_at|dt }}; the name stays taken so old logs can still name it">Removed</span>{% endif %}
+          {%- if not a.removed %}<small class="subtle mono">{% if a.has_secret %}{{ "Token" if p != "esxi" else "Password" }} set{% if a.secret_hint and a.secret_hint != "set" %} (…{{ a.secret_hint }}){% endif %}{% else %}No {{ "token" if p != "esxi" else "password" }}{% endif %}</small>{% endif %}</td>
+        {%- if p == "digitalocean" %}
+        <td class="mono">{{ a.region or "—" }}</td>
+        <td>{{ a.team_name or "—" }}</td>
+        <td class="nowrap">About {{ v.estimate }} a month{% if v.limit %}<small class="subtle">Limit {{ v.limit }}</small>{% endif %}</td>
+        <td>{% for e in v.envs %}<span class="chip">{{ e }}</span> {% else %}<span class="subtle">None</span>{% endfor %}
+          {%- if a.ssh_open %}<div><span class="badge warning" title="An SSH source is 0.0.0.0/0 or ::/0">SSH open to the internet</span></div>{% endif %}</td>
+        {%- else %}
+        <td class="mono">{{ a.url or "—" }}
+          {%- if v.untrusted %}<div><span class="badge warning" title="Slipway doesn't connect until a person compares and trusts its certificate">Certificate not trusted</span></div>
+          {%- elif a.tls %}<small class="subtle mono" title="The pinned certificate">{{ a.tls.fingerprint_sha256[:23] }}…</small>{% endif %}</td>
+        <td>{% for n in v.networks %}<span class="chip mono">{{ n }}</span> {% else %}<span class="subtle">None</span>{% endfor %}</td>
+        <td>{% for vm in v.vms %}<span class="chip mono" title="{{ vm.environment }} {{ vm.slot }}">{{ vm.name }}</span> {% else %}<span class="subtle">None</span>{% endfor %}</td>
+        {%- endif %}
+        <td>{% if a.removed %}<span class="subtle">—</span>{% else %}<span class="badge {{ v.status[1] }}" title="{{ v.status_title }}">{{ v.status[0] }}</span>
+          {%- if v.checked_at %}<small class="subtle">{{ v.checked_at|timeago }}</small>{% endif %}
+          {%- if v.checks %}
+          <details class="account-checks"><summary>Checks</summary><ul class="check-list">
+            {%- for c in v.checks %}<li><span class="badge {{ c.badge[1] }}">{{ c.badge[0] }}</span> <span>{{ c.text }}</span></li>{% endfor %}
+          </ul></details>{% endif %}{% endif %}</td>
+        {%- if can_write %}
+        <td class="actions-cell">{% if not a.removed %}
+          <button class="btn btn-sm" type="button" data-api="POST /api/v1/provider-accounts/{{ a.id }}/test" data-success="Test finished" data-then="reload">{{ icon("sync", "i-sm") }} Test</button>
+          {%- if p != "digitalocean" %}
+          <button class="btn btn-sm" type="button" data-account-trust="{{ a.id }}" data-provider="{{ p }}" data-where="{{ a.url or a.name }}">{{ icon("fingerprint", "i-sm") }} Trust…</button>
+          {%- endif %}
+          <button class="btn btn-sm" type="button" data-account-open="{{ p }}" data-account='{{ v.edit|tojson }}'>{{ icon("edit", "i-sm") }} Edit</button>
+          <button class="btn btn-sm btn-danger" type="button" data-open="remove-account-{{ a.id }}">Remove…</button>
+        {%- endif %}</td>
+        {%- endif %}
+      </tr>
+    {%- endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <div class="card-body"><p class="muted" style="margin: 0">No {{ card.title }} accounts yet.{% if can_write %} Add one to make {{ "droplets" if p == "digitalocean" else "VMs" }} for environments.{% endif %}</p></div>
+  {% endif %}
+</section>
+{%- endmacro %}
+
 {% block settings %}
+{% if can_settings %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("globe", "i-lg") }}</span>
     <div><h2>Switchyard</h2><p>The reverse proxy that publishes instances' hostnames. Slipway creates and updates a proxy host for each hostname after every successful deploy.</p></div>
@@ -89,4 +154,10 @@
     </div>
   </form>
 </section>
+{% endif %}
+
+{% if can_accounts %}
+{% for card in cards %}{{ account_list(card) }}{% endfor %}
+{% if auth.can(Perm.PROVIDERS_WRITE) %}{% include "_account_dialogs.html" %}{% endif %}
+{% endif %}
 {% endblock %}

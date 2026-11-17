@@ -109,11 +109,22 @@ async def test_data_endpoints_by_role(make_client, monkeypatch, tmp_path):
     else (the request then runs, or is refused for another reason) for a role with it."""
     import uuid
 
+    import httpx
+
     from slipway.api.v1 import instances as instances_api
-    from slipway.services import deployer
+    from slipway.services import deployer, github
 
     c = await clients(make_client)
     monkeypatch.setattr(instances_api, "open_session", connect_to(Shell()))
+    # A first admin for an instance that never went live is checked against its branch's slipway.yml: a fake
+    # GitHub that has none answers it, so the matrix never reaches api.github.com.
+    asked: list[str] = []
+
+    def no_such_file(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    monkeypatch.setattr(github, "transport_factory", lambda: httpx.MockTransport(no_such_file))
 
     async def fake_run(instance, command, **kw):
         return ""
@@ -176,6 +187,7 @@ async def test_data_endpoints_by_role(make_client, monkeypatch, tmp_path):
                 assert r.status_code == 403, (role, method, url, r.status_code, r.text)
         r = await upload(c[role], plain_snapshot(), f"up-{role}")
         assert (r.status_code == 403) == (role not in (M, A)), (role, r.text)
+    assert asked and all(path.endswith("/contents/slipway.yml") for path in asked), asked
 
 
 async def test_conditional_data_permissions(make_client):
@@ -392,3 +404,57 @@ async def test_environment_conditional_permissions(make_client):
     adder = await client_with(make_client, "adder@example.com", ["environments:read", "environments:write"])
     r = await adder.post(f"{e}/slots", json={"host_id": str(ids["host_green"]), "update_data_server": True})
     assert r.status_code == 403 and "deployments:create" in r.json()["detail"]
+
+
+# ------------------------------------------------------------------ phase 4 test 22, phase 5 §4.1: providers and machines
+
+
+PROVIDER_PERMS = ["providers:read", "providers:write", "providers:spend", "machines:write"]
+PROVIDER_ROLES = {
+    "viewer": [],
+    "developer": ["providers:read"],
+    "maintainer": ["providers:read", "providers:spend", "machines:write"],
+    "admin": PROVIDER_PERMS,
+}
+
+
+async def _provider_grants() -> dict[str, list[str]]:
+    from sqlalchemy import select
+
+    from slipway.core.permissions import has_permission
+    from slipway.db.session import get_sessionmaker
+    from slipway.models import Role
+
+    async with get_sessionmaker()() as db:
+        roles = {r.name: set(r.permissions) for r in (await db.scalars(select(Role))).all()}
+    return {name: [p for p in PROVIDER_PERMS if has_permission(roles[name], p)] for name in PROVIDER_ROLES}
+
+
+async def test_roles_hold_the_provider_and_machine_permissions():
+    from sqlalchemy import select
+
+    from slipway.core.permissions import ALL_PERMISSIONS, PERMISSION_DESCRIPTIONS, SYSTEM_ROLES, Perm
+    from slipway.db.session import get_sessionmaker
+    from slipway.models import Role
+    from slipway.services.users import bootstrap
+
+    assert set(PROVIDER_PERMS) <= set(ALL_PERMISSIONS)
+    assert set(PERMISSION_DESCRIPTIONS) == set(Perm)  # every permission, the new ones included, says what it allows
+    assert "never tokens" in PERMISSION_DESCRIPTIONS[Perm.PROVIDERS_READ]
+    # Only admin writes accounts; viewers see none of it.
+    for name, spec in SYSTEM_ROLES.items():
+        held = {str(p) for p in spec["permissions"]}
+        assert ("providers:write" in held) is False or name == "admin", name
+    assert await _provider_grants() == PROVIDER_ROLES  # a fresh install (conftest bootstraps)
+
+    # An install bootstrapped before phases 4 and 5: the next start gives its roles the new permissions.
+    async with get_sessionmaker()() as db:
+        for role in (await db.scalars(select(Role))).all():
+            if role.name != "admin":
+                role.permissions = [p for p in role.permissions if p not in PROVIDER_PERMS]
+        await db.commit()
+    assert (await _provider_grants())["maintainer"] == []
+    async with get_sessionmaker()() as db:
+        await bootstrap(db)
+        await db.commit()
+    assert await _provider_grants() == PROVIDER_ROLES

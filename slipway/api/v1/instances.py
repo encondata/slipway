@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shlex
@@ -61,7 +62,19 @@ from slipway.schemas import (
     instance_outs,
     seeding_needs_download,
 )
-from slipway.services import audit, data, deployer, environments, jobs, manifest, snapshots, ssh, switchyard
+from slipway.services import (
+    audit,
+    backup_store,
+    data,
+    deployer,
+    environments,
+    hosts,
+    jobs,
+    manifest,
+    snapshots,
+    ssh,
+    switchyard,
+)
 from slipway.services.auth import AuthContext
 from slipway.services.github import GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
@@ -304,9 +317,42 @@ def _ssh_error(exc: ssh.SSHError) -> HTTPException:
     return HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
 
 
+def _not_built(exc: ssh.HostNotBuilt) -> HTTPException:
+    """A host a provider hasn't built yet (P4 §3.3): nothing to connect to, so 409 with its text. Not an
+    SSHError, so it never becomes ``_ssh_error``'s 502."""
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+
+def _require_host(instance: Instance) -> Host:
+    """409 for a managed environment's data owner, which has no host (P4 §3.4); else its host."""
+    if instance.host is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, data.hostless_text(instance))
+    return instance.host
+
+
+async def _refuse_owned(db: AsyncSession, host: Host, action: str) -> None:
+    """409 when ``host`` is one an environment made (a droplet or a VM): only that environment's slots run there
+    (``hosts.owned_host_refusal``, phase 4 §3.3, phase 5 §10.4)."""
+    problem = await hosts.owned_host_problem(db, host, action=action)
+    if problem:
+        raise HTTPException(status.HTTP_409_CONFLICT, problem)
+
+
+def _require_built(instance: Instance) -> None:
+    """409 with ``HostNotBuilt``'s text while the instance's host isn't built (a planned or gone droplet, a VM
+    not made yet; P4 §3.3, test 63). Phase 3's hosts are always built."""
+    host = _require_host(instance)
+    if not ssh.host_is_built(host):
+        try:
+            ssh.SSHTarget.from_host(host)
+        except ssh.HostNotBuilt as exc:
+            raise _not_built(exc) from exc
+
+
 @router.get("")
 async def list_instances(ctx: Reader, db: DB, host_id: uuid.UUID | None = None, repository_id: uuid.UUID | None = None) -> list[InstanceOut]:
-    stmt = select(Instance).order_by(Instance.name)
+    # A managed environment's data owner has no host (P4 §3.4): it is shown on its environment, not here.
+    stmt = select(Instance).where(Instance.host_id.is_not(None)).order_by(Instance.name)
     if host_id:
         stmt = stmt.where(Instance.host_id == host_id)
     if repository_id:
@@ -328,6 +374,7 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
     host = await db.get(Host, body.host_id)
     if repo is None or host is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown repository or host")
+    await _refuse_owned(db, host, "instance")
     try:
         slug = deployer.slugify(body.name)
     except ValueError as exc:
@@ -406,7 +453,8 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
 
 @router.get("/{instance_id}")
 async def get_instance(instance_id: uuid.UUID, ctx: Reader, db: DB) -> InstanceOut:
-    return await instance_out(db, await _get(db, instance_id))
+    instance = await _get(db, instance_id)
+    return await instance_out(db, instance)  # the host-less owner's host and host_id are null
 
 
 @router.get("/{instance_id}/env")
@@ -432,6 +480,10 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
             raise HTTPException(status.HTTP_409_CONFLICT, member_text(instance))
     await _check_seed_update(db, ctx, instance, data)
     changing = {f for f in _PLACEMENT_FIELDS if data.get(f) is not None and data[f] != getattr(instance, f)}
+    if "host_id" in changing:
+        target = await db.get(Host, data["host_id"])
+        if target is not None:
+            await _refuse_owned(db, target, "placement")
     if body.deploy_dir is not None and (body.deploy_dir or None) != instance.deploy_dir:
         if changing:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Change the folder on its own, without the host or build settings")
@@ -460,9 +512,10 @@ async def _change_folder(
     db: DB, instance: Instance, body: InstanceUpdate, data: dict[str, Any], ctx: AuthContext, request: Request
 ) -> Response | InstanceOut:
     """Give the instance another folder. Once it has been deployed, its files move there over SSH first."""
+    host = _require_host(instance)
     old = deployer.instance_dir(instance)
-    new = _folder_of(instance.host, instance.slug, body.deploy_dir or None)
-    await _check_folder(db, instance.host, new, instance.id)
+    new = _folder_of(host, instance.slug, body.deploy_dir or None)
+    await _check_folder(db, host, new, instance.id)
     result: list[InstanceOut] = []
 
     async def save() -> None:
@@ -481,9 +534,11 @@ async def _change_folder(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except deployer.DeployError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY, f"Could not move the files on {instance.host.name}: {exc}. Nothing was changed."
+            status.HTTP_502_BAD_GATEWAY, f"Could not move the files on {host.name}: {exc}. Nothing was changed."
         ) from exc
     audit.record(db, "instance.move", actor=ctx.user, target=instance, request=request,
                  summary=f"Moved {instance.name}'s folder from {old} to {new}" + (f": {' '.join(notes)}" if notes else ""),
@@ -574,6 +629,8 @@ async def delete_instance(instance_id: uuid.UUID, ctx: Writer, request: Request,
                 await db.commit()  # release the DB connection during SSH
                 try:
                     warning = await deployer.destroy(instance, report=report)
+                except ssh.HostNotBuilt as exc:
+                    raise _not_built(exc) from exc
                 except (ssh.SSHError, deployer.DeployError) as exc:
                     raise HTTPException(
                         status.HTTP_502_BAD_GATEWAY, f"{exc}. Retry, or delete with purge=false to keep the host untouched."
@@ -688,6 +745,8 @@ async def control(
     if body.override_hold:
         need(ctx, Perm.DATA_RESET)
         confirmed(instance, body.confirm)
+    # Before the status check: a planned slot's instance is CREATED, and its answer is that the host isn't built.
+    _require_built(instance)
     if instance.status in (InstanceStatus.CREATED, InstanceStatus.DEPLOYING):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Instance is {instance.status}")
     env = await environments.environment_of(db, instance)
@@ -723,6 +782,8 @@ async def control(
             await db.commit()  # release the DB connection during SSH
             try:
                 output = await deployer.run_on_instance(instance, command)
+            except ssh.HostNotBuilt as exc:
+                raise _not_built(exc) from exc
             except ssh.SSHError as exc:
                 raise _ssh_error(exc) from exc
             values: dict[str, Any] = {"status": InstanceStatus.STOPPED if action == "stop" else InstanceStatus.RUNNING}
@@ -752,11 +813,14 @@ def _running_text(job: Deployment) -> str:
 @router.get("/{instance_id}/containers")
 async def containers(instance_id: uuid.UUID, ctx: Reader, db: DB) -> list[dict[str, str]]:
     instance = await _get(db, instance_id)
+    _require_host(instance)
     if instance.status == InstanceStatus.CREATED:
         return []
     await db.commit()  # release the DB connection during SSH
     try:
         output = await deployer.run_on_instance(instance, deployer.status_command(instance))
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     rows = []
@@ -774,11 +838,14 @@ async def logs(
     instance_id: uuid.UUID, ctx: LogReader, db: DB, tail: Annotated[int, Query(ge=1, le=10000)] = 200
 ) -> ActionOut:
     instance = await _get(db, instance_id)
+    _require_host(instance)
     if instance.status == InstanceStatus.CREATED:
         return ActionOut(ok=True, output="")
     await db.commit()  # release the DB connection during SSH
     try:
         output = await deployer.run_on_instance(instance, deployer.logs_command(instance, tail), check=False)
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     return ActionOut(ok=True, output=output)
@@ -1007,24 +1074,41 @@ async def _check_on_host(db: AsyncSession, instance: Instance, rows: list[Backup
                          backups: str) -> tuple[str | None, int | None]:
     """``?check=true`` (§4.4): check the files on the host without waiting for a job. Returns a warning (the
     stored rows are shown as they are) and the number of other files in the folder."""
-    host = instance.host.name
+    host = data.host_label(instance)
     busy = f"A job is running for {instance.name}; showing what Slipway recorded"
     try:
         async with deployer.runner.exclusive(_runner_keys(instance)):
             if await data.active_job(db, instance.id) is not None:
                 return busy, None
             await db.commit()  # release the DB connection during SSH
-            async with open_session(ssh.SSHTarget.from_host(instance.host)) as remote:
+            async with open_session(ssh.SSHTarget.from_host(deployer.host_of(instance))) as remote:
                 _, listing = await remote.run(_listing_command(backups), check=False, timeout=data.PROBE_TIMEOUT)
                 result = await data.check_backups(remote, db, rows, backups, host)
             await db.commit()
     except deployer.RunnerBusy:
         return busy, None
-    except ssh.SSHError as exc:
+    except (ssh.SSHError, ssh.HostNotBuilt, deployer.DeployError) as exc:
         return f"Couldn't check the backups on {host} ({exc}); showing what Slipway recorded", None
     if result.warning:
         return result.warning, None
     return None, _other_files(listing, {r.name for r in rows})
+
+
+async def _check_on_slipway(db: AsyncSession, instance: Instance, rows: list[Backup]) -> str | None:
+    """``?check=true`` for a managed environment's data owner (P4 §10.5): its backups are kept on Slipway, so
+    they are checked in Slipway's storage with no SSH. A warning when a job is running."""
+    busy = f"A job is running for {data.confirm_name(instance)}; showing what Slipway recorded"
+    try:
+        async with deployer.runner.exclusive(_runner_keys(instance)):
+            if await data.active_job(db, instance.id) is not None:
+                return busy
+            result = await data.check_backups(None, db, rows, None, None)
+            await db.commit()
+    except deployer.RunnerBusy:
+        return busy
+    for row in rows:
+        await db.refresh(row)
+    return result.warning
 
 
 @router.get("/{instance_id}/backups")
@@ -1044,6 +1128,8 @@ async def list_backups(instance_id: uuid.UUID, ctx: DataReader, db: DB, check: b
     other: int | None = None
     if check and folder:
         warning, other = await _check_on_host(db, instance, rows, folder)
+    elif check and instance.host is None:
+        warning = await _check_on_slipway(db, instance, rows)
     views = await data.backup_views(db, instance, rows)
     users = {u.id: u.display_name for u in (await db.scalars(
         select(User).where(User.id.in_({r.created_by_id for r in rows if r.created_by_id})))).all()} \
@@ -1109,7 +1195,9 @@ async def delete_backup(
     await _refuse_shared_data(db, instance)
     _require_app(instance)
     row = await _backup(db, instance, backup_id)
-    host = instance.host.name
+    if data.on_slipway(row):
+        return await _delete_stored_backup(db, instance, row, ctx, request)
+    host = _require_host(instance).name
     left: str | None = None
     forgotten = False
     try:
@@ -1144,6 +1232,8 @@ async def delete_backup(
                                     f"left them in {folder}; Slipway forgot the backup")
                         else:
                             await remote.run(data.remove_backup_command(folder, [name]), timeout=data.PROBE_TIMEOUT)
+                except ssh.HostNotBuilt as exc:
+                    raise _not_built(exc) from exc
                 except ssh.SSHError as exc:
                     raise HTTPException(status.HTTP_502_BAD_GATEWAY,
                                         f"Could not delete backup {name} on {host}: {exc}. Nothing was changed.") from exc
@@ -1159,6 +1249,40 @@ async def delete_backup(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if left:
         return JSONResponse({"ok": True, "warning": left})
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def _delete_stored_backup(db: AsyncSession, instance: Instance, row: Backup, ctx: AuthContext,
+                                request: Request) -> Response:
+    """Delete a backup kept on Slipway (P4 §10.5, a managed environment's owner): its files in Slipway's storage,
+    then its row, with no SSH. P2's refusals stay: a running job, a pinned backup, one still being taken. A
+    backup whose key can't be read any more is deleted the same way."""
+    try:
+        async with deployer.runner.exclusive(_runner_keys(instance)):
+            running = await data.active_job(db, instance.id)
+            if running is not None:
+                raise HTTPException(status.HTTP_409_CONFLICT, _running_text(running))
+            pinned = await data.pinned_backups(db, instance)
+            if row.id in pinned:
+                raise HTTPException(status.HTTP_409_CONFLICT, f"This backup is pinned: {pinned[row.id]}")
+            if row.status == BackupStatus.PENDING:
+                raise HTTPException(status.HTTP_409_CONFLICT, "This backup is still being taken")
+            try:
+                removed = await asyncio.to_thread(backup_store.delete, instance.id, row)
+            except (OSError, data.DataError) as exc:
+                raise HTTPException(status.HTTP_409_CONFLICT,
+                                    f"Could not delete backup {row.name} from Slipway's storage ({type(exc).__name__}). "
+                                    "Nothing was changed.") from exc
+            forgotten = removed == 0
+            audit.record(db, "backup.delete", actor=ctx.user, target=row, request=request,
+                         details={"name": row.name, "reason": row.reason, "location": row.location,
+                                  **({"forgotten": True} if forgotten else {"sha256": row.db_sha256})},
+                         summary=f"{'Forgot' if forgotten else 'Deleted'} backup {row.name} of "
+                                 f"{data.confirm_name(instance)} (kept on Slipway)")
+            await db.execute(delete(Backup).where(Backup.id == row.id).execution_options(synchronize_session=False))
+            await db.commit()
+    except deployer.RunnerBusy as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1255,7 +1379,7 @@ async def start_over(instance_id: uuid.UUID, body: ConfirmIn, ctx: Resetter, req
         Deployment.release.is_not(None)).limit(1))
     if release is None:
         raise HTTPException(status.HTTP_409_CONFLICT,
-                            f"Slipway has no release of {instance.name} on {instance.host.name} to back up its data "
+                            f"Slipway has no release of {instance.name} on {data.host_label(instance)} to back up its data "
                             "with; deploy once more, or remove the volumes by hand")
     dep = await queue_deployment(db, instance, ctx.user, kind=DeploymentKind.RESET, options={"start_over": True})
     state = instance.app_state or {}

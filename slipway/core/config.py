@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # Largest snapshot accepted (the members added up; also the upload limit), and all stored snapshots together.
     snapshot_max_bytes: int = Field(default=20 * 1024**3, ge=1)
     snapshot_total_bytes: int = Field(default=100 * 1024**3, ge=1)
+    # All backups Slipway keeps on this server for environments whose data has no host of its own
+    # (DigitalOcean managed data, phase 4), added up.
+    backup_total_bytes: int = Field(default=100 * 1024**3, ge=1)
     # Snapshot transfers (takes, uploads, checks, downloads) and passphrase key derivations run at once.
     snapshot_transfers: int = Field(default=2, ge=1, le=8)
     snapshot_kdf_slots: int = Field(default=2, ge=1, le=4)
@@ -88,6 +91,23 @@ class Settings(BaseSettings):
     backup_free_margin_mb: int = Field(default=1024, ge=0)
     # Backups taken by hand ("Back up now") that one instance may keep.
     manual_backups_max: int = Field(default=10, ge=1)
+
+    # Certificates for DigitalOcean load balancers (phase 4): Let's Encrypt's directories, and how
+    # often the renewal loop looks for certificates due, in seconds (0 turns the loop off).
+    acme_directory: str = "https://acme-v02.api.letsencrypt.org/directory"
+    acme_staging_directory: str = "https://acme-staging-v02.api.letsencrypt.org/directory"
+    cert_renew_interval: int = Field(default=21600, ge=0)
+
+    # Terraform for Proxmox VMs (phase 5). The binary is an absolute path or a name on PATH; the CLI
+    # config is the image's mirror-only one (docker/terraformrc), so `init` never goes online.
+    terraform_binary: str = "terraform"
+    terraform_cli_config: str = "/etc/slipway/terraformrc"
+    # Terraform's working folders, one per VM, mode 700. Empty means <storage_dir>/terraform.
+    terraform_dir: str = ""
+    # Terraform processes at once across Slipway.
+    terraform_parallel: int = Field(default=2, ge=1, le=8)
+    # The TCP probe of a new VM's address before it is made; tests patch the probe itself.
+    vm_address_probe: bool = True
 
     @field_validator("github_allowed_users", "github_allowed_orgs", mode="before")
     @classmethod

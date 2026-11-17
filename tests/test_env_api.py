@@ -837,3 +837,18 @@ async def test_add_and_remove_a_slot_and_delete(make_client, github):
     assert (await _get(Environment, ids["env"])).status == "deleting"
     r = await m.request("DELETE", e, json={"confirm": "uat"})
     assert r.status_code == 409
+
+
+async def test_phase3_delete_of_an_environment_that_never_held_data_keeps_phase3s_snapshot_answer(make_client):
+    """P4 §13's never-held rule is for DigitalOcean, VM and production environments only: a phase 3 environment
+    on SSH hosts that never went live, asked for a snapshot first, still gets the snapshot's own refusal, and a
+    Delete without one carries no note."""
+    c = await clients(make_client)
+    ids = await _world(slots=("blue", "data"), live=(), active=None)
+    m, e = c["maintainer"], f"/api/v1/environments/{ids['env']}"
+    r = await m.request("DELETE", e, json={"confirm": "uat", "snapshot": {"name": "uat-before-delete"}})
+    assert r.status_code == 409, r.text
+    assert "nothing to snapshot" not in r.json()["detail"]
+    r = await m.request("DELETE", e, json={"confirm": "uat"})
+    assert r.status_code == 202, r.text
+    assert r.json()["kind"] == "teardown" and "note" not in r.json()

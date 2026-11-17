@@ -25,6 +25,18 @@
  *   <div data-load=... data-lazy>                           (loaded when its dialog opens, not with the page)
  *   <div data-render="traffic_plan">                        (the Traffic card's rows, or with data-mode="list" Activate's plan)
  *   <form data-env-flow>                                    (the New environment flow, wireEnvFlow)
+ *
+ * New VMs (phase 5 §12.2-12.6):
+ *   <select data-vm-host="blue"> + <div data-vm-form="blue">   (New VM on <account>: network, address, size; vmSpec)
+ *   <form data-vm-slot-form>                                (Add a slot: a New VM option sends {machine} for host_id)
+ *   <div data-render="vm_live">                             (GET .../machines: power, Lost, Hidden, Off, Forget)
+ *   <div data-render="vm_snapshots">                        (the VM snapshots card's rows and buttons)
+ *   <input type="number" data-scale="1024">                 (typed in one unit, sent in another: GB to MB)
+ *
+ * DigitalOcean (phase 4 §17.2-17.5):
+ *   <div data-render="cloud_objects">                       (the DigitalOcean card's objects; live callouts go to [data-cloud-callouts])
+ *   <form data-cost-confirm data-old-cents="4700">          (Check the price, then the new total typed: wireCostForm)
+ *   <div data-render="grow_sizes">                          (the Grow dialog's selects, from the account's catalog)
  */
 (function () {
   "use strict";
@@ -51,7 +63,10 @@
       if (res.status === 401 && !/^\/api\/v1\/auth\/login(?:[?#]|$)/.test(url) && location.pathname !== "/login") {
         location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
       }
-      throw new Error(errorText(data) || res.statusText || "Request failed");
+      const err = new Error(errorText(data) || res.statusText || "Request failed");
+      err.status = res.status; // a refusal's body stays readable (an untrusted certificate, say)
+      err.data = data;
+      throw err;
     }
     return data;
   }
@@ -161,7 +176,11 @@
   // ------------------------------------------------------------ forms
   function coerce(input) {
     if (input.type === "checkbox") return input.checked;
-    if (input.type === "number") return input.value === "" ? null : Number(input.value);
+    // data-scale: a number shown in one unit and sent in another (a VM's memory typed in GB, sent in MB).
+    if (input.type === "number") {
+      if (input.value === "") return null;
+      return input.dataset.scale ? Math.round(Number(input.value) * Number(input.dataset.scale)) : Number(input.value);
+    }
     if (input.dataset.type === "json") return input.value ? JSON.parse(input.value) : null;
     return input.value;
   }
@@ -247,6 +266,7 @@
     let body;
     try { body = serialize(form); } catch (err) { return toast("Invalid input: " + err.message, "error"); }
     omitUnchanged(form, body);
+    if (form.dataset.vmSlotForm !== undefined) vmSlotBody(form, body); // Add a slot on a new VM (P5 §9.5)
     if (submit && submit.name) body[submit.name] = submit.value === "true" ? true : submit.value === "false" ? false : submit.value;
     setLoading(submit, true);
     formError(form, "");
@@ -338,8 +358,15 @@
   function checkMustEqual(form) {
     const inputs = $$("[data-must-equal]", form);
     if (!inputs.length) return;
-    const ok = inputs.every((i) => i.closest("[hidden]") || i.value === i.dataset.mustEqual);
-    $$('[type="submit"]', form).forEach((b) => { b.disabled = !ok; });
+    const ok = inputs.every((i) => {
+      if (i.dataset.costInput !== undefined) return Boolean(i.dataset.mustEqual) && i.value === i.dataset.mustEqual;
+      return i.closest("[hidden]") || i.value === i.dataset.mustEqual;
+    });
+    // data-plan-blocked="1": the traffic plan hasn't loaded, failed to, or has blockers; data-blocked: the
+    // dialog can't succeed (a production Delete without a snapshot).
+    $$('[type="submit"]', form).forEach((b) => {
+      b.disabled = !ok || b.dataset.planBlocked === "1" || b.dataset.blocked !== undefined;
+    });
   }
 
   // data-fill: {"k": v} sets [name=k] (a checkbox is ticked by a true v), [data-slot=k] text, and shows
@@ -363,8 +390,12 @@
     $$("[data-form-error]", dlg).forEach((el) => el.remove());
     if (values) fill(dlg, values);
     $$("[data-must-equal]", dlg).forEach((i) => { i.value = ""; }); // the name is typed again for each action
-    $$("form", dlg).forEach((form) => { form.dispatchEvent(new Event("change")); syncRequired(form); checkMustEqual(form); });
+    $$("form", dlg).forEach((form) => {
+      if (form.dataset.costConfirm !== undefined) costReset(form);
+      form.dispatchEvent(new Event("change")); syncRequired(form); checkMustEqual(form);
+    });
     $$("[data-lazy][data-load]", dlg).forEach(load); // e.g. Activate's plan, read when the dialog opens
+    $$("form[data-cost-auto]", dlg).forEach((form) => costPrice(form, $("[data-cost-price]", form)));
     dlg.showModal();
     const f = $("input:not([type=hidden]), textarea, select", dlg);
     if (f) f.focus();
@@ -477,6 +508,9 @@
     deploy: "Building", restore: "Restoring", reset: "Resetting", rollback: "Rolling back", backup: "Backing up",
     snapshot: "Taking snapshot", admin: "Creating admin", content: "Adding content",
     activate: "Activating", publish: "Publishing", discard: "Discarding", remove_slot: "Removing", teardown: "Deleting",
+    // Phases 4 and 5 (P4 §17.5, Decision 33).
+    certificate: "Renewing", deactivate: "Taking off the air", vm_snapshot: "Taking VM snapshot",
+    vm_revert: "Reverting", vm_drop: "Deleting VM snapshot",
   };
   function statusBadge(status, kind) {
     const known = STATUS[status];
@@ -487,6 +521,7 @@
     return [label, known[1]];
   }
 
+  // A step's badge by its status; every job kind's steps use the same five (the five new kinds included).
   const STEP_BADGE = { succeeded: "success", failed: "error", running: "warning spin", warning: "warning", skipped: "plain" };
   function renderSteps(steps, active) {
     const list = $("[data-steps]");
@@ -578,7 +613,7 @@
         return;
       }
       parts.push('<div class="table-wrap"><table class="table backups"><thead><tr><th>Taken</th><th>Why</th><th>Data</th>' +
-        '<th>Size</th><th>On host</th><th></th></tr></thead><tbody>' + rows.map((b) => backupRow(b, ds.instance, ctx)).join("") +
+        '<th>Size</th><th>' + esc(ds.storedHeader || "On host") + '</th><th></th></tr></thead><tbody>' + rows.map((b) => backupRow(b, ds.instance, ctx)).join("") +
         "</tbody></table></div>");
       const notes = [];
       if (ds.hasFilesCap !== undefined) {
@@ -596,9 +631,306 @@
       el.innerHTML = trafficPlanHtml(data, el.dataset);
       const form = el.closest && el.closest("form");
       const submit = form && $("[data-plan-submit]", form);
-      if (submit) submit.disabled = planBlockers(data).length > 0;
+      if (submit) {
+        const blocked = planBlockers(data).length > 0;
+        submit.dataset.planBlocked = blocked ? "1" : "";
+        submit.disabled = blocked;
+        if (form && $("[data-must-equal]", form)) checkMustEqual(form);
+      }
+    },
+    // GET /environments/{id}/cloud (P4 §16, §17.3): each object read live, its status and price a month; the
+    // live callouts (a droplet powered off, the active slot's droplet gone, an object changed by hand).
+    cloud_objects(el, data) {
+      el.innerHTML = cloudObjectsHtml(data, el.dataset);
+      const box = document.querySelector("[data-cloud-callouts]");
+      if (box) box.innerHTML = cloudCallouts(data, el.dataset).join("");
+    },
+    // GET /provider-accounts/{id}/catalog (the Grow dialog): every size offered, the current one selected.
+    grow_sizes(el, data) {
+      const form = el.closest("form");
+      el.innerHTML = "";
+      if (!form) return;
+      const ds = el.dataset;
+      const droplet = $("[data-grow-droplet]", form), db = $("[data-grow-db]", form), standby = $("[data-grow-standby]", form);
+      const fill = () => {
+        if (droplet) fillOptions(droplet, dropletOptions(data), ds.droplet);
+        const nodes = standby && standby.checked ? "2" : String(ds.nodes || "1");
+        if (db) fillOptions(db, ((data && data.db_sizes) || {})[nodes] || [], db.value || ds.db, (v) => v);
+      };
+      fill();
+      if (standby && !standby._grow) { standby._grow = true; standby.addEventListener("change", fill); }
     },
   };
+
+  // ---------------------------------------------------- DigitalOcean (P4 §12, §17.2-17.5)
+  const DO_KIND = {
+    droplet: "Droplet", database: "Database cluster", load_balancer: "Load balancer", vpc: "VPC", firewall: "Cloud firewall",
+    certificate: "Certificate", bucket: "Bucket", spaces_key: "Spaces key",
+  };
+  const DO_STATUS = { ok: ["OK", "success"], gone: ["Gone", "error"], changed: ["Changed", "error"] };
+  // Cents as the figure people type ("84.00"), and as a sum ("$84.00").
+  const figure = (cents) => { const c = Math.abs(Number(cents) || 0); return `${Number(cents) < 0 ? "-" : ""}${Math.floor(c / 100)}.${String(c % 100).padStart(2, "0")}`; };
+  const money = (cents) => (cents === null || cents === undefined ? "—" : Number(cents) === 0 ? "No charge" : `$${figure(cents)}`);
+  const deltaText = (oldCents, newCents) => { const d = Number(newCents) - Number(oldCents); return `${d >= 0 ? "+" : "-"}$${figure(Math.abs(d))} a month`; };
+
+  function cloudObjectsHtml(data, ds) {
+    const objects = (data && data.objects) || [], pending = (data && data.pending) || [];
+    if (!objects.length && !pending.length) {
+      return '<div class="card-body"><p class="muted" style="margin: 0">Nothing on DigitalOcean yet: the first deploy makes it.</p></div>';
+    }
+    const rows = objects.map((o) => {
+      const st = DO_STATUS[o.status] || [o.status, ""];
+      const power = o.kind === "droplet" && o.power && o.power !== "active" ? ` <span class="badge warning">${esc(o.power === "off" ? "Powered off" : o.power)}</span>` : "";
+      return `<tr data-object="${esc(o.kind)}"><td>${esc(DO_KIND[o.kind] || o.kind)}</td><td class="mono">${esc(o.name)}${o.detail ? `<div class="subtle">${esc(o.detail)}</div>` : ""}</td>` +
+        `<td><span class="badge ${st[1]}">${esc(st[0])}</span>${power}</td><td class="nowrap">${esc(money(o.monthly_cents))}</td></tr>`;
+    });
+    pending.forEach((p) => {
+      rows.push(`<tr data-object="${esc(p.kind)}" data-pending><td>${esc(DO_KIND[p.kind] || p.kind)}</td><td class="mono">${esc(p.name)}</td>` +
+        `<td><span class="badge warning" title="${esc(p.sent_at ? "Sent " + utc(p.sent_at) : "")}">Create not answered yet</span></td><td class="subtle">—</td></tr>`);
+    });
+    return '<div class="table-wrap"><table class="table cloud-objects"><thead><tr><th>Kind</th><th>Name</th><th>Status</th><th>Monthly</th></tr></thead><tbody>' +
+      rows.join("") + "</tbody></table></div>";
+  }
+
+  // The callouts only a live read can give (§17.3, §15.13): a droplet left powered off, the active slot's droplet
+  // gone (when the page didn't already say so), an object that no longer looks like Slipway's.
+  function cloudCallouts(data, ds) {
+    const out = [];
+    const callout = (cls, key, text, extra) => `<div class="callout ${cls}" data-callout="${esc(key)}"${cls === "error" ? ' role="alert"' : ""}><div>${esc(text)}.${extra || ""}</div></div>`;
+    const slot = ds.activeSlot, droplet = ds.activeDroplet;
+    ((data && data.notes) || []).forEach((note) => {
+      // The read's own "Droplet <active> is gone" note: the gone-<slot> callout below (or the page's) says it.
+      if (droplet && note.startsWith(`Droplet ${droplet} is gone from DigitalOcean`)) return;
+      const off = /^(\S+) is powered off$/.exec(note);
+      out.push(callout("warning", off ? "off-" + off[1] : "note", note, off ? " The next deploy to its slot powers it on first." : ""));
+    });
+    ((data && data.objects) || []).forEach((o) => {
+      if (o.kind === "droplet" && o.status === "gone" && droplet && o.name === droplet && slot &&
+          !document.querySelector(`[data-callout="gone-${slot}"]`)) {
+        const button = ds.canDeploy !== undefined
+          ? `<div class="row wrap" style="margin-top: 10px"><button class="btn btn-sm btn-primary" type="button" data-api="POST /api/v1/environments/${esc(ds.env)}/deploy" data-body="${esc(JSON.stringify({ slot }))}" data-then="reload" data-success="Deploy queued">Deploy to ${esc(slot)}</button></div>` : "";
+        out.push(callout("error", "gone-" + slot, `${slot}'s droplet is gone, so nothing answers through the load balancer: deploy to ${slot} to build it again`, button));
+      } else if (o.status === "changed") {
+        out.push(callout("error", "changed-" + o.name, `${DO_KIND[o.kind] || o.kind} ${o.name} no longer looks like Slipway's: Slipway changes nothing on it until it does`));
+      }
+    });
+    return out;
+  }
+
+  // ---------------------------------------------------- VMs on the environment page (P5 §12.3, §12.6 item 2)
+  // The build chips only a live read gives (pages.BUILD_CHIPS and BUILD_TITLES say the same).
+  const VM_CHIPS = {
+    lost: ["Lost", "error", "A ready VM the hypervisor doesn't have any more, or has without Slipway's markers"],
+    hidden: ["Hidden", "warning", "Proxmox says the VM's id is in use, but the token can't see it"],
+    off: ["Off", "warning", "The VM is powered off"],
+  };
+  const VM_POWER = { running: "Running", stopped: "Off", suspended: "Suspended" };
+  const VM_WHY = { manual: "By hand", pre_resize: "Before a resize", pre_revert: "Before a revert" };
+  const VM_SNAP_STATUS = { pending: ["Being taken", "warning"], failed: ["Failed", "error"], missing: ["Missing", "error"] };
+
+  // What GET /environments/{id}/machines says of one VM: its chip (Lost, Hidden, Off or none), its power text,
+  // whether Forget the VM applies (lost) and whether Remove would meet blockers forget_vms gets past all of. That
+  // last is the answer's own ``forgettable`` (read with ?blockers=true, as Remove slot's check reads them), never
+  // guessed from the power read.
+  function vmLiveView(m) {
+    const live = m && m.live, ready = m && m.stage === "ready";
+    const out = { chip: null, text: "", title: "", lost: false, off: false, forgettable: Boolean(m && m.forgettable === true) };
+    if (!live) { out.text = ready ? "Not read" : ""; return out; }
+    if (live.error) {
+      out.text = live.error === "busy" ? "Busy: the account" : "Couldn't check";
+      out.title = live.detail || live.error;
+      return out;
+    }
+    if (live.hidden) { out.chip = "hidden"; }
+    else if (ready && (live.lost || (live.exists && live.ours === false))) {
+      out.chip = "lost"; out.lost = Boolean(live.lost);
+      out.title = live.why_not_ours || "";
+    } else if (ready && live.power === "stopped") { out.chip = "off"; out.off = true; }
+    if (live.busy) out.text = `Busy: ${String(live.busy).split(" (")[0]}`;
+    else if (out.chip === "lost") out.text = live.lost ? "Gone" : "Not Slipway's";
+    else if (out.chip === "hidden") out.text = "Can't be seen";
+    else out.text = VM_POWER[live.power] || live.power || "";
+    if (live.busy) out.title = live.busy;
+    return out;
+  }
+  function vmLiveHtml(m) {
+    const v = vmLiveView(m);
+    const chip = v.chip ? `<span class="badge build-chip ${VM_CHIPS[v.chip][1]}" title="${esc(VM_CHIPS[v.chip][2])}">${esc(VM_CHIPS[v.chip][0])}</span>` : "";
+    const power = v.text ? `<span class="vm-power${v.off ? " off" : ""}" title="${esc(v.title)}">${esc(v.text)}</span>` : "";
+    return { chip, power, view: v };
+  }
+  // The Slots card's read (no blockers): power and chips only. Whether Remove and Delete offer forget_vms is
+  // read by their dialogs when they open (renderers.vm_forget).
+  renderers.vm_live = function (el, answer) {
+    const list = Array.isArray(answer) ? answer : [];
+    list.forEach((m) => {
+      const { chip, power, view } = vmLiveHtml(m);
+      $$(`[data-vm-live="${m.slot}"]`).forEach((cell) => { cell.innerHTML = power; });
+      if (chip) $$(`[data-vm-chip="${m.slot}"]`).forEach((cell) => { cell.innerHTML = chip; });
+      $$(`[data-forget-slot="${m.slot}"]`).forEach((b) => { b.hidden = !view.lost; });
+      if (view.off || view.chip) $$(`[data-vm-error="${m.slot}"]`).forEach((e) => { e.hidden = false; });
+    });
+    el.innerHTML = list.some((m) => m.live)
+      ? '<span class="subtle">Power and state as the hypervisors show them now.</span>' : "";
+  };
+
+  // GET /environments/{id}/machines?blockers=true, read when Remove slot, Delete or a retry's dialog opens:
+  // the forget_vms box shows only when the VMs' removal has blockers and forget_vms gets past every one (what
+  // the job's check then does), and names them. ``data-forget-scope`` is ``slot`` (the dialog's slot, filled by
+  // its button, or ``data-forget-slot``) or ``all`` (Delete, a teardown's retry). A VM whose blockers weren't
+  // read in time, or a failed read, leaves the box as the page rendered it.
+  function vmForgetOffer(list, scope, slot) {
+    const vms = (Array.isArray(list) ? list : []).filter((m) => scope !== "slot" || m.slot === slot);
+    if (!vms.length) return { known: true, offer: false, texts: [] };
+    if (vms.some((m) => m.forgettable === null || m.forgettable === undefined)) return { known: false, offer: false, texts: [] };
+    const blocked = vms.filter((m) => (m.blockers || []).length);
+    const offer = blocked.length > 0 && blocked.every((m) => m.forgettable === true);
+    const texts = offer ? [].concat(...blocked.map((m) => m.blockers.map((b) => String(b.text).replace(/\.$/, "")))) : [];
+    return { known: true, offer, texts };
+  }
+  renderers.vm_forget = function (el, answer) {
+    const scope = el.dataset.forgetScope || "all";
+    const form = el.closest && el.closest("form");
+    const slotEl = form && $('[data-slot="slot"]', form);
+    const slot = el.dataset.forgetSlot || (slotEl ? slotEl.textContent : "");
+    const got = vmForgetOffer(answer, scope, slot);
+    el.textContent = got.texts.length ? `${got.texts.join(". ")}.` : "";
+    if (!got.known) return;
+    const box = el.closest && (el.closest("[data-remove-forget]") || el.closest("[data-forget-vms]"));
+    if (!box) return;
+    box.hidden = !got.offer;
+    if (!got.offer) $$('[name="forget_vms"]', box).forEach((c) => { c.checked = false; });
+    if (form) { syncRequired(form); checkMustEqual(form); }
+  };
+
+  // GET /environments/{id}/vm-snapshots (S22's object): the card's rows, with Revert and Delete opening their
+  // dialogs (#vm-revert, #vm-drop) filled from the row. ``ds`` is the card's dataset (env, account, can-act,
+  // none-text).
+  function vmSnapshotsHtml(data, ds) {
+    const d = data || {}, parts = [];
+    if (d.snapshot_mode === "none") {
+      return `<div class="card-body"><p class="muted" style="margin: 0">${esc(ds.noneText || "This VM's storage can't take VM snapshots. Backups (above) still work.")}</p></div>`;
+    }
+    if (d.error) parts.push(`<div class="card-body"><div class="callout warning">${esc(d.detail || d.error)}</div></div>`);
+    const rows = d.snapshots || [];
+    if (!rows.length) {
+      parts.push(`<div class="card-body"><p class="muted" style="margin: 0">No VM snapshots of ${esc(d.vm || "the VM")} yet.</p></div>`);
+      return parts.join("");
+    }
+    const act = ds.canAct !== undefined, account = ds.account || "the hypervisor";
+    const base = `/api/v1/environments/${ds.env}/vm-snapshots`;
+    const body = rows.map((r) => {
+      const st = VM_SNAP_STATUS[r.status];
+      const on = r.on_hypervisor === true ? '<span class="badge success">Yes</span>'
+        : r.on_hypervisor === false ? '<span class="badge error">Not there any more</span>' : '<span class="subtle">Couldn\'t check</span>';
+      const lost = (r.backups_after || []).length
+        ? `Everything written since is lost, including these backups: ${r.backups_after.join(", ")}.` : "Everything written since is lost.";
+      let actions = "";
+      if (act) {
+        const revert = r.revert || {}, drop = r.drop || {};
+        const rf = { action: `POST ${base}/${r.id}/revert`, snapshot: r.name, taken: utc(r.taken_at), sha7: sha7(r.commit_sha) || "none", lost };
+        actions += revert.available
+          ? `<button class="btn btn-sm btn-danger" type="button" data-open="vm-revert" data-fill="${esc(JSON.stringify(rf))}">Revert…</button>`
+          : `<button class="btn btn-sm" type="button" disabled title="${esc(revert.reason || "")}">Revert…</button>`;
+        const df = { action: `DELETE ${base}/${r.id}`, snapshot: r.name };
+        actions += drop.available
+          ? ` <button class="btn btn-sm" type="button" data-open="vm-drop" data-fill="${esc(JSON.stringify(df))}">Delete…</button>`
+          : ` <button class="btn btn-sm" type="button" disabled title="${esc(drop.reason || "")}">Delete…</button>`;
+        if (!revert.available && revert.reason) actions += `<div class="subtle">${esc(revert.reason)}</div>`;
+      }
+      return `<tr data-vm-snapshot="${esc(r.name)}"><td class="mono">${esc(r.name)}${r.newest ? ' <span class="chip">Newest</span>' : ""}` +
+        `${st ? ` <span class="badge ${st[1]}">${esc(st[0])}</span>` : ""}</td>` +
+        `<td class="nowrap">${esc(utc(r.taken_at))}</td><td>${esc(VM_WHY[r.reason] || r.reason)}</td>` +
+        `<td class="mono">${esc(sha7(r.commit_sha) || "—")}</td><td>${esc(r.note || "")}</td><td>${on}</td>` +
+        `<td class="actions-cell">${actions}</td></tr>`;
+    }).join("");
+    parts.push('<div class="table-wrap"><table class="table vm-snapshots"><thead><tr><th>Name</th><th>Taken</th><th>Why</th>' +
+      `<th>Commit</th><th>Note</th><th>On ${esc(account)}</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`);
+    return parts.join("");
+  }
+  renderers.vm_snapshots = function (el, data) { el.innerHTML = vmSnapshotsHtml(data, el.dataset); };
+
+  // The estimate as a table (§12.1): every line, the total and the foot.
+  function costTableHtml(cost) {
+    if (!cost) return "";
+    const rows = (cost.lines || []).map((l) => `<tr><td>${esc(l.label)}</td><td class="nowrap">${esc(money(l.cents))}</td></tr>`).join("");
+    return '<div class="table-wrap"><table class="table cost-table"><thead><tr><th>What</th><th>A month</th></tr></thead>' +
+      `<tbody>${rows}</tbody><tfoot><tr><th>Total</th><th class="nowrap">$${esc(cost.total || figure(cost.total_cents))}</th></tr></tfoot></table></div>` +
+      (cost.note ? `<p class="help" style="margin: 0">${esc(cost.note)}</p>` : "");
+  }
+  renderers.cost = function (el, cost) {
+    el.innerHTML = costTableHtml(cost);
+    const box = el.closest("form") || document;
+    $$("[data-cost-figure]", box).forEach((f) => { f.textContent = cost ? cost.total : ""; });
+  };
+
+  const dropletOptions = (data) => ((data && data.sizes) || []).map((z) => ({
+    value: z.slug,
+    label: `${z.slug} · ${z.vcpus} vCPU, ${Math.round((Number(z.memory) || 0) / 1024 * 10) / 10} GB, ${z.disk} GB` +
+      (z.price_monthly !== undefined && z.price_monthly !== null ? ` · $${Number(z.price_monthly).toFixed(2)} a month` : ""),
+  }));
+
+  // Fills a select with {value, label} options (or plain values), keeping ``keep`` chosen when it is offered.
+  function fillOptions(select, items, keep, label) {
+    const opts = items.map((it) => (typeof it === "string" ? { value: it, label: label ? label(it) : it } : it));
+    const first = select.dataset.placeholder ? `<option value="">${esc(select.dataset.placeholder)}</option>` : "";
+    select.innerHTML = first + opts.map((o) => `<option value="${esc(o.value)}"${o.value === keep ? " selected" : ""}>${esc(o.label)}</option>`).join("");
+    if (keep && opts.some((o) => o.value === keep)) select.value = keep;
+  }
+
+  // ------------------------------------- a cost a person confirms by typing it (Add slot, Grow; P4 §12.2)
+  // <form data-cost-confirm data-old-cents>: Check the price sends the form without confirm_cost as the API's
+  // dry run (?check=true, ChangeCheckOut: every refusal runs, nothing is written); its ``cost.total`` is the new
+  // total, which the [data-cost-input] then must equal. Changing anything else in the form asks for the price
+  // again.
+  function costReset(form) {
+    const box = $("[data-cost-box]", form), input = $("[data-cost-input]", form);
+    if (box) box.hidden = true;
+    if (input) { input.value = ""; input.dataset.mustEqual = ""; }
+    checkMustEqual(form);
+  }
+
+  async function costPrice(form, btn) {
+    const [method, url] = form.dataset.form.split(" ");
+    let body;
+    try { body = serialize(form); } catch (err) { return toast("Invalid input: " + err.message, "error"); }
+    delete body.confirm_cost;
+    if (btn) setLoading(btn, true);
+    formError(form, "");
+    const res = await request(method, url + (url.indexOf("?") === -1 ? "?" : "&") + "check=true", body);
+    if (btn) setLoading(btn, false);
+    const cost = res.status === 200 && res.data && res.data.cost;
+    if (!cost || !cost.total) {
+      const text = res.status === 200 ? "Slipway couldn't price this change" : res.text;
+      if (!formError(form, text)) toast(text, "error");
+      return;
+    }
+    const total = String(cost.total);
+    const cents = Number(cost.total_cents);
+    const box = $("[data-cost-box]", form), input = $("[data-cost-input]", form), text = $("[data-cost-text]", form);
+    $$("[data-cost-figure]", form).forEach((f) => { f.textContent = total; });
+    if (text) {
+      const old = form.dataset.oldCents;
+      const delta = cost.delta || (old !== undefined && old !== "" ? deltaText(old, cents) : "");
+      text.textContent = `The new estimate is about $${total} a month` + (delta ? ` (${delta})` : "") + ".";
+    }
+    if (input) { input.dataset.mustEqual = total; input.value = ""; }
+    if (box) box.hidden = false;
+    checkMustEqual(form);
+    if (input && input.focus) input.focus();
+  }
+
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target.closest && ev.target.closest("[data-cost-price]");
+    if (!btn) return;
+    const form = btn.closest("form[data-cost-confirm]");
+    if (form) { ev.preventDefault(); costPrice(form, btn); }
+  });
+  document.addEventListener("change", (ev) => {
+    const el = ev.target;
+    const form = el && el.closest && el.closest("form[data-cost-confirm]");
+    if (form && el.dataset && el.dataset.costInput === undefined && el.name) costReset(form);
+  });
 
   // What each planned change shows as (traffic.Change.action for Switchyard, its status for DNS).
   const SWITCH_STATE = {
@@ -625,6 +957,8 @@
       return out;
     };
     const swc = byName(sw), dnsc = byName(dns);
+    // The load balancer (do_lb) plans one change for every name: its targets (P4 §11.6).
+    const whole = ds.switchLabel && sw && (sw.changes || []).length === 1 ? sw.changes[0] : null;
     const blockedBy = (plan, host) => ((plan && plan.blockers) || []).filter((b) => String(b).indexOf(host) >= 0);
     const badge = (pair, title) => `<span class="badge ${pair[1]}"${title ? ` title="${esc(title)}"` : ""}>${esc(pair[0])}</span>`;
     const upstream = (c) => {
@@ -646,7 +980,7 @@
       blockers.forEach((b) => items.push(`<li class="blocked">${badge(["Blocked", "error"])} ${esc(b)}</li>`));
       if (!items.length) items.push('<li class="subtle">Every name already points where Activate would point it.</li>');
       return `<ul class="plan-list">${items.join("")}</ul>` +
-        (blockers.length ? '<p class="error-text" style="margin: 0">Slipway changed nothing. Fix these in Switchyard or Cloudflare, then open this again.</p>' : "");
+        (blockers.length ? `<p class="error-text" style="margin: 0">Slipway changed nothing. Fix these in ${ds.switchLabel ? "DigitalOcean" : "Switchyard"} or Cloudflare, then open this again.</p>` : "");
     }
 
     const rows = routes.map((r) => {
@@ -656,7 +990,7 @@
       let swCell;
       if (!sw) swCell = '<span class="subtle">Not used</span>';
       else if (sb.length) swCell = `${badge(["Blocked", "error"], sb.join("\n"))} <span class="subtle">${esc(sb.join("; "))}</span>`;
-      else if (s) swCell = badge(SWITCH_STATE[s.action] || [s.action, ""], s.summary);
+      else if (s || whole) swCell = badge(SWITCH_STATE[(s || whole).action] || [(s || whole).action, ""], (s || whole).summary);
       else swCell = '<span class="subtle">Not planned</span>';
       let dnsCell;
       if (!dns) dnsCell = '<span class="subtle">Off</span>';
@@ -680,7 +1014,7 @@
       ? `<div class="card-body"><div class="callout error">${other.map((b) => esc(b)).join("<br>")}</div></div>` : "";
     if (!rows.length) return head + '<div class="card-body"><p class="muted" style="margin: 0">No public names yet: they come from slipway.yml with the first deploy.</p></div>';
     return head + '<div class="table-wrap"><table class="table traffic"><thead><tr><th>Name</th><th>Follows</th><th>Now</th>' +
-      `<th>Switchyard</th><th>DNS</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+      `<th>${esc(ds.switchLabel || "Switchyard")}</th><th>DNS</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
   }
 
   const BACKUP_WHY = {
@@ -704,7 +1038,9 @@
     if (b.dirty_note) chips.push([b.dirty_note.replace("Holds data changed by failed ", "after failed ").replace(/ \(.*\)$/, ""), b.dirty_note]);
     let size = b.db_bytes === null || b.db_bytes === undefined ? "—" : humanBytes(b.db_bytes);
     if (b.has_files && b.files_bytes !== null && b.files_bytes !== undefined) size += ` + ${humanBytes(b.files_bytes)} ${ctx.labels.files.toLowerCase()}`;
-    const onHost = b.status === "ready" ? (b.checked_at ? ["On host", "success"] : ["Not checked", ""]) : (ON_HOST[b.status] || [b.status, ""]);
+    // A managed environment's backups are kept on this Slipway server (P4 §10.5); pages.backup_present agrees.
+    const stored = b.location === "slipway" ? ["On Slipway", "success"] : ["On host", "success"];
+    const onHost = b.status === "ready" ? (b.checked_at ? stored : ["Not checked", ""]) : (ON_HOST[b.status] || [b.status, ""]);
     const dataText = [sha7(b.commit_sha), b.revision_short || ""].filter(Boolean).join(" · ") || "—";
     const fillValues = {
       backup_id: b.id, name: b.name, taken: utc(b.taken_at), why, release: sha7(b.commit_sha) || "—",
@@ -734,12 +1070,28 @@
       `<td><span class="badge ${onHost[1]}">${esc(onHost[0])}</span></td><td class="actions-cell">${actions}</td></tr>`;
   }
 
+  // A traffic plan's dialog button stays off while the plan is read, and after a read that failed: only
+  // renderers.traffic_plan, with the plan in hand and no blocker, lets it on.
+  function planSubmitOf(el) {
+    if (el.dataset.render !== "traffic_plan") return null;
+    const form = el.closest && el.closest("form");
+    return (form && $("[data-plan-submit]", form)) || null;
+  }
+  function blockPlan(submit) {
+    if (!submit) return;
+    submit.dataset.planBlocked = "1";
+    submit.disabled = true;
+  }
+
   async function load(el) {
+    const planSubmit = planSubmitOf(el);
+    blockPlan(planSubmit);
     try {
       const data = await api("GET", el.dataset.load);
       renderers[el.dataset.render](el, data);
     } catch (err) {
       el.innerHTML = `<p class="callout error">${esc(err.message)}</p>`;
+      blockPlan(planSubmit);
     }
   }
   document.addEventListener("click", (ev) => {
@@ -1312,9 +1664,138 @@
       targets.forEach((el) => { el.hidden = !holds(el.dataset.showWhen); });
       required.forEach((el) => { el.required = holds(el.dataset.requiredWhen) && !el.closest("[hidden]"); });
       if (targets.length) syncRequired(form);
+      checkMustEqual(form); // a typed field shown or hidden by this change counts, or no longer counts
     };
     form.addEventListener("change", update);
     update();
+  }
+
+  // ------------------------------------------------- new VMs (P5 §12.2, §12.4, §12.6 item 1)
+  // A host select ([data-vm-host="<slot>"]) offers "New VM on <account>" (value vm:<account id>); its sub-form
+  // ([data-vm-form="<slot>"]) shows while one is chosen, lists that account's networks and the pool's free
+  // addresses (GET /provider-accounts/{id}/addresses), and vmSpec reads it as the body's ``machine``.
+  const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+  const VM_SLOTS = ["blue", "green", "data"];
+  // "4 vCPU · 8 GB · 64 GB" (pages._vm_size says the same).
+  const vmSizeText = (size) => {
+    const s = size || {}, parts = [];
+    if (s.cores) parts.push(`${s.cores} vCPU`);
+    if (s.memory_mb) parts.push(`${Math.round(Number(s.memory_mb) / 1024 * 100) / 100} GB`);
+    if (s.disk_gb) parts.push(`${s.disk_gb} GB`);
+    return parts.join(" · ");
+  };
+  const vmAccountOf = (sel) => { const v = (sel && sel.value) || ""; return v.indexOf("vm:") === 0 ? v.slice(3) : ""; };
+  const vmFormOf = (scope, slot) => $(`[data-vm-form="${slot}"]`, scope);
+  const vmField = (box, key) => $(`[data-vm="${key}"]`, box);
+
+  // {account_id, network, address, cores?, memory_mb?, disk_gb?} for ``slot``'s new VM, or null for a host.
+  // The address is the pool's pick (``auto`` until the free ones are read), or the typed one.
+  function vmSpec(scope, slot) {
+    const sel = $(`[data-vm-host="${slot}"]`, scope), account = vmAccountOf(sel), box = vmFormOf(scope, slot);
+    if (!account || !box) return null;
+    const from = ($('[data-vm="from"]:checked', box) || {}).value || "pool";
+    const typed = String((vmField(box, "typed") || {}).value || "").trim();
+    const picked = (vmField(box, "pick") || {}).value || "auto";
+    const spec = { account_id: account, network: (vmField(box, "network") || {}).value || "", address: from === "typed" ? typed : picked };
+    const num = (key) => { const el = vmField(box, key); return el && el.value !== "" && !isNaN(Number(el.value)) ? Number(el.value) : null; };
+    if (num("cores") !== null) spec.cores = num("cores");
+    if (num("memory_gb") !== null) spec.memory_mb = Math.round(num("memory_gb") * 1024);
+    if (num("disk_gb") !== null) spec.disk_gb = num("disk_gb");
+    return spec;
+  }
+
+  // The step's own checks of the new VMs in ``hosts`` ({slot: {machine}}): {field, text} or null.
+  function vmProblem(hosts) {
+    const given = {};
+    for (const slot of VM_SLOTS) {
+      const m = hosts[slot] && hosts[slot].machine;
+      if (!m) continue;
+      const base = `hosts.${slot}.machine`, who = slot === "data" ? "the data server" : slot;
+      if (!m.network) return { field: `${base}.network`, text: `Choose a network for ${who}'s VM` };
+      if (m.address !== "auto") {
+        if (!m.address) return { field: `${base}.address`, text: `Type ${who}'s address, or pick one from the pool` };
+        if (!IPV4.test(m.address)) return { field: `${base}.address`, text: `${m.address} isn't an IPv4 address, such as 10.0.0.12` };
+        if (given[m.address]) return { field: `${base}.address`, text: `${m.address} is given to both ${given[m.address]} and ${slot}: give each VM its own address` };
+        given[m.address] = slot;
+      }
+    }
+    return null;
+  }
+
+  // Shows each sub-form while its select holds a new VM, keeps its networks to that account's (and, with
+  // ``lock`` {slot, account, network}, every other slot to the lead VM's network) and reads the free addresses.
+  function syncVmForms(scope, lock, loadNow) {
+    $$("[data-vm-host]", scope).forEach((sel) => {
+      const slot = sel.dataset.vmHost, box = vmFormOf(scope, slot);
+      if (!box) return;
+      const account = vmAccountOf(sel);
+      box.hidden = !account || Boolean(sel.closest("[hidden]"));
+      const net = vmField(box, "network");
+      if (net) {
+        $$("option", net).forEach((o) => {
+          o.disabled = o.dataset.account !== account || Boolean(lock && lock.network && lock.slot !== slot && o.value !== lock.network);
+        });
+        const chosen = net.selectedOptions && net.selectedOptions[0];
+        if (!chosen || chosen.disabled) {
+          const first = $$("option", net).find((o) => !o.disabled);
+          net.value = first ? first.value : "";
+        }
+      }
+      if (account && !box.hidden && loadNow !== false) loadAddresses(scope, slot);
+    });
+  }
+
+  async function loadAddresses(scope, slot) {
+    const box = vmFormOf(scope, slot), account = vmAccountOf($(`[data-vm-host="${slot}"]`, scope));
+    const network = (vmField(box, "network") || {}).value || "";
+    if (!account || !network) return;
+    const key = `${account}|${network}`;
+    if (box.dataset.addresses === key) return;
+    box.dataset.addresses = key;
+    const cache = scope._vmAddresses = scope._vmAddresses || {};
+    const url = `/api/v1/provider-accounts/${encodeURIComponent(account)}/addresses?network=${encodeURIComponent(network)}&count=10`;
+    if (!cache[key]) cache[key] = api("GET", url).catch((err) => ({ error: err.message }));
+    const data = await cache[key];
+    if (box.dataset.addresses !== key) return; // the account or the network changed meanwhile
+    fillAddresses(scope, box, data || {}, network);
+  }
+
+  // The pool's free addresses in the pick select; each VM of the form starts on one no other slot's pick holds.
+  function fillAddresses(scope, box, data, network) {
+    const pick = vmField(box, "pick"), help = $("[data-vm-taken]", box);
+    const pool = $('[data-vm="from"][value="pool"]', box), typed = $('[data-vm="from"][value="typed"]', box);
+    const say = (text) => { if (help) help.textContent = text; };
+    if (data.error) { say(`Slipway couldn't read ${network}'s free addresses: ${data.error}. Type one, or Slipway takes the next free one.`); return; }
+    const free = data.free || [];
+    if (!data.pool || !free.length) {
+      if (pick) fillOptions(pick, [], "");
+      if (pool) { pool.disabled = true; pool.checked = false; }
+      if (typed) { typed.checked = true; typed.dispatchEvent(new Event("change", { bubbles: true })); }
+      say(data.pool ? `${network} has no free address left in its pool: type an address` : `${network} has no address pool: type an address`);
+      return;
+    }
+    if (pool) pool.disabled = false;
+    const others = $$("[data-vm-form]", scope).filter((b) => b !== box && !b.hidden && b.dataset.addresses === box.dataset.addresses)
+      .map((b) => (vmField(b, "pick") || {}).value);
+    const keep = pick && free.includes(pick.value) && !others.includes(pick.value) ? pick.value : (free.find((a) => !others.includes(a)) || free[0]);
+    if (pick) fillOptions(pick, free, keep);
+    const used = data.in_use || [];
+    say(used.length ? `In use on ${network}: ${used.slice(0, 4).map((u) => `${u.address} (${u.by})`).join(", ")}` +
+      (used.length > 4 ? `, and ${used.length - 4} more` : "") : `Nothing else on ${network} uses its pool yet.`);
+  }
+
+  // Add a slot (P5 §9.5): a New VM option sends {machine} instead of host_id.
+  function vmSlotBody(form, body) {
+    const sel = $("[data-vm-host]", form);
+    if (!vmAccountOf(sel)) return;
+    delete body.host_id;
+    body.machine = vmSpec(form, sel.dataset.vmHost);
+  }
+
+  function wireVmForms(form) {
+    if (!$("[data-vm-host]", form) || form.dataset.envFlow !== undefined) return; // the flow syncs its own
+    form.addEventListener("change", () => syncVmForms(form, null));
+    syncVmForms(form, null, false);
   }
 
   // ------------------------------------------------- the New environment flow (phase 3 §12.3)
@@ -1326,6 +1807,12 @@
     settings: 4, services: 4, env: 4,
     hostnames: 5, route_tls: 5, traffic: 5, "traffic.switch": 5, "traffic.dns": 5, auto_activate: 5,
     keep_backups: 6, seed_snapshot_id: 6, seed_content: 6, first_admin: 6,
+    // DigitalOcean placement (P4 §17.2): Where and Production are step 2's, the account and sizes step 3's, the
+    // typed total the Review's.
+    "placement.provider": 2, "placement.slots": 2, production: 2, placement: 3, confirm_cost: 7,
+    // A new VM's fields (P5 §12.2): hosts.<slot>.machine.* (account_id, network, address, size) are step 3's,
+    // through the "hosts" prefix; listed here so the map says so.
+    "hosts.blue.machine": 3, "hosts.green.machine": 3, "hosts.data.machine": 3,
   };
   const FLOW_STEPS = 7;
   const NAME_RE = /^[a-z][a-z0-9-]{0,24}[a-z0-9]$/;
@@ -1376,7 +1863,9 @@
     ["blue", "green", "data"].forEach((slot) => {
       if (slot === "green" && !two) return;
       if (slot === "data" && mode !== "server") return;
-      if (chosen[slot]) hosts[slot] = chosen[slot];
+      const vm = vmSpec(root, slot); // a new VM: {machine: MachineSpecIn} (P5 §9.2)
+      if (vm) hosts[slot] = { machine: vm };
+      else if (chosen[slot]) hosts[slot] = chosen[slot];
     });
     const traffic = raw.traffic || {};
     const dnsOn = Boolean(($('[name="dns_on"]', root) || {}).checked);
@@ -1390,6 +1879,22 @@
     };
     if (raw.services !== undefined) body.services = raw.services;
     ["keep_backups", "seed_snapshot_id", "seed_content", "first_admin"].forEach((k) => { if (raw[k] !== undefined) body[k] = raw[k]; });
+    if (flowWhere(root) === "digitalocean") {
+      // P4 §15.1: placement, production and the typed total; data_mode managed, traffic through the load balancer.
+      const p = raw.placement || {};
+      const production = flowProduction(root);
+      body.data_mode = "managed";
+      body.hosts = {};
+      body.placement = { provider: "digitalocean", account_id: p.account_id || "", region: p.region || undefined,
+                         droplet_size: p.droplet_size || "", db_size: p.db_size || "", db_standby: Boolean(p.db_standby),
+                         acme_staging: !production && Boolean(p.acme_staging), slots: two ? 2 : 1 };
+      body.production = production;
+      body.traffic = { switch: "do_lb", dns: { proxied: Boolean(($('[name="do_proxied"]', root) || {}).checked) } };
+      delete body.route_tls;
+      if (production) body.auto_activate = false;
+      const typed = ($("[data-flow-cost]", root) || {}).value;
+      if (!planning && typed) body.confirm_cost = typed;
+    }
     Object.keys(body).forEach((k) => { if (body[k] === undefined || body[k] === "") delete body[k]; });
     const fa = manifest && manifest.first_admin;
     if (planning && fa && !body.first_admin && !body.seed_snapshot_id) {
@@ -1402,6 +1907,9 @@
     return body;
   }
 
+  const flowWhere = (root) => (($('[name="where"]:checked', root) || {}).value) || "hosts";
+  const flowProduction = (root) => flowWhere(root) === "digitalocean" && Boolean(($('[name="production"]', root) || {}).checked);
+
   function wireEnvFlow(root) {
     const sections = $$("[data-step]", root).sort((a, b) => Number(a.dataset.step) - Number(b.dataset.step));
     const tabs = $$("[data-step-tab]", root);
@@ -1413,7 +1921,8 @@
     const ds = root.dataset;
     // unsure: a create got no answer or a 5xx, so it may have happened. created: the environment exists and only
     // its first deployment is left to start (the page is locked on Review).
-    const state = { current: 1, plan: null, manifest: null, unsure: false, created: null, name: "", busy: false };
+    const state = { current: 1, plan: null, manifest: null, unsure: false, created: null, name: "", busy: false,
+                    cost: null, catalog: null, catalogAccount: null };
     root._flow = state;
 
     const stepName = (n) => (sections[n - 1] && sections[n - 1].dataset.stepName) || String(n);
@@ -1450,7 +1959,17 @@
       if (deploy) deploy.hidden = state.current !== FLOW_STEPS;
       if (state.current === 5) fillTraffic();
       if (state.current === FLOW_STEPS) fillReview();
+      gateDeploy();
     }
+
+    // DigitalOcean: Deploy stays disabled until the total is typed as shown (P4 §12.2, §17.2).
+    const costInput = $("[data-flow-cost]", root);
+    const costOk = () => flowWhere(root) !== "digitalocean" ||
+      Boolean(state.cost && costInput && costInput.value === String(state.cost.total));
+    function gateDeploy() {
+      if (deploy && !state.created && !state.busy) deploy.disabled = state.current === FLOW_STEPS && !costOk();
+    }
+    if (costInput) costInput.addEventListener("input", gateDeploy);
 
     // The step's own checks, before Slipway is asked: {field, text} or null.
     function clientCheck(n) {
@@ -1460,15 +1979,22 @@
         if (!body.repository_id) return { field: "repository_id", text: "Choose a repository" };
         if (!body.branch) return { field: "branch", text: "Choose a branch" };
       }
+      if (n === 3 && body.placement) {
+        if (!body.placement.account_id) return { field: "placement.account_id", text: "Choose a DigitalOcean account" };
+        if (!body.placement.droplet_size) return { field: "placement.droplet_size", text: "Choose a droplet size" };
+        if (!body.placement.db_size) return { field: "placement.db_size", text: "Choose a database size" };
+        return null;
+      }
       if (n === 3) {
         if (!body.hosts.blue) return { field: "hosts.blue", text: "Choose a host for blue" };
         if ((($('[name="shape"]:checked', root) || {}).value) === "bluegreen" && !body.hosts.green) {
           return { field: "hosts.green", text: "Choose a host for green" };
         }
         if (body.data_mode === "server" && !body.hosts.data) return { field: "hosts.data", text: "Choose a host for the data server" };
-        if (body.hosts.data && (body.hosts.data === body.hosts.blue || body.hosts.data === body.hosts.green)) {
+        if (typeof body.hosts.data === "string" && (body.hosts.data === body.hosts.blue || body.hosts.data === body.hosts.green)) {
           return { field: "hosts.data", text: "The data server needs a host of its own" };
         }
+        return vmProblem(body.hosts);
       }
       return null;
     }
@@ -1480,16 +2006,26 @@
       const problem = clientCheck(n);
       if (problem) { stepError(n, problem.text); mark(problem.field); return; }
       state.busy = true; if (next) setLoading(next, true);
-      const res = await request("POST", "/api/v1/environments?check=true", flowBody(root, n < 6, state.manifest));
+      const checked = flowBody(root, n < 6, state.manifest);
+      delete checked.confirm_cost; // a check writes nothing and confirms nothing
+      const res = await request("POST", "/api/v1/environments?check=true", checked);
       state.busy = false; if (next) setLoading(next, false);
       if (res.status === 200) {
         state.plan = (res.data && res.data.plan) || null;
+        state.cost = (res.data && res.data.cost) || null;
         go(n + 1);
         return;
       }
+      // Whatever the check refused, the estimate it would have answered isn't known: Review never shows an
+      // older total (nor accepts it typed).
+      state.cost = null;
       const field = refusalField(res), at = fieldStep(field);
-      if (at > n && res.status >= 400 && res.status < 500) { go(n + 1); return; } // a later step's field: fine for now
-      if (at && res.status >= 400 && res.status < 500) {
+      const refusal = res.status >= 400 && res.status < 500;
+      // A later step's field is fine for now: that step's input isn't given yet. Review has no input a check
+      // sends (the typed total never is), so a refusal naming it (the account's monthly limit, confirm_cost) is
+      // about what is chosen so far: it is shown here.
+      if (refusal && at > n && at < FLOW_STEPS) { go(n + 1); return; }
+      if (refusal && at && at <= n) {
         go(at);
         stepError(at, res.text);
         mark(field);
@@ -1507,8 +2043,23 @@
           `/environments/${state.created}`);
     }
 
+    // The estimate again, after a create said it moved (409): the new total must be typed.
+    // Answers the check's refusal text when it couldn't price it (state.cost is then cleared, as nextStep does).
+    async function reprice() {
+      if (costInput) costInput.value = "";
+      const checked = flowBody(root, false, state.manifest);
+      delete checked.confirm_cost;
+      const res = await request("POST", "/api/v1/environments?check=true", checked);
+      let failed = "";
+      if (res.status === 200) { state.cost = (res.data && res.data.cost) || null; state.plan = (res.data && res.data.plan) || state.plan; }
+      else { state.cost = null; failed = res.text; }
+      fillReview();
+      return failed;
+    }
+
     async function deployAll() {
       if (state.busy) return;
+      if (!state.created && !costOk()) { gateDeploy(); return; }
       state.busy = true; if (deploy) setLoading(deploy, true);
       try {
         say(""); stepError(FLOW_STEPS, "");
@@ -1530,7 +2081,12 @@
               return;
             }
             if (at && at < FLOW_STEPS) { go(at); stepError(at, res.text); mark(field); return; }
+            if (field === "confirm_cost" && res.status === 409) {
+              const failed = await reprice();
+              stepError(FLOW_STEPS, failed || res.text); mark(field); return;
+            }
             stepError(FLOW_STEPS, res.text);
+            mark(field);
             return;
           }
         }
@@ -1538,6 +2094,7 @@
       } finally {
         state.busy = false; if (deploy) setLoading(deploy, false);
         if (state.created && deploy) deploy.disabled = false;
+        gateDeploy();
       }
     }
 
@@ -1551,17 +2108,50 @@
 
     // Keeps data_mode, the hosts' disabled options and the shape's notes in step with what is chosen.
     function syncChoices() {
+      const onDo = flowWhere(root) === "digitalocean";
+      const production = flowProduction(root);
+      // Production runs Blue and Green and waits for Activate (P4 §13).
+      const single = $('[name="shape"][value="single"]', root), bg = $('[name="shape"][value="bluegreen"]', root);
+      if (single) single.disabled = production;
+      if (production && bg && !bg.disabled) { bg.checked = true; if (single) single.checked = false; }
+      const auto = $('[name="auto_activate"]', root);
+      if (auto) { auto.disabled = production; if (production) auto.checked = false; }
+      const staging = $("[data-do-staging]", root);
+      if (staging) { staging.hidden = production; if (production) $("input", staging).checked = false; }
+      // A production environment needs a production account, and only it may use one.
+      const account = $("[data-do-account]", root);
+      if (account) {
+        $$("option", account).forEach((o) => {
+          const off = o.dataset.unusable !== undefined || (production ? o.dataset.production === undefined : o.dataset.production !== undefined);
+          o.disabled = off;
+        });
+        const chosen = account.selectedOptions && account.selectedOptions[0];
+        if (!chosen || chosen.disabled) {
+          const first = $$("option", account).find((o) => !o.disabled);
+          account.value = first ? first.value : "";
+        }
+      }
+      const label = onDo ? "DigitalOcean" : "Hosts";
+      if (sections[2]) sections[2].dataset.stepName = label;
+      const tab = tabs.find((t) => t.dataset.stepTab === "3"), tabLabel = tab && $("[data-step-label]", tab);
+      if (tabLabel) tabLabel.textContent = label;
+      // The settings the load balancer sets (edge.env) aren't asked for on DigitalOcean (P4 §5).
+      const edge = (state.manifest && state.manifest.edge && state.manifest.edge.env) || [];
+      $$("[data-app-setting]", root).forEach((i) => {
+        const field = i.closest(".field");
+        if (field) field.hidden = onDo && edge.includes(i.dataset.appSetting);
+      });
       const shapeEl = $('[name="shape"]:checked', root);
       const two = Boolean(shapeEl && shapeEl.value === "bluegreen");
       const keep = $('[name="keep_data"]', root);
-      const mode = two || (keep && keep.checked && !keep.closest("[hidden]")) ? "server" : "slot";
+      const mode = onDo ? "managed" : two || (keep && keep.checked && !keep.closest("[hidden]")) ? "server" : "slot";
       if (modeInput) modeInput.value = mode;
       const pick = (slot) => { const el = $(`[data-host-select="${slot}"]`, root); return el ? el.value : ""; };
       const blue = pick("blue"), green = two ? pick("green") : "";
       $$("[data-host-select]", root).forEach((sel) => {
         const slot = sel.dataset.hostSelect;
         $$("option", sel).forEach((o) => {
-          if (!o.value || o.dataset.unpinned !== undefined) return;
+          if (!o.value || o.dataset.unpinned !== undefined || o.dataset.vmAccount !== undefined) return;
           let off = "";
           if (mode === "server" && slot !== "data" && !o.dataset.ip) off = "Its address must be an IP for the data server to let it in";
           if (slot === "data" && (o.value === blue || o.value === green)) off = "The data server needs a host of its own";
@@ -1570,7 +2160,8 @@
         });
       });
       const same = $("[data-same-host]", root);
-      if (same) same.hidden = !(two && blue && blue === green);
+      if (same) same.hidden = !(two && blue && blue === green && !vmAccountOf({ value: blue }));
+      syncVms(two, mode);
       const none = $('[name="traffic.switch"][value="none"]', root), sy = $('[name="traffic.switch"][value="switchyard"]', root);
       if (none) {
         none.disabled = two;
@@ -1578,6 +2169,29 @@
       }
       const slots = $("[data-name-slots]", root), name = ($('[name="name"]', root) || {}).value || "<name>";
       if (slots) slots.textContent = `${name}-blue, ${name}-green and ${name}-data`;
+    }
+
+    // New VMs (P5 §12.2): once one slot is a new VM, every other slot's New VM options are limited to its
+    // account, and its network to the lead VM's (an environment's VMs share one account and one network).
+    function syncVms(two, mode) {
+      const used = VM_SLOTS.filter((slot) => slot === "blue" || (slot === "green" && two) || (slot === "data" && mode === "server"));
+      const name = ($('[name="name"]', root) || {}).value || "<name>";
+      $$("[data-vm-env]", root).forEach((el) => { el.textContent = name; });
+      const leadSlot = used.find((slot) => vmAccountOf($(`[data-vm-host="${slot}"]`, root)));
+      const lead = leadSlot ? { slot: leadSlot, account: vmAccountOf($(`[data-vm-host="${leadSlot}"]`, root)) } : null;
+      $$("[data-vm-host]", root).forEach((sel) => {
+        $$("option[data-vm-account]", sel).forEach((o) => {
+          if (o.dataset.vmOff !== undefined) return; // off for good (a permission, an account that can't be used)
+          const off = Boolean(lead && lead.slot !== sel.dataset.vmHost && o.dataset.vmAccount !== lead.account);
+          o.disabled = off;
+          o.textContent = (o.dataset.label || o.textContent) + (off ? `: ${name}'s VMs share one account and one network` : "");
+        });
+        const chosen = sel.selectedOptions && sel.selectedOptions[0];
+        if (chosen && chosen.disabled && chosen.dataset.vmAccount !== undefined) sel.value = "";
+      });
+      syncVmForms(root, null, false); // each sub-form on its own account's networks first
+      if (lead) lead.network = (vmField(vmFormOf(root, lead.slot), "network") || {}).value || "";
+      syncVmForms(root, lead);
     }
 
     // The manifest decides whether Blue/Green and a data server are possible (its capabilities, §12.3 step 2).
@@ -1603,7 +2217,61 @@
         : `${path} doesn't describe a data server (data.server)`;
       const noData = $("[data-no-data]", root);
       if (noData) noData.hidden = Boolean(m) && caps.some((c) => DATA_FIELD_CAPS.includes(c));
+      // DigitalOcean needs slipway.yml's data.managed and edge (P4 §15.1 refusal 3).
+      const doRadio = $('[name="where"][value="digitalocean"]', root), doReason = $("[data-do-reason]", root);
+      if (doRadio) {
+        if (doRadio.dataset.off === undefined) doRadio.dataset.off = doRadio.disabled ? "1" : "";
+        const missing = Boolean(m) && !caps.includes("digitalocean");
+        doRadio.disabled = doRadio.dataset.off === "1" || missing;
+        if (doReason && doRadio.dataset.off !== "1") {
+          const branch = ($('[name="branch"]', root) || {}).value || "";
+          doReason.textContent = missing ? `${path}${branch ? " on " + branch : ""} doesn't say how it runs on managed data behind a load balancer (data.managed and edge)` : "";
+        }
+        if (doRadio.disabled && doRadio.checked) { const hosts = $('[name="where"][value="hosts"]', root); if (hosts) hosts.checked = true; root.dispatchEvent(new Event("change")); }
+      }
       syncChoices();
+    });
+
+    // The account's catalog (GET /provider-accounts/{id}/catalog): the regions with Spaces, the droplet sizes with
+    // their prices and the database sizes for the node count. Read when DigitalOcean is chosen, the account or
+    // the region changes.
+    let catalogSeq = 0;
+    const doStatus = (html) => { const el = $("[data-do-catalog-status]", root); if (el) el.innerHTML = html || ""; };
+    function fillDb() {
+      const db = $("[data-do-db]", root), standby = $("[data-do-standby]", root);
+      if (!db || !state.catalog) return;
+      const nodes = standby && standby.checked ? "2" : "1";
+      db.dataset.placeholder = "Choose a size";
+      fillOptions(db, (state.catalog.db_sizes || {})[nodes] || [], db.value);
+    }
+    async function loadCatalog(regionChosen) {
+      const account = $("[data-do-account]", root), region = $("[data-do-region]", root), droplet = $("[data-do-droplet]", root);
+      if (!account || !account.value || flowWhere(root) !== "digitalocean") return;
+      const opt = account.selectedOptions && account.selectedOptions[0];
+      const same = state.catalogAccount === account.value;
+      const want = (regionChosen || same) && region && region.value ? region.value : (opt && opt.dataset.region) || "";
+      const mine = ++catalogSeq;
+      doStatus(`<p class="muted" style="margin: 0">Reading ${esc((opt && opt.dataset.label) || "the account")}'s sizes and prices…</p>`);
+      const res = await request("GET", `/api/v1/provider-accounts/${encodeURIComponent(account.value)}/catalog${want ? "?region=" + encodeURIComponent(want) : ""}`);
+      if (mine !== catalogSeq) return;
+      if (res.status !== 200 || !res.data) { doStatus(`<div class="callout error">${esc(res.text)}</div>`); return; }
+      state.catalog = res.data; state.catalogAccount = account.value;
+      doStatus("");
+      if (region) {
+        region.dataset.placeholder = "Choose a region";
+        const regions = (res.data.regions || []).filter((r) => r.available && r.spaces)
+          .map((r) => ({ value: r.slug, label: r.name ? `${r.slug} · ${r.name}` : r.slug }));
+        fillOptions(region, regions, res.data.region);
+      }
+      if (droplet) { droplet.dataset.placeholder = "Choose a size"; fillOptions(droplet, dropletOptions(res.data), droplet.value); }
+      fillDb();
+    }
+    const is = (el, sel) => Boolean(el && el.closest && el.closest(sel) === el);
+    root.addEventListener("change", (ev) => {
+      const t = ev.target;
+      if (is(t, '[name="where"]') || is(t, "[data-do-account]") || is(t, '[name="production"]')) loadCatalog(false);
+      else if (is(t, "[data-do-region]")) loadCatalog(true);
+      else if (is(t, "[data-do-standby]")) fillDb();
     });
 
     // The Traffic step's table, from the last check's plan (§12.3 step 5).
@@ -1618,6 +2286,11 @@
         return;
       }
       const sw = ($('[name="traffic.switch"]:checked', root) || {}).value || "none";
+      if (flowWhere(root) === "digitalocean") {
+        body.innerHTML = plan.hostnames.map((h) => `<tr><td class="mono">${esc(h.hostname)}</td><td>DigitalOcean load balancer</td>` +
+          `<td>The live slot's droplet</td><td class="subtle">The load balancer's certificate</td></tr>`).join("");
+        return;
+      }
       const through = sw === "switchyard" ? `Switchyard (${ds.trafficAddress || "no traffic address set"})` : "Not published by Slipway";
       const slots = plan.slots || {};
       const modes = [["auto", "Let's Encrypt"], ["dns", "DNS challenge"], ["internal", "Internal CA"], ["off", "No TLS"]];
@@ -1638,19 +2311,46 @@
       const body = flowBody(root, false, state.manifest);
       const text = (sel) => { const el = $(sel, root); const o = el && el.selectedOptions && el.selectedOptions[0]; return o ? (o.dataset.label || o.textContent).trim() : ""; };
       const two = (($('[name="shape"]:checked', root) || {}).value) === "bluegreen";
+      const p = body.placement;
       const rows = [
         ["Name", body.name], ["Repository", text('[name="repository_id"]')], ["Branch", body.branch],
         ["Manifest", body.manifest_file || "slipway.yml"],
-        ["Shape", two ? "Blue/Green, with a data server" : body.data_mode === "server" ? "Single slot, with a data server" : "Single slot"],
-        ["Blue", text('[data-host-select="blue"]')],
+        ["Shape", p ? (two ? "Blue/Green, on managed data" : "Single slot, on managed data")
+          : two ? "Blue/Green, with a data server" : body.data_mode === "server" ? "Single slot, with a data server" : "Single slot"],
       ];
-      if (body.hosts.green) rows.push(["Green", text('[data-host-select="green"]')]);
-      if (body.hosts.data) rows.push(["Data server", text('[data-host-select="data"]')]);
+      if (p) {
+        rows.push(["Where", `DigitalOcean: ${text("[data-do-account]")}${p.region ? ", " + p.region : ""}`]);
+        if (body.production) rows.push(["Production", "Yes: it waits for Activate, and is deleted only after it is retired and snapshotted"]);
+        rows.push(["Droplets", `${two ? 2 : 1} × ${text("[data-do-droplet]")}`]);
+        rows.push(["Database", `${p.db_size}${p.db_standby ? ", with a standby node" : ", one node"}`]);
+        rows.push(["Certificate", p.acme_staging ? "Let's Encrypt staging (not trusted by browsers)" : "Let's Encrypt"]);
+      } else {
+        // A new VM is listed as the last check planned it (plan.machines, P5 §9.2): name, account, address, size.
+        const planned = {};
+        ((state.plan && state.plan.machines) || []).forEach((m) => { planned[m.slot] = m; });
+        const host = (slot) => {
+          const m = body.hosts[slot] && body.hosts[slot].machine;
+          if (!m) return text(`[data-host-select="${slot}"]`);
+          const p = planned[slot] || {};
+          const account = p.account || text(`[data-host-select="${slot}"]`).replace(/^New VM on /, "");
+          const address = p.address || (m.address === "auto" ? "the next free address" : m.address);
+          return `New VM ${p.name || `slipway-${body.name || "<name>"}-${slot}`} on ${account}, at ${address} on ${p.network || m.network}, ` +
+            vmSizeText(p.size || { cores: m.cores, memory_mb: m.memory_mb, disk_gb: m.disk_gb });
+        };
+        rows.push(["Blue", host("blue")]);
+        if (body.hosts.green) rows.push(["Green", host("green")]);
+        if (body.hosts.data) rows.push(["Data server", host("data")]);
+      }
       rows.push(["Settings", Object.keys(body.settings || {}).map((k) => `${k}=${body.settings[k]}`).join(", ") || "None set"]);
       if (body.services) rows.push(["Optional services", body.services.join(", ") || "None"]);
       rows.push(["Variables", Object.keys(body.env || {}).join(", ") || "None"]);
-      rows.push(["Switch", body.traffic.switch === "switchyard" ? `Switchyard${ds.trafficAddress ? ` (${ds.trafficAddress})` : ""}` : "None"]);
-      rows.push(["DNS", body.traffic.dns ? `Cloudflare, at ${body.traffic.dns.address || "the integration's public IP"}${body.traffic.dns.proxied ? ", proxied" : ""}` : "Not published"]);
+      if (p) {
+        rows.push(["Switch", "DigitalOcean load balancer"]);
+        rows.push(["DNS", `Cloudflare, at the load balancer's address${body.traffic.dns.proxied ? ", proxied" : ""}`]);
+      } else {
+        rows.push(["Switch", body.traffic.switch === "switchyard" ? `Switchyard${ds.trafficAddress ? ` (${ds.trafficAddress})` : ""}` : "None"]);
+        rows.push(["DNS", body.traffic.dns ? `Cloudflare, at ${body.traffic.dns.address || "the integration's public IP"}${body.traffic.dns.proxied ? ", proxied" : ""}` : "Not published"]);
+      }
       if (two) rows.push(["Activate", body.auto_activate ? "Automatically when the smoke test passes" : "When you choose Activate"]);
       const names = ((state.plan && state.plan.hostnames) || []).map((h) => h.hostname);
       rows.push(["Public names", names.join(", ") || "None"]);
@@ -1659,10 +2359,17 @@
       if (fa) rows.push(["First admin", (fa.fields && (fa.fields.email || Object.values(fa.fields)[0])) || "Set"]);
       if (body.keep_backups) rows.push(["Backups to keep", String(body.keep_backups)]);
       dl.innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v || "—")}</dd>`).join("");
+      const table = $("[data-cost-table]", root);
+      if (table && p) {
+        if (state.cost) renderers.cost(table, state.cost);
+        else table.innerHTML = '<p class="muted" style="margin: 0">Slipway couldn\'t price the environment yet: go back and check each step.</p>';
+      }
+      gateDeploy();
     }
 
     root.addEventListener("change", syncChoices);
     root.addEventListener("input", (ev) => { if (ev.target && ev.target.name === "name") syncChoices(); });
+    root.addEventListener("slipway:manifest", () => syncChoices());
     // Enter in a field would submit the form natively: it moves to the next step instead.
     root.addEventListener("submit", (ev) => { ev.preventDefault(); if (state.current < FLOW_STEPS) nextStep(); else deployAll(); });
     if (next) next.addEventListener("click", (ev) => { ev.preventDefault(); nextStep(); });
@@ -1672,7 +2379,7 @@
       ev.preventDefault();
       if (state.created || !confirm("Start over? Every choice on this page is cleared.")) return;
       if (root.reset) root.reset();
-      state.plan = null; state.unsure = false;
+      state.plan = null; state.unsure = false; state.cost = null;
       clearMarks(); say(""); sections.forEach((_, i) => stepError(i + 1, ""));
       root.dispatchEvent(new Event("change"));
       go(1);
@@ -1680,6 +2387,371 @@
     syncChoices();
     go(1);
   }
+
+  // ------------------------------------------- provider accounts (P4 §17.1, P5 §12.1, §12.6 item 3)
+  // _account_dialogs.html holds one dialog per provider, <form data-account-form="digitalocean|proxmox|esxi">.
+  //   <button data-account-open="<provider>" data-account='{...}'>   Add, or Edit filled from the account (no secret)
+  //   <button data-account-trust="<id>" data-provider data-where>     trust the certificate an account presents now
+  // wireAccountForm builds the body (the networks table rows, SSH sources, the limit in dollars), saves through
+  // /api/v1/provider-accounts, shows Test's checks, and on a 409 tls_untrusted opens "Trust this certificate?"
+  // and saves again with trust_fingerprint.
+  const ACCOUNT_NAMES = { digitalocean: "DigitalOcean", proxmox: "Proxmox", esxi: "VMware ESXi" };
+  const CHECK_BADGE = { ok: ["OK", "success"], note: ["Note", "plain"], warning: ["Warning", "warning"], error: ["Failed", "error"] };
+  const TEST_STATUS = { unknown: "Not tested", ok: "Every check passed.", warning: "It works, with warnings.", error: "A check failed." };
+  // No certificate has this fingerprint: a save or trust sent with it is refused with the certificate the
+  // account's address presents now, for the person to compare (nothing is written).
+  const PROBE_FINGERPRINT = Array(32).fill("00").join(":");
+  const NET_FIELDS = {
+    proxmox: [["name", "Name", "lan"], ["bridge", "Bridge", "vmbr0"], ["vlan_tag", "VLAN", "none"],
+      ["subnet", "Subnet", "10.0.0.0/24"], ["gateway", "Gateway", "10.0.0.1"], ["dns_servers", "DNS servers", "the gateway"],
+      ["pool_first", "Pool from", "10.0.0.100"], ["pool_last", "Pool to", "10.0.0.150"]],
+    esxi: [["name", "Name", "lan"], ["port_group", "Port group", "VM Network"],
+      ["subnet", "Subnet", "10.0.0.0/24"], ["gateway", "Gateway", "10.0.0.1"], ["dns_servers", "DNS servers", "the gateway"],
+      ["pool_first", "Pool from", "10.0.0.100"], ["pool_last", "Pool to", "10.0.0.150"]],
+  };
+  const ACCOUNT_KEYS = ["url", "node", "pool", "storage", "template_vmid", "user", "datastore", "resource_pool", "source_vm"];
+
+  const listOf = (text) => String(text || "").split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+
+  // A value as text for "did it change": object keys sorted, and an object's null, empty-text and empty-list
+  // members left out (a stored network may lack keys the table sends as null).
+  function canon(v) {
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (v && typeof v === "object") {
+      return "{" + Object.keys(v).sort().filter((k) => {
+        const x = v[k];
+        return !(x === null || x === undefined || x === "" || (Array.isArray(x) && !x.length));
+      }).map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+    }
+    return JSON.stringify(v === undefined ? null : v);
+  }
+
+  function fieldValue(form, name) {
+    const el = $(`[name="${name}"]`, form);
+    return el ? String(el.value || "").trim() : "";
+  }
+
+  // One row of the Networks table, with the columns of the form's provider (Proxmox: bridge and VLAN; ESXi:
+  // port group), filled from ``net`` (an account's network) when given.
+  function networkRow(form, net) {
+    const row = document.createElement("div");
+    row.className = "net-row";
+    row.setAttribute("data-network-row", "");
+    (NET_FIELDS[form.dataset.provider] || []).forEach(([key, label, hint]) => {
+      const input = document.createElement("input");
+      input.className = "input mono";
+      input.setAttribute("data-net", key);
+      input.setAttribute("aria-label", label);
+      input.setAttribute("placeholder", hint);
+      input.setAttribute("autocomplete", "off");
+      let v = "";
+      if (net) {
+        if (key === "pool_first" || key === "pool_last") v = net.pool ? net.pool[key === "pool_first" ? "first" : "last"] : "";
+        else if (key === "dns_servers") v = (net.dns_servers || []).join(", ");
+        else v = net[key];
+      }
+      input.value = v === null || v === undefined ? "" : String(v);
+      row.appendChild(input);
+    });
+    const remove = document.createElement("button");
+    remove.className = "btn btn-sm";
+    remove.setAttribute("type", "button");
+    remove.setAttribute("data-network-remove", "");
+    remove.setAttribute("title", "Remove this network");
+    remove.textContent = "Remove";
+    row.appendChild(remove);
+    $("[data-network-rows]", form).appendChild(row);
+    return row;
+  }
+
+  // The rows as the API's networks: every row with something typed in it, in the table's order.
+  function networksBody(form) {
+    const proxmox = form.dataset.provider === "proxmox";
+    return $$("[data-network-row]", form).map((row) => {
+      const v = (key) => { const el = $(`[data-net="${key}"]`, row); return el ? String(el.value || "").trim() : ""; };
+      const typed = (NET_FIELDS[form.dataset.provider] || []).some(([key]) => v(key));
+      if (!typed) return null;
+      const net = { name: v("name") };
+      if (proxmox) {
+        net.bridge = v("bridge");
+        const tag = v("vlan_tag");
+        net.vlan_tag = tag === "" ? null : /^\d+$/.test(tag) ? Number(tag) : tag;
+      } else {
+        net.port_group = v("port_group");
+      }
+      Object.assign(net, { subnet: v("subnet"), gateway: v("gateway"), dns_servers: listOf(v("dns_servers")) });
+      const first = v("pool_first"), last = v("pool_last");
+      net.pool = first || last ? { first, last } : null;
+      return net;
+    }).filter(Boolean);
+  }
+
+  // The body of a save. On an edit only what differs from the account as it was opened is sent, so an untouched
+  // field (SSH sources, networks) is never checked again.
+  function accountBody(form) {
+    const provider = form.dataset.provider;
+    const account = form._account || null;
+    const body = { name: fieldValue(form, "name") };
+    const secret = ($('[name="secret"]', form) || {}).value || "";
+    if (provider === "digitalocean") {
+      body.region = fieldValue(form, "region");
+      body.production = Boolean(($('[name="production"]', form) || {}).checked);
+      body.ssh_sources = listOf(fieldValue(form, "ssh_sources"));
+      const limit = fieldValue(form, "monthly_limit");
+      if (limit !== "" && !(Number(limit) > 0)) throw new Error("The monthly limit is a number of US dollars, such as 150");
+      body.monthly_limit_cents = limit === "" ? null : Math.round(Number(limit) * 100);
+      const prices = fieldValue(form, "prices");
+      try { body.prices = prices ? JSON.parse(prices) : null; } catch (e) { throw new Error("The price overrides aren't valid JSON"); }
+    } else {
+      ACCOUNT_KEYS.forEach((key) => { if ($(`[name="${key}"]`, form)) body[key] = fieldValue(form, key); });
+      if ("template_vmid" in body && /^\d+$/.test(body.template_vmid)) body.template_vmid = Number(body.template_vmid);
+      if (provider === "esxi" && body.resource_pool === "") body.resource_pool = account ? account.resource_pool : null;
+      body.networks = networksBody(form);
+    }
+    if (!account) {
+      Object.keys(body).forEach((k) => { if (body[k] === null || body[k] === "") delete body[k]; });
+      body.provider = provider;
+    } else {
+      Object.keys(body).forEach((k) => {
+        if (canon(body[k]) === canon(account[k] === undefined ? null : account[k])) delete body[k];
+      });
+      const clear = $('[name="clear_secret"]', form);
+      if (clear && clear.checked && !secret) body.clear_secret = true;
+    }
+    if (secret) body.secret = secret;
+    return body;
+  }
+
+  // An edit that moves a Proxmox or ESXi account to another address (or ESXi user) forgets its pinned
+  // certificate, so it is saved together with trusting the new one.
+  function movesAddress(form, body) {
+    return Boolean(form._account) && form.dataset.provider !== "digitalocean" && ("url" in body || "user" in body);
+  }
+
+  function openTrust(pending) {
+    const dlg = $("#account-trust");
+    if (!dlg) return toast("Reload the page to trust this certificate", "error");
+    const c = pending.certificate || {};
+    dlg._trust = pending;
+    fill(dlg, {
+      where: pending.where || "The server", note: pending.note || "", fingerprint_sha256: c.fingerprint_sha256,
+      subject: c.subject || "", issuer: c.issuer || "", not_after: String(c.not_after || "").replace("T", " ").slice(0, 16),
+      sans: (c.sans || []).join(", ") || "None",
+    });
+    $$("[data-trust-hint]", dlg).forEach((el) => { el.hidden = el.dataset.trustHint !== pending.provider; });
+    openDialog(dlg);
+  }
+
+  function trustRefusal(err) {
+    const d = err && err.data;
+    return d && d.certificate && (d.code === "tls_untrusted" || d.code === "tls_mismatch") ? d.certificate : null;
+  }
+
+  async function saveAccount(form, extra) {
+    const id = form.dataset.accountId;
+    let body;
+    try { body = accountBody(form); } catch (err) { if (!formError(form, err.message)) toast(err.message, "error"); return; }
+    if (!extra && movesAddress(form, body)) extra = { trust_fingerprint: PROBE_FINGERPRINT };
+    Object.assign(body, extra || {});
+    const submit = $('[type="submit"]', form);
+    setLoading(submit, true);
+    formError(form, "");
+    try {
+      await api(id ? "PATCH" : "POST", "/api/v1/provider-accounts" + (id ? "/" + id : ""), body);
+      flashAfterReload(id ? "Account saved" : "Account added");
+      location.reload();
+    } catch (err) {
+      const cert = trustRefusal(err);
+      if (cert) {
+        const real = body.trust_fingerprint && body.trust_fingerprint !== PROBE_FINGERPRINT;
+        openTrust({ form, certificate: cert, provider: form.dataset.provider,
+          where: body.url || (form._account && form._account.url) || fieldValue(form, "name"),
+          note: real ? err.message : "" });
+      } else if (!formError(form, err.message)) {
+        toast(err.message, "error");
+      }
+    } finally {
+      setLoading(submit, false);
+    }
+  }
+
+  async function trustAccount(btn, id, fingerprint, pending) {
+    setLoading(btn, true);
+    try {
+      await api("POST", `/api/v1/provider-accounts/${id}/trust`, { fingerprint });
+      flashAfterReload("Certificate trusted");
+      location.reload();
+    } catch (err) {
+      const cert = trustRefusal(err);
+      if (cert) openTrust(Object.assign({}, pending, { id, certificate: cert, note: fingerprint === PROBE_FINGERPRINT ? "" : err.message }));
+      else toast(err.message, "error");
+    } finally {
+      setLoading(btn, false);
+    }
+  }
+
+  function showChecks(form, answer) {
+    const box = $("[data-account-test-result]", form);
+    if (!box) return;
+    const list = $("[data-account-checks]", box);
+    list.textContent = "";
+    (answer.checks || []).forEach((c) => {
+      const [label, cls] = CHECK_BADGE[c.level] || [String(c.level || ""), ""];
+      const li = document.createElement("li");
+      const chip = document.createElement("span");
+      chip.className = "badge " + cls;
+      chip.textContent = label;
+      const text = document.createElement("span");
+      text.textContent = c.text || c.name || "";
+      li.appendChild(chip);
+      li.appendChild(text);
+      list.appendChild(li);
+    });
+    $("[data-account-test-status]", box).textContent = TEST_STATUS[answer.status] || String(answer.status || "");
+    box.hidden = false;
+  }
+
+  // Test: an unsaved DigitalOcean token is tested as typed (with the region chosen); otherwise the saved account.
+  async function testAccount(form, btn) {
+    const id = form.dataset.accountId;
+    const secret = ($('[name="secret"]', form) || {}).value || "";
+    let call = null;
+    if (form.dataset.provider === "digitalocean" && secret) {
+      const region = fieldValue(form, "region");
+      call = ["POST", "/api/v1/provider-accounts/test", region ? { secret, region } : { secret }];
+    } else if (id) {
+      call = ["POST", `/api/v1/provider-accounts/${id}/test`, undefined];
+    }
+    if (!call) {
+      const text = "Paste the API token to test it";
+      if (!formError(form, text)) toast(text, "error");
+      return;
+    }
+    setLoading(btn, true);
+    formError(form, "");
+    try {
+      showChecks(form, await api(call[0], call[1], call[2]) || {});
+    } catch (err) {
+      if (!formError(form, err.message)) toast(err.message, "error");
+    } finally {
+      setLoading(btn, false);
+    }
+  }
+
+  function ensureOption(select, value) {
+    if (!select || !value || $$("option", select).some((o) => o.value === value)) return;
+    const option = document.createElement("option");
+    option.setAttribute("value", value);
+    option.textContent = value;
+    select.appendChild(option);
+  }
+
+  // Opens the provider's dialog to add an account, or to edit ``account`` (a ProviderAccountOut without secrets).
+  function openAccount(provider, account) {
+    const dlg = document.getElementById(`account-${provider}`);
+    if (!dlg) return;
+    const form = $("form[data-account-form]", dlg);
+    const a = account || null;
+    form.dataset.accountId = a ? a.id : "";
+    form._account = a;
+    const set = (name, v) => $$(`[name="${name}"]`, form).forEach((el) => {
+      if (el.type === "checkbox") el.checked = Boolean(v);
+      else el.value = v === null || v === undefined ? "" : String(v);
+    });
+    fill(dlg, { account_title: a ? `Edit ${a.name}` : `Add a ${ACCOUNT_NAMES[provider] || provider} account` });
+    set("name", a ? a.name : "");
+    set("secret", "");
+    const secret = $('[name="secret"]', form);
+    if (secret) {
+      secret.required = !a && provider !== "digitalocean";
+      const hint = a && a.secret_hint && a.secret_hint !== "set" ? ` (…${a.secret_hint})` : "";
+      secret.setAttribute("placeholder", a && a.has_secret ? `Set${hint}; leave it empty to keep it` : (provider === "digitalocean" ? "dop_v1_…" : ""));
+    }
+    const state = $("[data-secret-state]", form);
+    if (state) state.textContent = a && a.has_secret ? `Set${a.secret_hint && a.secret_hint !== "set" ? ` (…${a.secret_hint})` : ""}. ` : "";
+    if (provider === "digitalocean") {
+      const region = (a && a.region) || "nyc3";
+      ensureOption($('[name="region"]', form), region);
+      set("region", region);
+      set("production", a && a.production);
+      set("ssh_sources", a ? (a.ssh_sources || []).join("\n") : "");
+      set("monthly_limit", a ? a.monthly_limit : "");
+      set("prices", a && a.prices ? JSON.stringify(a.prices, null, 2) : "");
+      set("clear_secret", false);
+      $$("[data-clear-secret]", form).forEach((el) => { el.hidden = !(a && a.has_secret); });
+    } else {
+      ACCOUNT_KEYS.forEach((key) => set(key, a ? a[key] : ""));
+      const rows = $("[data-network-rows]", form);
+      if (rows) {
+        rows.textContent = "";
+        const nets = (a && a.networks) || [];
+        (nets.length ? nets : [null]).forEach((net) => networkRow(form, net));
+      }
+    }
+    $$("[data-saved-only]", form).forEach((el) => { el.hidden = !a; });
+    $$("[data-account-test-result]", form).forEach((el) => { el.hidden = true; });
+    openDialog(dlg);
+  }
+
+  function wireAccountForm(form) {
+    if (form._wired) return;
+    form._wired = true;
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      saveAccount(form);
+    });
+    form.addEventListener("click", (ev) => {
+      if (ev.target.closest("[data-network-add]")) {
+        ev.preventDefault();
+        const first = $("input", networkRow(form, null));
+        if (first) first.focus();
+        return;
+      }
+      const remove = ev.target.closest("[data-network-remove]");
+      if (remove) {
+        ev.preventDefault();
+        remove.closest("[data-network-row]").remove();
+        return;
+      }
+      const test = ev.target.closest("[data-account-test]");
+      if (test) {
+        ev.preventDefault();
+        testAccount(form, test);
+      }
+    });
+  }
+
+  document.addEventListener("click", (ev) => {
+    const opener = ev.target.closest("[data-account-open]");
+    if (opener) {
+      ev.preventDefault();
+      let account = null;
+      try { account = opener.dataset.account ? JSON.parse(opener.dataset.account) : null; } catch (e) { account = null; }
+      openAccount(opener.dataset.accountOpen, account);
+      return;
+    }
+    const trust = ev.target.closest("[data-account-trust]");
+    if (trust) {
+      ev.preventDefault();
+      trustAccount(trust, trust.dataset.accountTrust, PROBE_FINGERPRINT,
+        { provider: trust.dataset.provider, where: trust.dataset.where, button: trust });
+    }
+  });
+
+  // "Trust this certificate?": saves the account again with the fingerprint shown, or trusts it on the account.
+  document.addEventListener("submit", (ev) => {
+    const form = ev.target.closest("form[data-trust-form]");
+    if (!form) return;
+    ev.preventDefault();
+    const dlg = form.closest("dialog");
+    const pending = dlg && dlg._trust;
+    if (!pending) return;
+    dlg._trust = null;
+    dlg.close();
+    const fingerprint = pending.certificate.fingerprint_sha256;
+    if (pending.form) saveAccount(pending.form, { trust_fingerprint: fingerprint });
+    else trustAccount(pending.button || $("[data-trust-confirm]", form), pending.id, fingerprint, pending);
+  });
 
   // -------------------------------------------------------------- boot
   document.addEventListener("DOMContentLoaded", () => {
@@ -1698,8 +2770,10 @@
     $$("select[data-branches]").forEach(wireBranches);
     // Before wireShowWhen: the flow keeps its computed fields (data_mode) current on every change first.
     $$("form[data-env-flow]").forEach(wireEnvFlow);
+    $$("form").forEach(wireVmForms);
     $$("form").forEach(wireShowWhen);
     $$("[data-app-form]").forEach(wireAppForm);
+    $$("form[data-account-form]").forEach(wireAccountForm);
     $$("form[data-preview-form]").forEach(wirePreview);
     // Pages with work in progress (a snapshot being checked) reload while they are being looked at, but not
     // while a dialog is open.
@@ -1721,5 +2795,10 @@
     });
   });
 
-  window.slipway = { api, toast, serialize, humanBytes, statusBadge, renderers, FIELD_STEP, fieldStep, flowBody };
+  window.slipway = {
+    api, toast, serialize, humanBytes, statusBadge, renderers, FIELD_STEP, fieldStep, flowBody,
+    wireAccountForm, openAccount, accountBody, PROBE_FINGERPRINT,
+    cloudObjectsHtml, cloudCallouts, costTableHtml, costPrice, RUNNING,
+    vmSpec, vmProblem, vmSizeText, vmLiveView, vmLiveHtml, vmSnapshotsHtml,
+  };
 })();

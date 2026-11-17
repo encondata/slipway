@@ -59,6 +59,10 @@ An app in an environment (phase 3) may also say how it runs as Blue/Green app sl
 ``services.<name>.health``, ``data.migrations``, ``data.attach`` and ``data.server``. ``plan`` then renders one of
 three roles: ``app`` (as before), ``slot`` (an app slot whose data is elsewhere) or ``server`` (the data server).
 
+An app may also say how it runs on DigitalOcean (phase 4): ``edge`` (how it serves its names behind a cloud load
+balancer) and ``data.managed`` (how it runs on a managed database and object store). ``plan``'s ``slot`` role
+then takes ``managed`` and ``edge_values``; without them it renders exactly as before.
+
 ``{slipway.out}``, ``{slipway.in}`` and ``{admin.<field>}`` are *slots*: values Slipway fills in when it
 runs the command (a file it names, or what an operator typed). Each is a whole argument, and ``plan``
 leaves it as ``{"slot": ...}`` for the deployer to fill in and quote. docs/manifest.md has the whole format.
@@ -76,6 +80,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import yaml
+
+from slipway.services import do_rules
 
 DEFAULT_FILE = "slipway.yml"
 MAX_BYTES = 256 * 1024
@@ -114,8 +120,9 @@ DEFAULT_TIMEOUTS = {
 }
 MAX_TIMEOUT = 1440  # minutes: a day
 # What the pages and endpoints offer an app, in this order (Manifest.capabilities).
+# edge, managed and digitalocean (phase 4) come before attach, server and bluegreen, which stay the last three.
 CAPABILITIES = ("backup", "verify", "restore", "revision_check", "files", "reset", "snapshot", "seed", "first_admin",
-                "starter_content", "attach", "server", "bluegreen")
+                "starter_content", "edge", "managed", "digitalocean", "attach", "server", "bluegreen")
 HOLDS = ("database", "files", "other")
 MAX_IDENTITY = 16
 
@@ -152,7 +159,19 @@ _PLACES = {
     "server.host": "data.server.provides and data.server.env",
     "server.port": "data.server.provides and data.server.env",
     "server.clients": "data.server.env",
+    "edge": "edge.env",
 }
+
+# DigitalOcean (phase 4): edge and data.managed.
+EDGE_VALUES = ("address", "trusted")  # {edge.address}: the load balancer's IP; {edge.trusted}: the VPC's range
+MAX_EDGE_ENV = 30
+MAX_EDGE_PROJECTS = 4
+MAX_MANAGED_ENV = 20
+MAX_CORS = 10
+MANAGED_KEYS = ("skip", "env", "commands")  # data.managed's own keys: never an endpoint's name
+MANAGED_COMMANDS = ("has_data", "data_up")
+POSTGRES_VERSIONS = ("13", "14", "15", "16", "17")  # what DigitalOcean offers for a managed cluster here
+MANAGED_FIELDS: dict[str, tuple[str, ...]] = {"postgres": ("version", "database", "user", "password"), "s3": ("cors",)}
 
 
 class ManifestError(ValueError):
@@ -259,6 +278,45 @@ class DataServer:
 
 
 @dataclass(frozen=True)
+class DataManaged:
+    """How the app runs on a managed database and object store (``data.managed``, phase 4)."""
+
+    # need: its entry. postgres: {version, database, user, password ("{secret.K}")}; s3: {cors: (service, ...)}
+    needs: dict[str, dict[str, Any]]
+    skip: tuple[str, ...] = ()  # services that don't run when the data is managed
+    env: dict[str, str] = field(default_factory=dict)  # .env key: template, written only when the data is managed
+    commands: dict[str, tuple[str, ...]] = field(default_factory=dict)  # replace these commands in managed mode
+
+    def password_secret(self, need: str) -> str:
+        """The secret a postgres need's password is (``POSTGRES_PASSWORD`` for ``{secret.POSTGRES_PASSWORD}``)."""
+        m = _SECRET_REF.match(str(self.needs[need]["password"]))
+        assert m is not None  # parse made sure
+        return m.group(1)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "skip": list(self.skip),
+            "needs": {need: {k: list(v) if isinstance(v, tuple) else v for k, v in entry.items()}
+                      for need, entry in self.needs.items()},
+            "env": list(self.env),
+            "commands": list(self.commands),
+        }
+
+
+@dataclass(frozen=True)
+class Edge:
+    """How the app serves its names behind a cloud load balancer (``edge``, phase 4)."""
+
+    port: int  # the host port each app slot serves plain HTTP on
+    health: str  # the path the load balancer asks for
+    env: dict[str, str] = field(default_factory=dict)  # .env key: template, written behind a load balancer
+    projects: tuple[str, ...] = ()  # templates: the Compose projects the edge adds
+
+    def to_json(self) -> dict[str, Any]:
+        return {"port": self.port, "health": self.health, "env": list(self.env), "projects": list(self.projects)}
+
+
+@dataclass(frozen=True)
 class DataSpec:
     """What slipway.yml says about the app's data (``data:``). Every field is optional."""
 
@@ -271,6 +329,7 @@ class DataSpec:
     migrations: str | None = None  # expand_contract: the previous release runs on the schema the next one migrates
     attach: DataAttach | None = None
     server: DataServer | None = None
+    managed: DataManaged | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -286,6 +345,8 @@ class DataSpec:
             out["attach"] = self.attach.to_json()
         if self.server is not None:
             out["server"] = self.server.to_json()
+        if self.managed is not None:
+            out["managed"] = self.managed.to_json()
         return out
 
 
@@ -357,6 +418,7 @@ class Manifest:
     data: DataSpec = field(default_factory=DataSpec)
     first_admin: FirstAdmin | None = None
     timeouts: dict[str, int] = field(default_factory=dict)  # minutes, as slipway.yml sets them
+    edge: Edge | None = None
 
     # -- what the instance chooses
 
@@ -375,12 +437,15 @@ class Manifest:
                 out.append(s)
         return out
 
-    def services_for(self, role: str, chosen: list[str] | None) -> list[Service]:
+    def services_for(self, role: str, chosen: list[str] | None, *, without: set[str] | None = None) -> list[Service]:
         """The services a plan in ``role`` runs and publishes ports for (§5.3): ``services_on(chosen)`` for an
         app; without ``data.server.services`` for an app slot; on a data server, those services, then each
-        ``data.server.ports`` entry as a service with no hostname (so ports are planned the same way)."""
+        ``data.server.ports`` entry as a service with no hostname (so ports are planned the same way).
+        ``without`` replaces ``data.server.services`` for an app slot (on managed data: ``data.managed.skip``)."""
         on = self.services_on(chosen)
         server = self.data.server
+        if role == "slot" and without is not None:
+            return [s for s in on if s.name not in without]
         if role == "app" or server is None:
             return on
         if role == "slot":
@@ -404,6 +469,16 @@ class Manifest:
 
     def setting_keys(self) -> set[str]:
         return {s.key for s in self.settings}
+
+    def edge_settings(self) -> set[str]:
+        """The settings ``edge.env`` sets: behind a load balancer (a ``do_lb`` environment) they take the edge's
+        value, so they aren't required and aren't asked for there."""
+        return {s.key for s in self.settings if self.edge is not None and s.key in self.edge.env}
+
+    def required_settings(self, *, edge: bool = False) -> tuple[Setting, ...]:
+        """The settings that must have a value. ``edge``: behind a load balancer, where ``edge.env`` sets some."""
+        skip = self.edge_settings() if edge else set()
+        return tuple(s for s in self.settings if s.required and s.key not in skip)
 
     def slipway_keys(self) -> set[str]:
         """Keys Slipway sets itself, which the instance's own variables may not change."""
@@ -437,8 +512,15 @@ class Manifest:
             "starter_content": "seed" in has,
             "attach": self.data.attach is not None,
             "server": self.data.server is not None,
-            # Two app slots on one set of data (D7): a data server, and migrations the previous release survives.
-            "bluegreen": self.data.server is not None and self.data.migrations == "expand_contract",
+            "edge": self.edge is not None,
+            "managed": self.data.managed is not None,
+            # Everything a DigitalOcean environment needs: the edge, and managed data for every attach need.
+            "digitalocean": self.edge is not None and self.data.managed is not None and self.data.attach is not None
+                            and set(self.data.attach.needs) <= set(self.data.managed.needs),
+            # Two app slots on one set of data (D7): a data server or managed data, and migrations the previous
+            # release survives.
+            "bluegreen": (self.data.server is not None or self.data.managed is not None)
+                         and self.data.migrations == "expand_contract",
         }
         return tuple(c for c in CAPABILITIES if on[c])
 
@@ -466,6 +548,8 @@ class Manifest:
             "first_admin": self.first_admin.to_json() if self.first_admin else None,
             "timeouts": {k: self.timeout(k) // 60 for k in timed},  # minutes, the defaults filled in
             "capabilities": list(self.capabilities()),
+            # Only when declared, so what is stored for an app without one stays as it was (I1).
+            **({"edge": self.edge.to_json()} if self.edge is not None else {}),
         }
 
 
@@ -548,7 +632,8 @@ def parse(text: str) -> Manifest:
         raise ManifestError(f"slipway.yml is not valid YAML: {exc}") from None
     data = _mapping(data, "the file")
     _only(data, ("version", "name", "env_file", "placeholder", "settings", "vars", "secrets", "services",
-                 "optional_services", "projects", "images", "commands", "data", "first_admin", "timeouts"), "the file")
+                 "optional_services", "projects", "images", "commands", "data", "first_admin", "timeouts", "edge"),
+          "the file")
     if data.get("version") != 1:
         raise _err("version", "must be 1")
     name = _str(data.get("name"), "name", max_len=100)
@@ -679,15 +764,18 @@ def parse(text: str) -> Manifest:
         if raw_data.get("attach") is not None else None
     server = _server(raw_data["server"], taken, secret_list, services, projects, commands, data_spec, attach) \
         if raw_data.get("server") is not None else None
-    if attach or server:
-        data_spec = replace(data_spec, attach=attach, server=server)
+    managed = _managed(raw_data["managed"], taken, {s.key for s in secret_list}, services, attach) \
+        if raw_data.get("managed") is not None else None
+    if attach or server or managed:
+        data_spec = replace(data_spec, attach=attach, server=server, managed=managed)
+    edge = _edge(data["edge"], taken, services, projects, attach, managed) if data.get("edge") is not None else None
     timeouts = _timeouts(data.get("timeouts"), commands, first_admin)
 
     return Manifest(
         name=name, env_file=env_file, placeholder=placeholder, settings=tuple(settings), vars=variables,
         secrets=tuple(secret_list), services=tuple(services), optional_var=optional_var, optional_none=optional_none,
         projects=projects, images=images, commands=commands, streams=streams, data=data_spec, first_admin=first_admin,
-        timeouts=timeouts,
+        timeouts=timeouts, edge=edge,
     )
 
 
@@ -802,8 +890,8 @@ def _label(value: Any, pattern: re.Pattern[str], where: str, what: str) -> str:
 
 def _data(value: Any) -> DataSpec:
     spec = _mapping(value, "data")
-    _only(spec, ("app", "format", "volumes", "files", "identity_label", "identity_help", "migrations", "attach", "server"),
-          "data")
+    _only(spec, ("app", "format", "volumes", "files", "identity_label", "identity_help", "migrations", "attach", "server",
+                 "managed"), "data")
     migrations = spec.get("migrations")
     if migrations is not None and migrations not in MIGRATIONS:
         raise _err("data.migrations", "the only value is expand_contract")
@@ -898,18 +986,22 @@ def _attach(value: Any, taken: dict[str, str], secret_keys: set[str]) -> DataAtt
         needs[name] = kind
     env = _env_values(spec.get("env"), f"{where}.env", (1, MAX_ATTACH_ENV), taken, frozenset({"data", "secret"}))
     for key, tmpl in env.items():
-        for name in placeholders(tmpl):
-            if name.startswith("data."):
-                _, need, fld = name.split(".")
-                if need not in needs:
-                    raise _err(f"{where}.env.{key}", f"{{{name}}} isn't one of data.attach.needs ({', '.join(needs)})")
-                fields = ENDPOINT_FIELDS[needs[need]]
-                if fld not in fields:
-                    raise _err(f"{where}.env.{key}",
-                               f"{{{name}}} isn't a field of a {needs[need]} endpoint ({', '.join(fields)})")
-            elif name.startswith("secret.") and name.removeprefix("secret.") not in secret_keys:
-                raise _err(f"{where}.env.{key}", f"{{{name}}} isn't one of secrets")
+        _check_data_refs(tmpl, f"{where}.env.{key}", needs, secret_keys)
     return DataAttach(needs=needs, env=env)
+
+
+def _check_data_refs(template: str, where: str, needs: dict[str, str], secret_keys: set[str]) -> None:
+    """``{data.<need>.<field>}``: a declared need and a field of its kind; ``{secret.K}``: a declared secret."""
+    for name in placeholders(template):
+        if name.startswith("data."):
+            _, need, fld = name.split(".")
+            if need not in needs:
+                raise _err(where, f"{{{name}}} isn't one of data.attach.needs ({', '.join(needs)})")
+            fields = ENDPOINT_FIELDS[needs[need]]
+            if fld not in fields:
+                raise _err(where, f"{{{name}}} isn't a field of a {needs[need]} endpoint ({', '.join(fields)})")
+        elif name.startswith("secret.") and name.removeprefix("secret.") not in secret_keys:
+            raise _err(where, f"{{{name}}} isn't one of secrets")
 
 
 def _server(value: Any, taken: dict[str, str], secret_list: list[Secret], services: list[Service],
@@ -1062,6 +1154,149 @@ def _provides(value: Any, attach: DataAttach, declared: list[str], server_secret
             rendered[fld] = text
         out[need] = rendered
     return out
+
+
+# --------------------------------------------------- DigitalOcean (phase 4): managed and edge
+
+
+def _pg_name(value: Any, where: str, reserved: frozenset[str]) -> str:
+    """A database or user name the managed cluster gets: refused here what do_rules would refuse later."""
+    text = _str(value, where, max_len=63)
+    if not do_rules.PG_IDENT_RE.match(text):
+        raise _err(where, f"'{text}' isn't a PostgreSQL name: a lowercase letter or '_', then lowercase letters, "
+                          "digits and '_', at most 63")
+    if text in reserved or text.startswith("pg_"):
+        raise _err(where, f"'{text}' is reserved by PostgreSQL or DigitalOcean")
+    return text
+
+
+def _managed(value: Any, taken: dict[str, str], secret_keys: set[str], services: list[Service],
+             attach: DataAttach | None) -> DataManaged:
+    """data.managed: an entry for every data.attach.needs endpoint, the services that don't run, the .env keys
+    written only on managed data, and the commands that replace the app's there (§5.1, §5.2 rules 5-9, 11)."""
+    where = "data.managed"
+    spec = _mapping(value, where)
+    if attach is None:
+        raise ManifestError("slipway.yml: data.managed needs data.attach: the app slots must be told where the data is")
+    for need in attach.needs:
+        if need in MANAGED_KEYS:
+            raise _err(f"data.attach.needs.{need}", f"{', '.join(MANAGED_KEYS[:-1])} and {MANAGED_KEYS[-1]} are "
+                                                    "data.managed's own keys, so they can't be endpoint names")
+    for key in spec:
+        if key not in MANAGED_KEYS and key not in attach.needs:
+            raise _err(f"{where}.{key}", f"isn't one of data.attach.needs ({', '.join(attach.needs)})")
+    for need in attach.needs:
+        if need not in spec:
+            raise _err(where, f"needs an entry for {need} (data.attach.needs lists it)")
+    by_name = {s.name: s for s in services}
+
+    skip = _name_list(spec.get("skip"), f"{where}.skip", 20)
+    for i, name in enumerate(skip):
+        if name not in by_name:
+            raise _err(f"{where}.skip[{i}]", f"{name} is not one of services")
+
+    needs: dict[str, dict[str, Any]] = {}
+    for need, kind in attach.needs.items():
+        nwhere = f"{where}.{need}"
+        entry = _mapping(spec[need], nwhere)
+        fields = MANAGED_FIELDS[kind]
+        _only(entry, fields, nwhere)
+        if kind == "postgres":
+            for fld in fields:
+                if fld not in entry:
+                    raise _err(nwhere, f"needs {fld} (postgres entries have {', '.join(fields)})")
+            version = _str(entry["version"], f"{nwhere}.version", max_len=10)
+            if version not in POSTGRES_VERSIONS:
+                raise _err(f"{nwhere}.version", f"'{version}' isn't a version DigitalOcean offers here "
+                                                f"({POSTGRES_VERSIONS[0]}-{POSTGRES_VERSIONS[-1]})")
+            database = _pg_name(entry["database"], f"{nwhere}.database", do_rules.RESERVED_DATABASES)
+            user = _pg_name(entry["user"], f"{nwhere}.user", do_rules.RESERVED_ROLES)
+            password = _str(entry["password"], f"{nwhere}.password", max_len=200)
+            m = _SECRET_REF.match(password)
+            if not m:
+                raise _err(f"{nwhere}.password", 'must be one secret, such as "{secret.POSTGRES_PASSWORD}"')
+            if m.group(1) not in secret_keys:
+                raise _err(f"{nwhere}.password", f"{password} isn't one of secrets")
+            needs[need] = {"version": version, "database": database, "user": user, "password": password}
+        else:
+            cors = _name_list(entry.get("cors"), f"{nwhere}.cors", MAX_CORS)
+            for i, name in enumerate(cors):
+                cwhere = f"{nwhere}.cors[{i}]"
+                svc = by_name.get(name)
+                if svc is None:
+                    raise _err(cwhere, f"{name} is not one of services")
+                if svc.hostname is None:
+                    raise _err(cwhere, f"{name} has no hostname, so it has no origin to allow")
+                if name in skip:
+                    raise _err(cwhere, f"{name} is in data.managed.skip, so it doesn't run")
+            needs[need] = {"cors": tuple(cors)}
+
+    raw_env = _mapping(spec.get("env"), f"{where}.env")
+    for key in raw_env:
+        if key in attach.env:
+            raise _err(f"{where}.env.{key}", "is already set by data.attach.env")
+    env = _env_values(raw_env, f"{where}.env", (0, MAX_MANAGED_ENV), taken, frozenset({"data", "secret"}))
+    for key, tmpl in env.items():
+        _check_data_refs(tmpl, f"{where}.env.{key}", attach.needs, secret_keys)
+
+    commands: dict[str, tuple[str, ...]] = {}
+    for key, cspec in _mapping(spec.get("commands"), f"{where}.commands").items():
+        if key not in MANAGED_COMMANDS:
+            raise _err(f"{where}.commands.{key}", f"unknown command (allowed: {', '.join(MANAGED_COMMANDS)})")
+        commands[key] = _argv(cspec, f"{where}.commands.{key}")[0]
+    return DataManaged(needs=needs, skip=tuple(skip), env=env, commands=commands)
+
+
+def _edge(value: Any, taken: dict[str, str], services: list[Service], projects: tuple[str, ...],
+          attach: DataAttach | None, managed: DataManaged | None) -> Edge:
+    """edge: how the app serves its names behind a cloud load balancer (§5.1, §5.2 rules 2-4)."""
+    where = "edge"
+    spec = _mapping(value, where)
+    _only(spec, ("port", "health", "env", "projects"), where)
+    if spec.get("port") is None or spec.get("health") is None:
+        raise _err(where, "give port (the host port each app slot serves plain HTTP on) and health "
+                          "(the path the load balancer asks for)")
+    port = _port(spec["port"], f"{where}.port")
+    for svc in services:
+        if svc.port == port:
+            raise _err(f"{where}.port", f"{port} is the {svc.name} service's port")
+    health = _str(spec["health"], f"{where}.health", max_len=200)
+    if not HEALTH_RE.match(health):
+        raise _err(f"{where}.health", f"'{health}' is not a path such as /healthz")
+
+    raw = _mapping(spec.get("env"), f"{where}.env")
+    if not 1 <= len(raw) <= MAX_EDGE_ENV:
+        raise _err(f"{where}.env", f"give 1 to {MAX_EDGE_ENV} keys")
+    env: dict[str, str] = {}
+    for key, tmpl in raw.items():
+        kwhere = f"{where}.env.{key}"
+        _env_key(key, kwhere)
+        what = taken.get(key, "")
+        if what.startswith("secrets."):
+            raise _err(kwhere, "is a secret; Slipway generates it")
+        if what.endswith(".port_var"):
+            raise _err(kwhere, "is a port variable; Slipway sets it")
+        if what == "optional_services.var":
+            raise _err(kwhere, f"is {what}; Slipway sets it")
+        if attach is not None and key in attach.env:
+            raise _err(kwhere, "is already set by data.attach.env")
+        if managed is not None and key in managed.env:
+            raise _err(kwhere, "is already set by data.managed.env")
+        text = _str(tmpl, kwhere, max_len=1000, allow_empty=True)
+        for name in placeholders(text):
+            if _env_value_kind(name) not in (None, "edge"):
+                raise _err(kwhere, f"{{{name}}} can't be used here: edge.env may use "
+                                   "{edge.address}, {edge.trusted}, settings and vars")
+        check_template(text, kwhere, allow=frozenset({"edge"}))
+        env[key] = text
+
+    extra = _template_list(spec.get("projects"), f"{where}.projects", MAX_EDGE_PROJECTS)
+    for i, item in enumerate(extra):
+        if item in projects:
+            raise _err(f"{where}.projects[{i}]", f"'{item}' is already one of projects")
+        if item in extra[:i]:
+            raise _err(f"{where}.projects", f"'{item}' is listed twice")
+    return Edge(port=port, health=health, env=env, projects=tuple(extra))
 
 
 def _check_data_rules(commands: dict[str, tuple[str, ...]], data: DataSpec) -> None:
@@ -1239,7 +1474,7 @@ def placeholders(template: str) -> list[str]:
 def _env_value_kind(name: str) -> str | None:
     """Which environment value a placeholder is (a ``_PLACES`` key), or None for any other name."""
     head = name.split(".", 1)[0]
-    if "." in name and head in ("data", "secret"):
+    if "." in name and head in ("data", "secret", "edge"):
         return head
     if name in ("server.host", "server.clients"):
         return name
@@ -1257,6 +1492,9 @@ def _check_env_value(name: str, where: str) -> None:
     elif parts[0] == "secret":
         if len(parts) != 2 or not ENV_KEY_RE.match(parts[1]):
             raise _err(where, f"{{{name}}} is not {{secret.<KEY>}}, such as {{secret.POSTGRES_PASSWORD}}")
+    elif parts[0] == "edge":
+        if len(parts) != 2 or parts[1] not in EDGE_VALUES:
+            raise _err(where, f"{{{name}}} is not one of {', '.join('edge.' + v for v in EDGE_VALUES)}")
     elif name not in ("server.host", "server.clients") and not (
             len(parts) == 3 and parts[1] == "port" and FIELD_RE.match(parts[2])):
         raise _err(where, f"{{{name}}} is not one of server.host, server.port.<name>, server.clients")
@@ -1264,7 +1502,7 @@ def _check_env_value(name: str, where: str) -> None:
 
 def check_template(template: str, where: str, *, allow: frozenset[str] = frozenset()) -> None:
     """Check a template's placeholders. ``allow`` names the environment values (``_PLACES`` keys) it may use:
-    none, except in data.attach.env, data.server.env and data.server.provides."""
+    none, except in data.attach.env, data.managed.env, data.server.env, data.server.provides and edge.env."""
     for m in _PLACEHOLDER.finditer(template):
         token, name = m.group(0), m.group(1)
         if token in ("{{", "}}"):
@@ -1452,9 +1690,11 @@ class AppPlan:
     provides: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-def check_instance_env(manifest: Manifest, env: dict[str, str], role: str = "app") -> None:
+def check_instance_env(manifest: Manifest, env: dict[str, str], role: str = "app", *, managed: bool = False,
+                       edge: bool = False) -> None:
     """The instance's own variables may not change what Slipway sets. An environment's variables (the
-    ``slot`` and ``server`` roles) may not set what data.attach and data.server set either."""
+    ``slot`` and ``server`` roles) may not set what data.attach and data.server set either, nor, on an app slot
+    on managed data (``managed``) or behind a load balancer (``edge``), what data.managed.env and edge.env set."""
     clash = sorted(set(env) & (manifest.slipway_keys() | manifest.setting_keys()))
     if clash:
         raise ManifestError(
@@ -1468,6 +1708,17 @@ def check_instance_env(manifest: Manifest, env: dict[str, str], role: str = "app
             raise ManifestError(
                 f"{', '.join(clash)} {'is' if len(clash) == 1 else 'are'} set from slipway.yml's data.attach or "
                 f"data.server; remove {'it' if len(clash) == 1 else 'them'} from the environment's variables"
+            )
+        keys: set[str] = set()
+        if managed and manifest.data.managed is not None:
+            keys |= set(manifest.data.managed.env)
+        if edge and manifest.edge is not None:
+            keys |= set(manifest.edge.env)
+        clash = sorted(set(env) & keys)
+        if clash:
+            raise ManifestError(
+                f"{', '.join(clash)} {'is' if len(clash) == 1 else 'are'} set from slipway.yml's edge.env or "
+                f"data.managed.env; remove {'it' if len(clash) == 1 else 'them'} from the environment's variables"
             )
 
 
@@ -1491,6 +1742,9 @@ def plan(
     role: str = "app",
     data_values: dict[str, dict[str, str]] | None = None,
     server_values: dict[str, Any] | None = None,
+    without: set[str] | None = None,
+    managed: bool = False,
+    edge_values: dict[str, str] | None = None,
 ) -> AppPlan:
     """Render an app's ``.env``, routes, projects and commands.
 
@@ -1505,6 +1759,14 @@ def plan(
     server: only its services, ports, projects and volumes, ``data.server.env`` and commands, and only
     ``data.server.secrets`` (every other secret is written empty). ``server_values`` is ``{host, clients,
     ports?}``: the server host's address, the app slots' addresses, and port overrides over ``host_ports``.
+
+    The ``slot`` role also takes (phase 4, §5.3): ``without``, the services that don't run (default:
+    ``data.managed.skip`` with ``managed``, else ``data.server.services``); ``managed``, data on a managed
+    database and object store (``data_values`` is then what the provider made): ``data.managed.env`` right after
+    ``data.attach.env``, and ``data.managed.commands`` in place of has_data and data_up; and ``edge_values``
+    (``{address, trusted}``), behind a load balancer: ``edge.env`` after those (a setting it names takes the edge's
+    value and isn't required), ``edge.projects`` added to the projects. With either, only ``data.volumes`` that
+    hold ``other`` stay (the database and files are managed). Without them the role renders exactly as before.
     """
     if role not in ROLES:
         raise ValueError(f"unknown plan role {role!r}")
@@ -1513,7 +1775,14 @@ def plan(
         raise ManifestError("slipway.yml has no data.attach, so the app can't run on a host that doesn't hold its data")
     if role == "server" and server is None:
         raise ManifestError("slipway.yml has no data.server, so Slipway can't run the app's data services on their own")
-    check_instance_env(manifest, env, role)
+    if (managed or edge_values is not None or without is not None) and role != "slot":
+        raise ValueError("without, managed and edge_values are for the slot role")
+    managed_spec, edge = manifest.data.managed, manifest.edge
+    if managed and managed_spec is None:
+        raise ManifestError("slipway.yml has no data.managed, so the app can't run on a managed database")
+    if edge_values is not None and edge is None:
+        raise ManifestError("slipway.yml has no edge, so the app can't serve its names behind a load balancer")
+    check_instance_env(manifest, env, role, managed=managed, edge=edge_values is not None)
     _, defaults = parse_env_template(template or "")
     values = dict(defaults)
     written: list[str] = []
@@ -1524,15 +1793,18 @@ def plan(
             written.append(key)
 
     missing = []
+    set_by_edge = manifest.edge_settings() if edge_values is not None else set()
     for s in manifest.settings:
         value = (settings.get(s.key) or "").strip() or s.default
-        if not value and s.required:
+        if not value and s.required and s.key not in set_by_edge:
             missing.append(f"{s.label} ({s.key})")
         if value or s.key not in values:
             put(s.key, value)
     if missing:
         raise ManifestError(f"Set {', '.join(missing)} in the app settings of the instance")
-    on = manifest.services_for(role, chosen)
+    if without is None and managed and managed_spec is not None:
+        without = set(managed_spec.skip)
+    on = manifest.services_for(role, chosen, without=without)
     ports = dict(host_ports)
     if role == "server":
         ports.update({str(k): int(v) for k, v in ((server_values or {}).get("ports") or {}).items()})
@@ -1595,6 +1867,23 @@ def plan(
                 secret_env.add(key)
                 secret_values.add(value)
                 secret_values.update(given[n] for n in used if given.get(n))
+        if managed and managed_spec is not None:  # right after data.attach.env, by the same rules
+            for key, tmpl in managed_spec.env.items():
+                value = render(tmpl, builtins, ctx, f"data.managed.env.{key}", hidden=hidden,
+                               blocked={**blocked, **stale}, values=given)
+                used = [n for n in placeholders(tmpl) if n in secret_names]
+                if not value:
+                    continue
+                put(key, value)
+                if used:
+                    secret_env.add(key)
+                    secret_values.add(value)
+                    secret_values.update(given[n] for n in used if given.get(n))
+        if edge_values is not None and edge is not None:  # after those: the edge's own keys and settings
+            at = {f"edge.{k}": str(edge_values[k]) for k in EDGE_VALUES if edge_values.get(k)}
+            for key, tmpl in edge.env.items():
+                put(key, render(tmpl, builtins, ctx, f"edge.env.{key}", hidden=hidden, blocked={**blocked, **stale},
+                                values=at))
     elif role == "server":
         assert server is not None
         for key, tmpl in server.env.items():
@@ -1637,6 +1926,14 @@ def plan(
         if not PROJECT_RE.match(name):
             raise ManifestError(f"projects[{i}]: '{name}' is not a Compose project name")
         projects.append(name)
+    if edge_values is not None and edge is not None:
+        for i, tmpl in enumerate(edge.projects):
+            name = render(tmpl, builtins, usable, f"edge.projects[{i}]", hidden=hidden, blocked=blocked)
+            if not PROJECT_RE.match(name):
+                raise ManifestError(f"edge.projects[{i}]: '{name}' is not a Compose project name")
+            if name in projects:
+                raise ManifestError(f"edge.projects[{i}]: '{name}' is already one of the projects")
+            projects.append(name)
     images = []
     for i, tmpl in enumerate(manifest.images):
         ref = render(tmpl, builtins, usable, f"images[{i}]", hidden=hidden, blocked=blocked)
@@ -1662,6 +1959,9 @@ def plan(
     if role == "server" and server is not None:
         for key, t in server.commands.items():  # the server's own commands replace the app's (no streams)
             commands[key] = {"argv": argv(t, f"data.server.commands.{key}"), "stream": None}
+    if managed and managed_spec is not None:
+        for key, t in managed_spec.commands.items():  # has_data and data_up on managed data
+            commands[key] = {"argv": argv(t, f"data.managed.commands.{key}"), "stream": None}
     for key, cmd in commands.items():
         program_ok(cmd["argv"][0], f"commands.{key}[0]")
     first_admin = None
@@ -1676,9 +1976,13 @@ def plan(
     volumes: list[dict[str, str]] = []
     on_server = set(server.volumes if server.volumes is not None else [v.name for v in manifest.data.volumes]) \
         if server is not None else set()
+    elsewhere = managed or edge_values is not None  # the database and files are managed: only holds: other stays
     for i, vol in enumerate(manifest.data.volumes):
         # An app slot keeps only the volumes that aren't on the data server; the data server only those.
-        if (role == "slot" and vol.name in on_server) or (role == "server" and vol.name not in on_server):
+        if elsewhere:
+            if vol.holds != "other":
+                continue
+        elif (role == "slot" and vol.name in on_server) or (role == "server" and vol.name not in on_server):
             continue
         where = f"data.volumes[{i}].name"
         name = render(vol.name, builtins, usable, where, hidden=hidden, blocked=blocked)

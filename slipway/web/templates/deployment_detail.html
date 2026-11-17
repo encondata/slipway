@@ -24,7 +24,7 @@
     {% if env and can_envs %}<a class="btn" href="/environments/{{ env.id }}">{{ icon("environments") }} Open environment</a>{% endif %}
     {% if not dep.is_active and may_retry %}
       {% if retry.available %}
-        {% if retry.needs_confirm or retry.offers_forget_traffic %}
+        {% if retry.needs_confirm or retry.offers_forget_traffic or d.phrases or d.offers_drop_data or d.offers_forget_vms %}
         <button class="btn btn-primary" type="button" data-open="retry-env-job">{{ icon("restart") }} Retry…</button>
         {% else %}
         <button class="btn btn-primary" data-api="POST /api/v1/deployments/{{ dep.id }}/retry" data-then="redirect:/deployments/{id}">{{ icon("restart") }} Try again</button>
@@ -38,13 +38,14 @@
 
 <div class="grid grid-4">
   <div class="card stat"><div class="label">{{ icon("commit") }} Commit</div><div class="value mono" style="font-size: 22px">{{ dep.short_sha or "—" }}</div><div class="hint truncate">{{ dep.commit_message or "—" }}</div></div>
-  <div class="card stat"><div class="label">{{ icon("user") }} Triggered by</div><div class="value" style="font-size: 22px">{{ dep.triggered_by.display_name if dep.triggered_by else "Slipway" }}</div><div class="hint">{{ dep.created_at|dt }}</div></div>
+  <div class="card stat"><div class="label">{{ icon("user") }} Triggered by</div><div class="value" style="font-size: 22px">{{ d.by or "Slipway" }}</div><div class="hint">{{ dep.created_at|dt }}</div></div>
   <div class="card stat"><div class="label">{{ icon("clock") }} Duration</div><div class="value" style="font-size: 22px">{{ dep.duration_seconds|duration }}</div><div class="hint">{% if dep.finished_at %}Finished {{ dep.finished_at|timeago }}{% else %}In progress{% endif %}</div></div>
   <div class="card stat"><div class="label">{{ icon("environments") }} What</div><div class="value" style="font-size: 22px">{{ d.label }}</div><div class="hint">{{ env.name if env else "" }}{% if (dep.options or {}).get("back") %} · switch back{% endif %}</div></div>
 </div>
 
 {% if d.switch %}<div class="callout {{ 'success' if dep.status == 'succeeded' else 'warning' }}">{{ icon("globe") }}<span>{{ d.switch }}.</span></div>{% endif %}
 {% if dep.retry_of_id %}<div class="callout primary">{{ icon("info") }}<span>Retry of <a href="/deployments/{{ dep.retry_of_id }}">{{ (d.retry_of.kind if d.retry_of else kind)|kind_noun }} {{ dep.retry_of_id|string|truncate(8, True, "") }}</a>.</span></div>{% endif %}
+{% if not dep.triggered_by and (dep.options or {}).get("by") %}<div class="callout primary" data-started-by>{{ icon("info") }}<span>Started by {{ d.by }}.</span></div>{% endif %}
 {% if not retry.available and retry.reason and dep.status in ("failed", "cancelled") %}
 <p class="subtle" style="margin: 0">Retry isn't available: {{ retry.reason }}</p>
 {% endif %}
@@ -69,7 +70,7 @@
   </div>
 </section>
 
-{% if not dep.is_active and may_retry and retry.available and (retry.needs_confirm or retry.offers_forget_traffic) and env %}
+{% if not dep.is_active and may_retry and retry.available and (retry.needs_confirm or retry.offers_forget_traffic or d.phrases or d.offers_drop_data or d.offers_forget_vms) and env %}
 {% from "_environment_dialogs.html" import retry_env_dialog with context %}
 {{ retry_env_dialog(dep, env, d) }}
 {% endif %}
@@ -116,6 +117,10 @@
         {% endif %}
       {% elif retry_off %}
         <button class="btn btn-primary" type="button" disabled title="{{ retry_off }}">{{ icon("restart") }} Retry…</button>
+      {% endif %}
+      {#- A gone cluster or bucket under live data (P4 §10.1): retry and make it again, empty. #}
+      {% if d.rebuild and retry.available and can_retry and auth.can(Perm.DATA_RESET) %}
+        <button class="btn btn-danger" type="button" data-open="retry-rebuild">Make it again, empty…</button>
       {% endif %}
       {#- A slot of an environment is deployed from the environment's page (Slipway picks the slot). #}
       {% if kind == "deploy" and not dep.instance.environment_id %}
@@ -223,6 +228,7 @@
     {%- else %}{{ rollback_dialog(dep, instance, d) }}{% endif %}
   {% endif %}
   {% if d.again %}{% from "_environment_dialogs.html" import deploy_again_dialog with context %}{{ deploy_again_dialog(dep, d.again) }}{% endif %}
+  {% if d.rebuild and retry.available and can_retry and auth.can(Perm.DATA_RESET) %}{% from "_environment_dialogs.html" import rebuild_retry_dialog with context %}{{ rebuild_retry_dialog(dep, d.rebuild) }}{% endif %}
 {% endif %}
 {% if not dep.is_active and d.undo and not d.undo.restore_off and auth.can(Perm.DATA_RESTORE) %}{{ restore_dialog(instance, d) }}{% endif %}
 {% endif %}

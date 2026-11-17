@@ -27,6 +27,10 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "aiosqlite>=0.20",
+    "pyvmomi==8.0.3.0.1",  # ESXi client tests over tests/fake_vim.py
+]
+esxi = [
+    "pyvmomi==8.0.3.0.1",  # 8.0.3 still supports ESXi 7; keep equal to requirements-esxi.txt
 ]
 
 [project.scripts]
@@ -40,7 +44,8 @@ build-backend = "setuptools.build_meta"
 include = ["slipway*"]
 
 [tool.setuptools.package-data]
-slipway = ["web/templates/**/*", "web/static/**/*"]
+# setuptools' `*` skips dotfiles, so the Terraform module's lock file is named on its own.
+slipway = ["web/templates/**/*", "web/static/**/*", "terraform/**/*", "terraform/**/.terraform.lock.hcl"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

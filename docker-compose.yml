@@ -28,6 +28,9 @@ services:
     build: .
     image: slipway:latest
     restart: unless-stopped
+    # Time to stop cleanly: a running Terraform gets 30 s to save its state after being asked to
+    # stop. With Docker's 10 s default, a half-made VM is left for the next deploy to clean up.
+    stop_grace_period: 60s
     depends_on:
       db:
         condition: service_healthy

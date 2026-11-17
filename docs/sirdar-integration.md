@@ -1,8 +1,9 @@
 # Bringing Sirdar into Slipway
 
 Status: phases 1 (manifest and steps), 2 (data safety) and 3 (environments and slots) are
-built on branch `sirdar` (from `instance-folders`). Phases 2 and 3 still have to pass their
-real-host checks below. Phases 4 to 6 are the plan.
+built on branch `sirdar` (from `instance-folders`). Phases 4 (DigitalOcean) and 5 (Proxmox and
+ESXi VMs) are built on branch `machines`, against fakes only. Phases 2 to 5 still have to pass
+their real-host and real-account checks below. Phase 6 is the plan.
 
 ## Goal
 
@@ -22,8 +23,8 @@ it deploys the same way. Once it matches Sirdar, Sirdar is retired.
 | What it deploys | any repository: a Dockerfile or a compose file | ServerSherpa only: the five stacks in `deploy/stack`, through `ss-stack` |
 | Unit | instance: one repository, one branch, one host; phase 3: environment, one or two app slots and a data server, each an instance | environment: one ServerSherpa, one or two slots |
 | Engine | shell over its own SSH session, one log per deployment | 17 numbered steps as Ansible playbooks, one log per step, retry from the failed step |
-| Targets | SSH hosts | SSH, Proxmox (Terraform), ESXi (pyvmomi), DigitalOcean (VPC, droplets, managed Postgres, Spaces, load balancer, firewall, certificates) |
-| Traffic | Switchyard routes; phase 3: Activate repoints an environment's names in Switchyard, and Cloudflare DNS records at a fixed address | Cloudflare DNS, Nginx Proxy Manager on the LAN, DigitalOcean load balancer plus Caddy in the cloud |
+| Targets | SSH hosts; phases 4 and 5: DigitalOcean (VPC, droplets, managed Postgres, Spaces, load balancer, firewall, certificates), Proxmox (Terraform) and ESXi (pyvmomi) VMs | SSH, Proxmox (Terraform), ESXi (pyvmomi), DigitalOcean (VPC, droplets, managed Postgres, Spaces, load balancer, firewall, certificates) |
+| Traffic | Switchyard routes; phase 3: Activate repoints an environment's names in Switchyard, and Cloudflare DNS records at a fixed address; phase 4: a DigitalOcean load balancer | Cloudflare DNS, Nginx Proxy Manager on the LAN, DigitalOcean load balancer plus Caddy in the cloud |
 | Data | phase 2: a backup before every change that replaces data, the Backups list, restore, reset, roll back, encrypted snapshots ([snapshots.md](snapshots.md)) | a dump before each Update only (not before a restore or a reset), restore, reset, roll back, snapshot bundles, VM snapshots |
 
 Sirdar's ServerSherpa knowledge sits in a few modules: `envfile.py` (the `.env`
@@ -131,7 +132,8 @@ expand_contract` (required for two app slots), `data.attach` (the `.env` keys th
 point an app slot at data on another host, built from named endpoints such as
 `{data.db.host}`) and `data.server` (which services, ports, secrets, projects,
 volumes and commands the data server uses, and the endpoints it provides). Phase 4
-fills the same `data.attach` from a managed Postgres and a Spaces bucket. An
+adds `edge` and `data.managed` ([manifest.md](manifest.md#digitalocean-edge-and-datamanaged))
+and fills the same `data.attach` endpoints from a managed Postgres and a Spaces bucket. An
 instance outside an environment whose data lives outside its host
 (`STACK_EXTERNAL_DATA=1`, `STACK_DB_HOST`, or a hand-made data VM, where
 `ss-stack has-data` exits 4) is still backed up, and Slipway still won't restore
@@ -149,11 +151,22 @@ deploy, logs, ports and folders keep working, and each can be on a different ser
 One slot is active. Instances that don't belong to an environment keep working as
 they do now. [environments.md](environments.md) explains how to set one up and run it.
 
-**Providers that make hosts.** A host gets a provider: `ssh` (today's hosts),
-`digitalocean`, `proxmox` or `esxi`. A provider creates the server, pins its host
-key before the first connection (cloud-init on DigitalOcean, as Sirdar does),
-resizes it, snapshots it and destroys it. What it creates is an ordinary host in
-the Hosts list, marked as owned by its environment.
+**Providers that make hosts (phases 4 and 5, built).** A host has a provider: `ssh`
+(hosts you add), `digitalocean`, `proxmox` or `esxi`. A provider makes the server at
+its slot's first deploy, resizes it in a later deploy, and destroys it with its slot or
+environment. What it makes is an ordinary host in the Hosts list, owned by its
+environment: only that environment's slots run there, and it isn't built until its
+provider says so. Neither provider trusts a key on first contact, but they pin it in
+two ways. On DigitalOcean, Slipway generates the droplet's host key, writes its public
+half to the host row before it sends the create, and hands the key pair to cloud-init,
+as Sirdar does; it then trusts only a droplet that answers with that key. On Proxmox
+and ESXi the key is learned out of band and pinned only after an SSH connection that
+presents exactly that key succeeds: Proxmox reads the new VM's own key through the
+guest agent over the pinned API, and on ESXi Slipway generates the key, hands it to
+cloud-init through guestinfo, and deletes the private half once the pin is made.
+Droplets are not rows of the VM `machines` table; both kinds share the host's
+`provider_state` phase (`planned`, `creating`, `ready`, `gone`).
+[digitalocean.md](digitalocean.md) and [machines.md](machines.md) describe their use.
 
 **Data resources.** A managed Postgres cluster, a Spaces bucket and its scoped key,
 or the app's own self-hosted stacks. They are tracked in a `resources` table
@@ -168,7 +181,7 @@ in one apply, checks the names through Switchyard, and puts them back if anythin
 fails (the role Nginx Proxy Manager plays in Sirdar). Phase 4 adds the DigitalOcean
 load balancer (add the new droplet, wait for health, smoke test, remove the old
 one). Cloudflare DNS is not a switch: Slipway keeps an A record per public name at
-one fixed address (the WAN address, or later the load balancer's), as Sirdar does.
+one fixed address (the WAN address, or on DigitalOcean the load balancer's), as Sirdar does.
 
 **Steps.** Every deployment runs as numbered steps (Resolve the commit, Download
 the source, Upload the release, Read slipway.yml, Check host ports, Write the
@@ -183,8 +196,10 @@ Phase 2 adds Back up the data (after Build) to an app's deploys, and data jobs
 deployments of their own kind with their own steps. Phase 3 adds the environment's
 steps: Check the slot (smoke test), Update Switchyard, Update DNS records, Stop and
 start Blue and Green around a data job, and the steps of the jobs that run on the
-environment itself (Activate, Publish names, Discard, Remove a slot, Delete). Phase 5
-adds Prepare server.
+environment itself (Activate, Publish names, Discard, Remove a slot, Delete). Phases 4
+and 5 add Prepare (make or check the droplet or VM) right after Resolve, Resize after the
+backup, the managed database and the load balancer on DigitalOcean, and the jobs Renew the
+certificate, Take off the air and the VM snapshot jobs.
 
 **Backups and snapshots (phase 2).** A backup before every change that replaces
 data: before a deploy (which migrates), a restore, a reset and a roll back, kept
@@ -192,8 +207,10 @@ per instance (newest N) on its host. Sirdar dumps only before an Update. Restore
 reset, start over and roll back, each refused before it changes anything when the
 copy doesn't fit. Snapshots (the database, the files and the manifest's `identity`
 secrets, encrypted) to seed new instances, kept on the Slipway server, and
-downloadable with a passphrase. [snapshots.md](snapshots.md) describes them. VM
-snapshots on Proxmox and ESXi come with phase 5.
+downloadable with a passphrase. [snapshots.md](snapshots.md) describes them. On
+DigitalOcean the backups are kept on the Slipway server, since a droplet can be rebuilt.
+VM snapshots on Proxmox and ESXi (phase 5) are a separate thing, for a single slot that
+keeps its data on a VM ([machines.md](machines.md#vm-snapshots)).
 
 ## Decisions taken in this draft
 
@@ -281,10 +298,21 @@ Each phase merges on its own and leaves Slipway working.
        the environment page's notice continues it.
 
    After each, a user signs in with their own password and 2FA.
-4. **DigitalOcean.** Accounts (production and development), VPC, droplets as hosts,
-   managed Postgres, Spaces bucket and key, load balancer, firewall, certificates,
-   the load-balancer switch, delete with the name and the production phrase.
-5. **Proxmox and ESXi.** Creating, resizing, snapshotting and destroying VMs.
+4. **DigitalOcean (built; real-account checks to do).** Accounts (production and
+   development), VPC, droplets as hosts, managed Postgres, Spaces bucket and key, load
+   balancer, firewall, Let's Encrypt certificates and their renewal, the load-balancer
+   switch, cost confirmation, retire and take off the air, delete with the name and the
+   production phrase. The design is [phase4-digitalocean.md](phase4-digitalocean.md); how to
+   use it is [digitalocean.md](digitalocean.md). Its price table is dated and unchecked until
+   the real-account run (phase4-digitalocean.md §20.3, which lists the checks). BaseCampV3's
+   side (`edge` and `data.managed` in `slipway.yml`, `ss-stack has-data --external`) is on
+   `slipway-manifest` and is tracked there.
+5. **Proxmox and ESXi (built; real-host checks to do).** Creating, resizing, snapshotting
+   and destroying VMs, Forget a lost VM, and VM snapshots with revert. The design is
+   [phase5-machines.md](phase5-machines.md); how to use it is [machines.md](machines.md). The
+   Proxmox path needs one networked session before it can run outside the tests: the
+   Terraform lock file and the image's checksums (phase5-machines.md §16.3 item 18, which
+   lists the real-host checks).
 6. **Retiring Sirdar.** Delete its environments with Sirdar itself, so it removes
    the cloud resources it recorded, then shut it down. Nothing is imported.
 

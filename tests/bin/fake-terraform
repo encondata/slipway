@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""A fake Terraform for Slipway's tests (design §16.1). It never touches a network.
+
+It plays Terraform 1.16.5 with ``bpg/proxmox`` for Slipway's bundled module, reading the
+``terraform.tfvars.json`` Slipway writes. The "Proxmox" it changes is the JSON state file of
+``FakeProxmox`` (``fake_proxmox.py`` beside this folder, ``FAKE_PVE_STATE``), changed through that
+module's own helpers under its lock, so the fake API and this process see the same VMs. As
+``bpg/proxmox`` does, a create is two writes: the clone (name, description and pool, no tags,
+``lock: clone``), then the tags and settings.
+
+Tests start it through a wrapper named ``fake-terraform`` that runs this file with
+``sys.executable`` and hands it ``FAKE_CONFIG`` = {"pve_state", "script", "log"}, so Slipway's
+allowlisted environment reaches it unchanged. Without the wrapper it reads the same three from
+``$FAKE_PVE_STATE``, ``$FAKE_TF_SCRIPT`` and ``$FAKE_TF_LOG``.
+
+Commands: ``version -json``, ``init`` (``-lockfile=readonly`` refuses a lock file whose version or
+hash isn't the mirror's), ``plan -out``, ``show -json``, ``apply <plan>``, ``destroy -auto-approve``
+and ``state rm``. Every run's argv, environment variable names, cwd and pid go to the log, one
+JSON object per line (the token only as its sha256).
+
+Knobs, from the JSON file ``script`` names (read at each run):
+  fail_after_clone     apply clones, then fails: the VM exists, the state has it tainted
+  die_after_clone      apply clones, leaves the VM untagged with ``lock: clone`` for
+                       ``clone_lock_outlives`` API polls and no state, then SIGKILLs itself
+  clone_lock_outlives  n (default: FakeProxmox's own ``clone_lock_outlives`` knob, at least 1)
+
+FakeProxmox's ``resize_refused_with_snapshots`` knob makes an apply that grows the disk of a VM
+with snapshots fail, as Proxmox refuses it on a qcow2 disk.
+  hang                 [commands] that wait for SIGINT, then write their state and exit 1
+  sigint_delay         seconds a hanging command takes to save after SIGINT (default 0)
+  ignore_sigint        SIGINT is ignored (only SIGKILL stops it)
+  print                {command: [lines]} printed first
+  big_line             {command: bytes} prints one line that long first
+  plan_extra           "delete" (another resource deleted) or "resource" (another one made)
+  lineage              the lineage of a new state
+  mirror               provider versions the filesystem mirror holds (default ["0.115.0"])
+  host_key             the SSH host key a VM it makes has in its key file (FakeProxmox's agent reads it)
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+import time
+import uuid
+from pathlib import Path
+
+TF_VERSION = "1.16.5"
+PROVIDER = "registry.terraform.io/bpg/proxmox"
+VM = "proxmox_virtual_environment_vm.vm"
+LOCK_INFO = ".terraform.tfstate.lock.info"
+
+
+def provider_hash(version: str) -> str:
+    """The h1: hash the fake mirror's package of ``version`` has."""
+    return "h1:" + base64.b64encode(hashlib.sha256(f"fake-bpg-proxmox-{version}".encode()).digest()).decode()
+
+
+def _config() -> dict:
+    given = globals().get("FAKE_CONFIG") or {}
+    return {
+        "pve_state": given.get("pve_state") or os.environ.get("FAKE_PVE_STATE"),
+        "script": given.get("script") or os.environ.get("FAKE_TF_SCRIPT"),
+        "log": given.get("log") or os.environ.get("FAKE_TF_LOG"),
+    }
+
+
+CONFIG = _config()
+
+
+def knobs() -> dict:
+    path = CONFIG["script"]
+    if path and Path(path).exists():
+        return json.loads(Path(path).read_text() or "{}")
+    return {}
+
+
+def fail(text: str, code: int = 1) -> None:
+    print(f"\nError: {text}\n", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def write_json(path: Path, doc) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def log_run(argv: list[str]) -> None:
+    if not CONFIG["log"]:
+        return
+    token = os.environ.get("PROXMOX_VE_API_TOKEN")
+    entry = {
+        "argv": argv, "env": sorted(os.environ), "cwd": os.getcwd(), "pid": os.getpid(),
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest() if token else None,
+        "env_values": {k: os.environ[k] for k in ("HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "TF_CLI_CONFIG_FILE",
+                                                   "TF_IN_AUTOMATION", "TF_INPUT", "CHECKPOINT_DISABLE")
+                       if k in os.environ},
+    }
+    with open(CONFIG["log"], "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+# ------------------------------------------------------------------ "Proxmox"
+
+
+def _fake_proxmox():
+    """``fake_proxmox.py`` from the test folder above ``bin/`` (tests/)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "fake_proxmox.py"
+    spec = importlib.util.spec_from_file_location("fake_proxmox_for_terraform", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fp = _fake_proxmox()
+
+
+def pve():
+    """The FakeProxmox state under its lock (written back when the block ends)."""
+    if not CONFIG["pve_state"]:
+        fail("FAKE_PVE_STATE isn't set")
+    return fp.locked(CONFIG["pve_state"])
+
+
+def disk_spec(storage: str, vmid: int, size: int, file_format: str) -> str:
+    if file_format == "qcow2":
+        return f"{storage}:{vmid}/vm-{vmid}-disk-0.qcow2,size={size}G"
+    return f"{storage}:vm-{vmid}-disk-0,size={size}G"
+
+
+def net_spec(bridge: str, vlan: int | None) -> str:
+    return f"virtio,bridge={bridge}" + (f",tag={vlan}" if vlan else "")
+
+
+def _disk_size(spec: str) -> int | None:
+    match = re.search(r"size=(\d+)([GM])", spec or "")
+    if not match:
+        return None
+    return int(match.group(1)) if match.group(2) == "G" else int(match.group(1)) // 1024
+
+
+def _net(spec: str) -> tuple[str | None, int]:
+    bridge = re.search(r"bridge=([^,]+)", spec or "")
+    tag = re.search(r"tag=(\d+)", spec or "")
+    return (bridge.group(1) if bridge else None), (int(tag.group(1)) if tag else 0)
+
+
+# ------------------------------------------------------------------ state and plans
+
+
+def load_state() -> dict | None:
+    path = Path("terraform.tfstate")
+    if not path.exists() or not path.read_text().strip():
+        return None
+    return json.loads(path.read_text())
+
+
+def vm_resource(state: dict | None) -> dict | None:
+    for res in (state or {}).get("resources", []):
+        if f"{res['type']}.{res['name']}" == VM and res.get("instances"):
+            return res["instances"][0]
+    return None
+
+
+def write_state(state: dict | None, instance: dict | None) -> None:
+    """Write terraform.tfstate with serial + 1, keeping the lineage (a new one for a first state)."""
+    lineage = (state or {}).get("lineage") or knobs().get("lineage") or str(uuid.uuid4())
+    serial = (state or {}).get("serial", 0) + 1
+    resources = []
+    if instance is not None:
+        resources.append({
+            "mode": "managed", "type": "proxmox_virtual_environment_vm", "name": "vm",
+            "provider": f'provider["{PROVIDER}"]', "instances": [instance],
+        })
+    write_json(Path("terraform.tfstate"), {
+        "version": 4, "terraform_version": TF_VERSION, "serial": serial, "lineage": lineage,
+        "outputs": {}, "resources": resources, "check_results": None,
+    })
+
+
+def desired(v: dict) -> dict:
+    return {
+        "vm_id": v["vm_id"], "name": v["name"], "node_name": v["node"], "pool_id": v["pool"],
+        "tags": v["tags"], "description": v["description"], "started": True,
+        "cpu": [{"cores": v["cores"], "type": "host"}],
+        "memory": [{"dedicated": v["memory_mb"]}],
+        "disk": [{"interface": "scsi0", "datastore_id": v["datastore"], "size": v["disk_gb"],
+                  "file_format": v["file_format"]}],
+        "network_device": [{"bridge": v["bridge"], "vlan_id": v["vlan_id"] or 0}],
+    }
+
+
+def actual(vm: dict) -> dict:
+    config = vm.get("config", {})
+    scsi0 = config.get("scsi0", "")
+    bridge, vlan = _net(config.get("net0", ""))
+    return {
+        "vm_id": vm["vmid"], "name": vm.get("name"), "node_name": vm.get("node"), "pool_id": vm.get("pool"),
+        "tags": vm.get("tags", []), "description": vm.get("description", ""),
+        "started": vm.get("status") == "running",
+        "cpu": [{"cores": config.get("cores"), "type": "host"}],
+        "memory": [{"dedicated": config.get("memory")}],
+        "disk": [{"interface": "scsi0", "datastore_id": scsi0.split(":", 1)[0] or None, "size": _disk_size(scsi0),
+                  "file_format": "qcow2" if ".qcow2" in scsi0 else "raw"}],
+        "network_device": [{"bridge": bridge, "vlan_id": vlan}],
+    }
+
+
+def settings_of(want: dict) -> dict:
+    """What the provider's update writes into the VM's config."""
+    disk, net = want["disk"][0], want["network_device"][0]
+    return {
+        "cores": want["cpu"][0]["cores"], "memory": want["memory"][0]["dedicated"],
+        "scsi0": disk_spec(disk["datastore_id"], want["vm_id"], disk["size"], disk["file_format"]),
+        "net0": net_spec(net["bridge"], net["vlan_id"]),
+    }
+
+
+def lock_file_entry() -> tuple[str | None, list[str]]:
+    path = Path(".terraform.lock.hcl")
+    if not path.exists():
+        return None, []
+    text = path.read_text()
+    block = re.search(r'provider\s+"' + re.escape(PROVIDER) + r'"\s*\{(.*?)\n\}', text, re.S)
+    if not block:
+        return None, []
+    version = re.search(r'version\s*=\s*"([^"]+)"', block.group(1))
+    hashes = re.findall(r'"((?:h1|zh):[^"]+)"', block.group(1))
+    return (version.group(1) if version else None), hashes
+
+
+def take_lock(command: str) -> None:
+    info = Path(LOCK_INFO)
+    if info.exists():
+        try:
+            pid = json.loads(info.read_text()).get("pid")
+            os.kill(int(pid), 0)
+            fail("Error acquiring the state lock: the state is locked by another Terraform process")
+        except (ProcessLookupError, ValueError, TypeError):
+            pass
+    info.write_text(json.dumps({"ID": str(uuid.uuid4()), "Operation": command, "pid": os.getpid()}))
+
+
+def drop_lock() -> None:
+    Path(LOCK_INFO).unlink(missing_ok=True)
+
+
+def hang_if_asked(command: str, k: dict, on_sigint) -> None:
+    if command not in (k.get("hang") or []):
+        return
+    interrupted = []
+    if k.get("ignore_sigint"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGINT, lambda *_: interrupted.append(True))
+    print(f"{command}: still working...", flush=True)
+    while not interrupted:
+        time.sleep(0.02)
+    print("Interrupt received. Please wait for Terraform to exit or data loss may occur.", flush=True)
+    time.sleep(float(k.get("sigint_delay") or 0))
+    on_sigint()
+    drop_lock()
+    print("Gracefully shutting down... state saved", flush=True)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ commands
+
+
+def cmd_version(args: list[str]) -> None:
+    if "-json" in args:
+        print(json.dumps({"terraform_version": TF_VERSION, "platform": "fake_amd64",
+                          "provider_selections": {}, "terraform_outdated": False}, indent=2))
+    else:
+        print(f"Terraform v{TF_VERSION}")
+
+
+def cmd_init(args: list[str], k: dict) -> None:
+    if not os.environ.get("TF_CLI_CONFIG_FILE"):
+        fail("TF_CLI_CONFIG_FILE isn't set: the fake refuses to look for providers online")
+    mirror = k.get("mirror") or ["0.115.0"]
+    version, hashes = lock_file_entry()
+    if "-lockfile=readonly" in args:
+        if version is None:
+            fail(f"provider {PROVIDER}: required by this configuration but no version is selected "
+                 "in the dependency lock file")
+        if version not in mirror:
+            fail(f"Failed to query available provider packages: {PROVIDER} {version} isn't in the filesystem mirror")
+        if provider_hash(version) not in hashes:
+            fail(f"Failed to install provider: the local package for {PROVIDER} {version} doesn't match any "
+                 "of the checksums previously recorded in the dependency lock file")
+    else:
+        version = version or mirror[0]
+    folder = Path(".terraform/providers") / PROVIDER / version
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "terraform-provider-proxmox").write_text("fake")
+    write_json(Path(".terraform/fake-provider.json"), {"version": version, "hash": provider_hash(version)})
+    print(f"- Installed {PROVIDER} v{version} (unauthenticated)")
+    print("Terraform has been successfully initialized!")
+
+
+def check_initialised() -> None:
+    installed = Path(".terraform/fake-provider.json")
+    if not installed.exists():
+        fail(f"Inconsistent dependency lock file: provider {PROVIDER} isn't installed; run \"terraform init\"")
+    have = json.loads(installed.read_text())
+    version, hashes = lock_file_entry()
+    if version != have["version"] or have["hash"] not in hashes:
+        fail(f"Required plugins are not installed: the cached package for {PROVIDER} {have['version']} "
+             f"(in .terraform/providers) doesn't match the dependency lock file (it names {version}); "
+             "run \"terraform init\"")
+
+
+def cmd_plan(args: list[str], k: dict) -> None:
+    check_initialised()
+    out = next((a.split("=", 1)[1] for a in args if a.startswith("-out=")), None)
+    take_lock("OperationTypePlan")
+    try:
+        v = json.loads(Path("terraform.tfvars.json").read_text())
+        state = load_state()
+        res = vm_resource(state)
+        want = desired(v)
+        changes = []
+        if res is None:
+            changes.append({"actions": ["create"], "before": None, "after": want})
+        elif res.get("status") == "tainted":
+            changes.append({"actions": ["delete", "create"], "before": res["attributes"], "after": want})
+        else:
+            vm = fp.load(CONFIG["pve_state"])["vms"].get(str(res["attributes"]["vm_id"]))
+            if vm is None:
+                changes.append({"actions": ["create"], "before": None, "after": want})
+            else:
+                have = actual(vm)
+                if have == want:
+                    changes.append({"actions": ["no-op"], "before": have, "after": have})
+                else:
+                    changes.append({"actions": ["update"], "before": have, "after": want})
+        doc_changes = [{
+            "address": VM, "mode": "managed", "type": "proxmox_virtual_environment_vm", "name": "vm",
+            "provider_name": PROVIDER,
+            "change": {**c, "after_unknown": {}, "before_sensitive": False, "after_sensitive": False},
+        } for c in changes]
+        extra = k.get("plan_extra")
+        if extra == "delete":
+            doc_changes.append({"address": "proxmox_virtual_environment_vm.other", "mode": "managed",
+                                "type": "proxmox_virtual_environment_vm", "name": "other",
+                                "change": {"actions": ["delete"], "before": {"vm_id": 999}, "after": None}})
+        elif extra == "resource":
+            doc_changes.append({"address": "proxmox_virtual_environment_file.extra", "mode": "managed",
+                                "type": "proxmox_virtual_environment_file", "name": "extra",
+                                "change": {"actions": ["create"], "before": None, "after": {"x": 1}}})
+        doc = {"format_version": "1.2", "terraform_version": TF_VERSION, "resource_changes": doc_changes,
+               "planned_values": {"root_module": {}}}
+        hang_if_asked("plan", k, lambda: None)
+        if out:
+            write_json(Path(out), {"doc": doc, "want": want, "serial": (state or {}).get("serial", 0),
+                                   "lineage": (state or {}).get("lineage")})
+        summary = ", ".join("+".join(c["actions"]) for c in changes)
+        print(f"Plan: {summary}")
+    finally:
+        drop_lock()
+
+
+def cmd_show(args: list[str]) -> None:
+    plan = Path(args[-1])
+    if not plan.exists():
+        fail(f"Failed to read the given file as a state or plan file: {plan} doesn't exist")
+    print(json.dumps(json.loads(plan.read_text())["doc"]))
+
+
+def _make_vm(want: dict, tfvars: dict, k: dict, state: dict | None) -> None:
+    """Clone (the first write: name, description and pool, no tags, ``lock: clone``), then tag and start."""
+    vmid = int(want["vm_id"])
+    # After a SIGKILL the clone task and its lock go on for clone_lock_outlives polls (this knob, else
+    # FakeProxmox's own); otherwise the second write below ends the task.
+    polls = k.get("clone_lock_outlives") if k.get("die_after_clone") else 1
+    with pve() as doc:
+        if str(vmid) in doc["vms"]:
+            drop_lock()
+            fail(f"error creating VM: unable to create VM {vmid}: config file already exists")
+        fp.clone_vm(doc, tfvars["template_vm_id"], vmid, node=want["node_name"], name=want["name"],
+                    description=want["description"], pool=want["pool_id"], storage=tfvars["datastore"],
+                    polls=int(polls) if polls is not None else None)
+    print(f"proxmox_virtual_environment_vm.vm: Creating... (clone of VM {tfvars['template_vm_id']})", flush=True)
+    if k.get("die_after_clone"):  # a SIGKILL: no state written, the clone task and its lock go on
+        os.kill(os.getpid(), signal.SIGKILL)
+    if k.get("fail_after_clone"):  # the clone finished; the update that tags it failed
+        with pve() as doc:
+            fp.tick(doc, vmid)
+        write_state(state, {"schema_version": 0, "status": "tainted", "attributes": want})
+        drop_lock()
+        fail("error updating VM: the task ended with an error")
+    with pve() as doc:
+        fp.finish_clone(doc, vmid, tags=want["tags"], address=tfvars["address_cidr"].split("/")[0],
+                        host_key=k.get("host_key"), **settings_of(want))
+
+
+def cmd_apply(args: list[str], k: dict) -> None:
+    check_initialised()
+    plan_path = Path(args[-1])
+    if not plan_path.exists():
+        fail("Failed to load the saved plan")
+    plan = json.loads(plan_path.read_text())
+    state = load_state()
+    if (state or {}).get("serial", 0) != plan["serial"] or (state or {}).get("lineage") != plan["lineage"]:
+        fail("Saved plan is stale: the state was changed by another operation after the plan was made")
+    take_lock("OperationTypeApply")
+    for line in (k.get("print") or {}).get("apply", []):
+        print(line, flush=True)
+    res = vm_resource(state)
+    hang_if_asked("apply", k, lambda: write_state(state, res))
+    want = plan["want"]
+    tfvars = json.loads(Path("terraform.tfvars.json").read_text())
+    actions = [c["change"]["actions"] for c in plan["doc"]["resource_changes"] if c["address"] == VM]
+    action = actions[0] if actions else ["no-op"]
+    if action == ["no-op"]:
+        print("Apply complete! Resources: 0 added, 0 changed, 0 destroyed.")
+    elif action == ["update"]:
+        with pve() as doc:
+            vm = doc["vms"][str(want["vm_id"])]
+            grows = want["disk"][0]["size"] > (actual(vm)["disk"][0]["size"] or 0)
+            if grows and vm.get("snapshots") and doc["knobs"].get("resize_refused_with_snapshots"):
+                drop_lock()
+                fail(f"error resizing disk of VM {want['vm_id']}: can't resize a disk that has snapshots")
+            vm.update(tags=fp.sorted_tags(want["tags"]), description=want["description"], name=want["name"],
+                      status="running")
+            fp.set_config(doc, want["vm_id"], **settings_of(want))
+        write_state(state, {"schema_version": 0, "attributes": want})
+        print("Apply complete! Resources: 0 added, 1 changed, 0 destroyed.")
+    else:
+        if "delete" in action and res is not None:
+            with pve() as doc:
+                fp.destroy_vm(doc, res["attributes"]["vm_id"])
+        _make_vm(want, tfvars, k, state)
+        write_state(state, {"schema_version": 0, "attributes": want})
+        print("Apply complete! Resources: 1 added, 0 changed, 0 destroyed.")
+    drop_lock()
+
+
+def cmd_destroy(args: list[str], k: dict) -> None:
+    check_initialised()
+    take_lock("OperationTypeApply")
+    state = load_state()
+    res = vm_resource(state)
+    hang_if_asked("destroy", k, lambda: write_state(state, res))
+    if res is not None:
+        with pve() as doc:
+            fp.destroy_vm(doc, res["attributes"]["vm_id"])
+    if state is not None:
+        write_state(state, None)
+    drop_lock()
+    print(f"Destroy complete! Resources: {1 if res else 0} destroyed.")
+
+
+def cmd_state(args: list[str]) -> None:
+    rest = [a for a in args if not a.startswith("-")]
+    if rest[:1] != ["rm"] or len(rest) < 2:
+        fail("only `state rm <address>` is faked")
+    take_lock("OperationTypeInvalid")
+    state = load_state()
+    if vm_resource(state) is None or rest[1] != VM:
+        drop_lock()
+        fail(f"Invalid target address: no matching objects found for {rest[1]}")
+    write_state(state, None)
+    drop_lock()
+    print(f"Removed {rest[1]}\nSuccessfully removed 1 resource instance(s).")
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    log_run(argv)
+    k = knobs()
+    command = argv[0] if argv else ""
+    for line in (k.get("print") or {}).get(command, []) if command != "apply" else []:
+        print(line, flush=True)
+    size = (k.get("big_line") or {}).get(command)
+    if size:
+        sys.stdout.write("x" * int(size) + "\n")
+        print("after the big line", flush=True)
+    if command == "version":
+        cmd_version(argv[1:])
+    elif command == "init":
+        cmd_init(argv[1:], k)
+    elif command == "plan":
+        cmd_plan(argv[1:], k)
+    elif command == "show":
+        cmd_show(argv[1:])
+    elif command == "apply":
+        cmd_apply(argv[1:], k)
+    elif command == "destroy":
+        cmd_destroy(argv[1:], k)
+    elif command == "state":
+        cmd_state(argv[1:])
+    else:
+        fail(f"fake-terraform doesn't know {command!r}")
+
+
+if __name__ == "__main__":
+    main()

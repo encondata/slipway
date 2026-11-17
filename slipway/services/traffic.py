@@ -5,10 +5,13 @@ An environment's **routes** are its public hostnames (phase 3 §10.1). Those of 
 them published:
 
 * a **traffic backend** points each name at a slot. Phase 3 has one, ``switchyard``: one Switchyard proxy
-  host per name, marked as the environment's (``switchyard.marker``). ``switch`` is the whole of
-  Activate's ``switch`` step: plan (reads only), write every host and apply once, check the names
-  through Switchyard, and put back what it wrote when anything fails. ``sync`` brings hosts up to date
-  without moving any name to another slot (an in-place deploy, the data server's deploy, Publish names).
+  host per name, marked as the environment's (``switchyard.marker``). Phase 4 adds ``do_lb``, which
+  registers itself with ``register``. ``switch`` is the whole of Activate's ``switch`` step (and of
+  Deactivate's): plan (reads only), write and apply, check the names through the backend, and put back
+  what it wrote when anything fails. ``sync`` brings hosts up to date without moving any name to another
+  slot (an in-place deploy, the data server's deploy, Publish names), then lets the backend repair what
+  it serves for the recorded active slot. Each backend gives the lock its writers share
+  (``backend.lock(ctx)``); Switchyard's is ``switchyard.lock``.
 * **DNS publishing** (``publish_dns``) keeps one Cloudflare A record per name at a fixed address. DNS
   never moves on a switch.
 
@@ -17,7 +20,7 @@ provider answers. Slipway changes or deletes only objects a row names whose live
 its marker (I7); anything else in the way is a blocker, and a plan with a blocker writes nothing (I5).
 
 Also here, because Activate, the deploys and Discard all use them: the slot smoke test (a ``curl`` on
-the slot's host), the public check (from the Slipway server through Switchyard's traffic address), and
+the slot's host), the public check (from the Slipway server through the backend's address), and
 the database probe a slot's ``settings`` step runs against the data server.
 """
 
@@ -212,10 +215,11 @@ class PutBack:
 @dataclass
 class SwitchContext:
     env: Environment
-    to_slot: Instance | None  # activate: the target slot; sync: the recorded active slot when included
+    # activate: the target slot; sync: the recorded active slot when included; deactivate and remove: None
+    to_slot: Instance | None
     owner: Instance | None  # the data owner (data server in mode server, the only slot in mode slot)
-    routes: list[Route]
-    mode: str  # activate | sync | remove
+    routes: list[Route]  # deactivate: the active slot's names, the ones traffic is taken off
+    mode: str  # activate | deactivate | sync | remove
     deployment_id: uuid.UUID | None = None
     say: Log = _quiet
     connect: ConnectFactory | None = None
@@ -309,6 +313,11 @@ def routes(env: Environment, slot_instance: Instance | None, owner: Instance | N
     return sorted(out.values(), key=lambda r: r.hostname)
 
 
+def _host_name(instance: Instance) -> str:
+    """The instance's host in a sentence; a managed environment's data owner has none (P4 §3.4)."""
+    return instance.host.name if instance.host is not None else "its managed database"
+
+
 def _port_name(route: Route) -> str:
     return f"{route.service} container port {route.container}" if route.service else f"container port {route.container}"
 
@@ -317,6 +326,8 @@ def target(route: Route, instance: Instance | None) -> Target:
     """Where ``route`` should send traffic on ``instance`` (as ``switchyard.route_targets``), or why it can't."""
     if instance is None:
         return Target(route.hostname, route.tls_mode, problem="its slot doesn't exist")
+    if instance.host is None:  # a managed environment's data owner runs nothing that serves a name (P4 §3.4)
+        return Target(route.hostname, route.tls_mode, problem=f"{instance.name} has no server of its own")
     published = [p for p in instance.published_ports or [] if p.get("protocol", "tcp") == "tcp"]
     match = next((p for p in published if int(p["container"]) == route.container
                   and (p.get("service") or "") == route.service), None)
@@ -364,7 +375,8 @@ async def context(
     db: AsyncSession, env: Environment, mode: str, *, slot: str | None = None, include_active: bool = False,
     deployment_id: uuid.UUID | None = None, say: Log = _quiet, connect: ConnectFactory | None = None,
 ) -> SwitchContext:
-    """A SwitchContext for ``mode``: ``activate`` (of ``slot``), ``sync`` or ``remove``."""
+    """A SwitchContext for ``mode``: ``activate`` (of ``slot``), ``deactivate`` (take traffic off the
+    recorded active slot: ``to_slot`` None, ``routes`` that slot's names), ``sync`` or ``remove``."""
     slots = await members(db, env)
     owner = owner_in(env, slots)
     active = active_in(env, slots)
@@ -376,6 +388,10 @@ async def context(
             raise TrafficError("Only an app slot can take traffic")
         to_slot, scope = slots[slot], (ACTIVE, SERVER)
         planned = routes(env, to_slot, owner, default_tls=default_tls)
+    elif mode == "deactivate":
+        to_slot, scope = None, (ACTIVE,)
+        planned = ([r for r in routes(env, active, owner, default_tls=default_tls) if r.follows == ACTIVE]
+                   if active is not None else [])
     elif mode == "sync":
         scope, note = sync_scope(env, active, include_active=include_active)
         if note and include_active:
@@ -397,14 +413,33 @@ async def context(
 
 
 class TrafficBackend(Protocol):
-    name: ClassVar[str]  # switchyard | do_lb (phase 4)
+    """What ``switch``, ``sync``, ``remove`` and Resolve need from a backend (registered with ``register``).
 
+    ``switch`` and ``sync`` hold ``lock(ctx)`` around ``plan`` and ``apply``, and hand it to the put-back
+    task (``put_back_locked``) when ``apply`` fails, which releases it; ``verify`` runs without it.
+    ``put_back`` and ``remove`` take it themselves. ``repair`` runs after a sync, without the lock (it takes
+    it itself if it writes), only while no switch is unresolved, and never moves traffic to another slot.
+    A backend whose put-back can outlast PUT_BACK_TIMEOUT gives its own ``put_back_timeout`` (seconds).
+    """
+
+    name: ClassVar[str]  # switchyard | do_lb (phase 4)
+    label: ClassVar[str]  # what its log lines and warnings start with, and where to check by hand
+    via: ClassVar[str]  # the path the public check takes, in "through <via>" texts
+    errors: ClassVar[tuple[type[Exception], ...]]  # what it raises when its service can't be read or written
+
+    def lock(self, ctx: SwitchContext) -> asyncio.Lock: ...  # one writer at a time; the same lock for one ctx
     async def configured(self, db: AsyncSession) -> str | None: ...  # why it can't be used, or None
     async def plan(self, ctx: SwitchContext) -> Plan: ...  # reads only
     async def apply(self, ctx: SwitchContext, plan: Plan) -> Applied: ...  # writes; records as it goes
     async def verify(self, ctx: SwitchContext, plan: Plan) -> CheckResult: ...  # raises SwitchFailed; no lock
     async def put_back(self, ctx: SwitchContext, plan: Plan, applied: Applied) -> PutBack: ...  # never raises
+    async def put_back_locked(self, ctx: SwitchContext, plan: Plan,
+                              applied: Applied) -> PutBack: ...  # the caller holds lock(ctx); never raises
     async def remove(self, ctx: SwitchContext) -> Plan: ...  # teardown: plan of deletes, then applied
+    async def who_is_live(self, ctx: SwitchContext) -> list[str]: ...  # the app slots it serves now, sorted
+    def pending(self, plan: Plan) -> bool: ...  # sync: whether the plan leaves anything to write or apply
+    async def check_sync(self, ctx: SwitchContext, result: SyncResult) -> None: ...  # sync: after apply
+    async def repair(self, ctx: SwitchContext) -> SyncResult | None: ...  # sync: None when it has nothing to do
 
 
 def _strip(host: dict[str, Any]) -> dict[str, Any]:
@@ -503,10 +538,18 @@ class SwitchyardBackend:
     """Repoint the environment's Switchyard proxy hosts (§10.3).
 
     ``plan`` and ``apply`` expect the caller (``switch``, ``sync``) to hold ``switchyard.lock``;
-    ``put_back`` and ``remove`` take it themselves; ``verify`` holds no lock.
+    ``put_back`` and ``remove`` take it themselves; ``verify`` holds no lock. Deactivate isn't designed for
+    Switchyard: its plan refuses.
     """
 
     name: ClassVar[str] = "switchyard"
+    label: ClassVar[str] = "Switchyard"
+    via: ClassVar[str] = "Switchyard"
+    errors: ClassVar[tuple[type[Exception], ...]] = (SwitchyardError,)
+
+    def lock(self, ctx: SwitchContext) -> asyncio.Lock:
+        """The one Switchyard writer lock, shared with every instance's sync (``switchyard.lock``)."""
+        return switchyard.lock
 
     async def configured(self, db: AsyncSession) -> str | None:
         return None if await switchyard.load_config(db) is not None else SWITCHYARD_MISSING
@@ -514,6 +557,9 @@ class SwitchyardBackend:
     # -- plan
 
     async def plan(self, ctx: SwitchContext) -> Plan:
+        if ctx.mode == "deactivate":
+            return Plan(self.name, notes=list(ctx.notes), blockers=[
+                f"{ctx.env.name} uses Switchyard; take its names off in Switchyard instead"])
         config = await _config(ctx)
         async with SwitchyardClient(config) as sy:
             preview = await sy.preview()
@@ -746,7 +792,7 @@ class SwitchyardBackend:
     # -- put back
 
     async def put_back(self, ctx: SwitchContext, plan: Plan, applied: Applied) -> PutBack:
-        async with switchyard.lock:
+        async with self.lock(ctx):
             return await self.put_back_locked(ctx, plan, applied)
 
     async def put_back_locked(self, ctx: SwitchContext, plan: Plan, applied: Applied) -> PutBack:
@@ -932,7 +978,7 @@ class SwitchyardBackend:
         staged). Raises SwitchyardError when Switchyard can't be reached.
         """
         ctx.routes, ctx.mode, ctx.scope = [], "remove", (ACTIVE, SERVER)
-        async with switchyard.lock:
+        async with self.lock(ctx):
             plan = await self.plan(ctx)
             config = await _config(ctx)
             owner = Owner.of(ctx.env)
@@ -964,8 +1010,73 @@ class SwitchyardBackend:
                         await ctx.say(f"Switchyard: applied #{(answer or {}).get('n')}")
         return plan
 
+    # -- who is live (Resolve)
+
+    async def who_is_live(self, ctx: SwitchContext) -> list[str]:
+        """The app slots Switchyard sends the environment's active-following names to now, sorted.
+
+        Read from the hosts Slipway recorded for the environment: one that still carries its marker counts
+        for the slot whose published port it points at. Two slots: the traffic is split; none: no recorded
+        host reaches a slot. Reads only, without the lock. Raises SwitchyardError when Switchyard can't be
+        read, SwitchRefused when it isn't set up.
+        """
+        config = await _config(ctx)
+        async with SwitchyardClient(config) as sy:
+            hosts = await sy.list_hosts()
+        async with session_scope() as db:
+            mem = await members(db, ctx.env)
+        owner = owner_in(ctx.env, mem)
+        marker = Owner.of(ctx.env)
+        by_id = {str(h.get("id")): h for h in hosts}
+        apps = environments.app_members(mem)
+        live: set[str] = set()
+        for row in (await _rows(ctx.env.id)).values():
+            if _row_follows(row, ctx.env) != ACTIVE:
+                continue
+            host = by_id.get(row.provider_id)
+            if host is None or not switchyard.owned_by(host, marker):
+                continue
+            upstream = _upstream_of(host)
+            for slot in apps:
+                route = next((r for r in routes(ctx.env, slot, owner) if r.hostname == row.name), None)
+                tgt = target(route, slot) if route is not None else None
+                if tgt is not None and not tgt.problem and tgt.upstream == upstream:
+                    live.add(str(slot.slot))
+        return sorted(live)
+
+    # -- sync
+
+    def pending(self, plan: Plan) -> bool:
+        """Whether a sync's plan writes, records or forgets a host, or leaves Slipway's own edits to apply."""
+        return bool(plan.writes or [c for c in plan.changes if c.adopt or c.stale_row or c.action == "forget"]
+                    or switchyard.own_count(plan.meta.get("edits") or {}))
+
+    async def check_sync(self, ctx: SwitchContext, result: SyncResult) -> None:
+        """After a sync's apply: the names through Switchyard's traffic address, once (more rounds when a
+        host was made, since Caddy gets a certificate). A failure is a warning."""
+        if not (result.applied and result.applied.did_apply and ctx.routes):
+            return
+        rounds = CHECK_ROUNDS_CREATED if result.applied.created else 1
+        config = await _config(ctx)
+        await ctx.say("Checking the names through Switchyard")
+        result.check = await public_check(ctx.routes, config.traffic_address, say=ctx.say, rounds=rounds)
+        if result.check.skipped:
+            result.warnings.append(result.check.skipped)
+        elif not result.check.ok:
+            result.warnings.append(f"{result.check.message} through Switchyard")
+
+    async def repair(self, ctx: SwitchContext) -> SyncResult | None:
+        """Nothing: a sync already brings every Switchyard host it may touch up to date."""
+        return None
+
 
 BACKENDS: dict[str, TrafficBackend] = {"switchyard": SwitchyardBackend()}
+
+
+def register(backend: TrafficBackend) -> TrafficBackend:
+    """Add (or replace) the backend for ``traffic.switch = <backend.name>``; returns it."""
+    BACKENDS[backend.name] = backend
+    return backend
 
 
 def backend_for(env: Environment) -> TrafficBackend | None:
@@ -988,29 +1099,31 @@ _put_backs: set[asyncio.Task[PutBack]] = set()  # strong references, so a put-ba
 
 
 async def _shielded_put_back(backend: TrafficBackend, ctx: SwitchContext, plan: Plan, applied: Applied, *,
-                             lock_held: bool) -> PutBack:
-    """Run the put-back as its own task and wait for it (up to PUT_BACK_TIMEOUT), even if we're cancelled.
+                             held: asyncio.Lock | None) -> PutBack:
+    """Run the put-back as its own task and wait for it, even if we're cancelled.
 
-    With ``lock_held`` the caller holds ``switchyard.lock``; the task releases it when it ends, so no
-    other writer gets in between a failed apply and its put-back.
+    The wait is the backend's ``put_back_timeout`` when it has one (``do_lb``'s can wait for its load
+    balancer twice), else PUT_BACK_TIMEOUT.
+
+    ``held`` is the backend's lock (``backend.lock(ctx)``) when the caller holds it: the task runs
+    ``put_back_locked`` and releases it when it ends, so no other writer gets in between a failed apply and
+    its put-back. Without it the task runs ``put_back``, which takes the lock itself.
     """
-    locked = getattr(backend, "put_back_locked", None)
 
     async def run() -> PutBack:
-        if lock_held and locked is not None:
+        if held is not None:
             try:
-                return await locked(ctx, plan, applied)
+                return await backend.put_back_locked(ctx, plan, applied)
             finally:
-                switchyard.lock.release()
-        if lock_held:
-            switchyard.lock.release()
+                held.release()
         return await backend.put_back(ctx, plan, applied)
 
     task = asyncio.ensure_future(run())
     _put_backs.add(task)
     task.add_done_callback(_put_backs.discard)
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + PUT_BACK_TIMEOUT
+    timeout = getattr(backend, "put_back_timeout", None) or PUT_BACK_TIMEOUT
+    deadline = loop.time() + timeout
     interrupted = False
     while not task.done() and loop.time() < deadline:
         try:
@@ -1019,7 +1132,7 @@ async def _shielded_put_back(backend: TrafficBackend, ctx: SwitchContext, plan: 
             interrupted = True  # keep waiting: the put-back must not be cut off
     if not task.done():
         pb = PutBack(total=len(applied.changes), failed=[c.hostname for c in applied.changes],
-                     not_applied=f"the put-back took longer than {PUT_BACK_TIMEOUT} s")
+                     not_applied=f"the put-back took longer than {timeout:g} s")
     else:
         pb = task.result()
     pb.interrupted = interrupted
@@ -1044,74 +1157,107 @@ async def _mark_unresolved(ctx: SwitchContext, message: str) -> None:
     ctx.env.traffic_state = state
 
 
-def _failure_text(ctx: SwitchContext, reason: str, pb: PutBack) -> str:
+def _failure_text(ctx: SwitchContext, reason: str, pb: PutBack, backend: TrafficBackend) -> str:
     if pb.failed:
         names = ", ".join(sorted(pb.failed))
         return (f"{reason}. Slipway couldn't put {len(pb.failed)} of {pb.total} back: {names}. Check them in "
-                "Switchyard, then use Resolve on the environment page")
+                f"{backend.label}, then use Resolve on the environment page")
     if ctx.from_slot:
         return f"{reason}. Traffic stays on {ctx.from_slot}"
-    return f"{reason}. Nothing was live before; Slipway removed the hosts it had made"
+    if isinstance(backend, SwitchyardBackend):
+        return f"{reason}. Nothing was live before; Slipway removed the hosts it had made"
+    return f"{reason}. Nothing was live before; Slipway put back what it had written"
+
+
+SWITCH_MODES = ("activate", "deactivate")
+
+
+async def _retiring_text(env_id: uuid.UUID) -> str | None:
+    """P4 §13's ``<env> is retiring: it only goes dark``, read again under the backend's lock just before an
+    activate's first write: Retire may have landed while the activate's smoke or certificate step ran."""
+    async with session_scope() as db:
+        env = await db.get(Environment, env_id)
+        if env is None or not env.production or env.retiring_at is None:
+            return None
+        return f"{env.name} is retiring: it only goes dark"
 
 
 async def switch(ctx: SwitchContext) -> SwitchResult:
-    """Activate's ``switch`` step (§10.2): plan, write and apply once, check through Switchyard, put back.
+    """Activate's ``switch`` step (§10.2), and Deactivate's: plan, write and apply, check through the
+    backend, put back.
 
-    Raises SwitchRefused (nothing written) or SwitchFailed (put back, or ``unresolved``). It doesn't
-    write ``active_slot_id``: the caller does that once this returns.
+    ``ctx.mode`` is ``activate`` (traffic moves to ``ctx.to_slot``) or ``deactivate`` (traffic comes off
+    the active slot, ``to_slot`` None; ``verify`` is the backend's own check for that mode). Raises
+    SwitchRefused (nothing written) or SwitchFailed (put back, or ``unresolved``). It doesn't write
+    ``active_slot_id``: the caller does that once this returns.
     """
     backend = backend_for(ctx.env)
     if backend is None:
         raise SwitchRefused(f"{ctx.env.name} doesn't publish its names through Switchyard")
-    ctx.mode, ctx.record_switch = "activate", True
-    to = ctx.to_slot.slot if ctx.to_slot else "?"
-    await switchyard.lock.acquire()
+    if ctx.mode not in SWITCH_MODES:
+        raise ValueError(f"a switch is an activate or a deactivate, not {ctx.mode!r}")
+    ctx.record_switch = True
+    deactivate = ctx.mode == "deactivate"
+    to = ctx.to_slot.slot if ctx.to_slot else ("" if deactivate else "?")
+    lock = backend.lock(ctx)
+    await lock.acquire()
     lock_ours = True
     try:
+        if not deactivate:
+            retiring = await _retiring_text(ctx.env.id)
+            if retiring:
+                raise SwitchRefused(f"{retiring}; Slipway changed nothing")
         try:
             plan = await backend.plan(ctx)
-        except SwitchyardError as exc:
+        except backend.errors as exc:
             raise SwitchRefused(f"{exc}; Slipway changed nothing") from exc
-        await ctx.say(f"Plan for {ctx.env.name} → {to}:")
+        if deactivate:
+            await ctx.say(f"Plan to take {ctx.env.name}'s traffic off {ctx.from_slot or 'every slot'}:")
+        else:
+            await ctx.say(f"Plan for {ctx.env.name} → {to}:")
         await _log_plan(ctx.say, plan)
         if plan.blockers:
             raise SwitchRefused("; ".join(plan.blockers) + "; Slipway changed nothing", plan)
         # The switch record exists before the first write, for recovery and Resolve.
         before = {c.hostname: c.before for c in plan.changes if c.before is not None}
         await _save_switch(ctx, lambda r: (r.clear(), r.update(
-            backend=backend.name, from_slot=ctx.from_slot, to_slot=to, before=before,
+            backend=backend.name, from_slot=ctx.from_slot, to_slot=to or None, before=before,
             created=[], deleted=[], changed=[], applied=False, apply_n=None)))
         try:
             applied = await backend.apply(ctx, plan)
         except BaseException as exc:
             applied = ctx.applied or Applied()
             lock_ours = False  # the put-back task holds it now and releases it
-            pb = await _shielded_put_back(backend, ctx, plan, applied, lock_held=True)
-            await _after_failed(ctx, exc, pb)
+            pb = await _shielded_put_back(backend, ctx, plan, applied, held=lock)
+            await _after_failed(ctx, exc, pb, backend)
             raise AssertionError("unreachable")  # pragma: no cover
     finally:
         if lock_ours:
-            switchyard.lock.release()
+            lock.release()
 
     # The verify phase holds no lock: other syncs run meanwhile (they touch other hosts).
-    await ctx.say("Checking the names through Switchyard")
+    if deactivate:
+        await ctx.say(f"Checking that {backend.via} sends no traffic to {ctx.from_slot or 'any slot'}")
+    else:
+        await ctx.say(f"Checking the names through {backend.via}")
     try:
         check = await backend.verify(ctx, plan)
     except BaseException as exc:
-        pb = await _shielded_put_back(backend, ctx, plan, applied, lock_held=False)
-        await _after_failed(ctx, exc, pb)
+        pb = await _shielded_put_back(backend, ctx, plan, applied, held=None)
+        await _after_failed(ctx, exc, pb, backend)
         raise AssertionError("unreachable")  # pragma: no cover
     warnings = [check.skipped] if check.skipped else []
     return SwitchResult(plan, applied, check, warnings)
 
 
-async def _after_failed(ctx: SwitchContext, exc: BaseException, pb: PutBack) -> None:
+async def _after_failed(ctx: SwitchContext, exc: BaseException, pb: PutBack, backend: TrafficBackend) -> None:
     """Raise the right error after a put-back: SwitchFailed, or the cancellation that interrupted us."""
     if not isinstance(exc, Exception):
         reason = "Slipway was stopped during the switch"
     else:
-        reason = str(exc) if isinstance(exc, (TrafficError, SwitchyardError)) else f"{type(exc).__name__}: {exc}"
-    text = _failure_text(ctx, reason.rstrip("."), pb)
+        known = (TrafficError, SwitchyardError, *backend.errors)
+        reason = str(exc) if isinstance(exc, known) else f"{type(exc).__name__}: {exc}"
+    text = _failure_text(ctx, reason.rstrip("."), pb, backend)
     if pb.failed:
         await _mark_unresolved(ctx, text)
     if pb.interrupted:
@@ -1125,61 +1271,77 @@ async def sync(ctx: SwitchContext) -> SyncResult:
     """Bring the hosts in ``ctx.routes`` up to date (mode ``sync``, §10.3). Never raises for Switchyard problems.
 
     It never moves a name to another slot: ``context(..., "sync")`` targets only the recorded active slot
-    and the data server. Blockers and failures come back as warnings; a failed apply is put back.
+    and the data server. Blockers and failures come back as warnings; a failed apply is put back. After
+    a successful apply the backend checks the names (``check_sync``). Then, while no switch is unresolved,
+    the backend's ``repair`` may put the recorded active slot back where it lost it (``do_lb``); what it
+    did is added to the result.
     """
     ctx.mode = "sync"
     backend = backend_for(ctx.env)
     if backend is None:
         return SyncResult(None, skipped=f"{ctx.env.name} doesn't publish its names through Switchyard")
+    result = await _sync_writes(backend, ctx)
+    if unresolved(ctx.env) is None:
+        _merge(result, await backend.repair(ctx))
+    return result
+
+
+async def _sync_writes(backend: TrafficBackend, ctx: SwitchContext) -> SyncResult:
+    """The plan and apply of a sync under the backend's lock, then the backend's check of the names."""
+    label = backend.label
     result = SyncResult(None)
-    await switchyard.lock.acquire()
+    lock = backend.lock(ctx)
+    await lock.acquire()
     lock_ours = True
     try:
         try:
             plan = await backend.plan(ctx)
-        except (SwitchyardError, SwitchRefused) as exc:
-            result.warnings.append(f"Switchyard: {exc}; nothing was changed")
+        except (*backend.errors, SwitchRefused) as exc:
+            result.warnings.append(f"{label}: {exc}; nothing was changed")
             await ctx.say(result.warnings[-1])
             return result
         result.plan = plan
-        await ctx.say("Switchyard plan:")
+        await ctx.say(f"{label} plan:")
         await _log_plan(ctx.say, plan)
         if plan.blockers:
             result.warnings += plan.blockers
-            await ctx.say("Switchyard: nothing was changed")
+            await ctx.say(f"{label}: nothing was changed")
             return result
-        if not plan.writes and not [c for c in plan.changes if c.adopt or c.stale_row or c.action == "forget"] \
-                and not switchyard.own_count(plan.meta.get("edits") or {}):
-            await ctx.say("Switchyard: up to date")
+        if not backend.pending(plan):
+            await ctx.say(f"{label}: up to date")
             return result
         try:
             result.applied = await backend.apply(ctx, plan)
         except BaseException as exc:
             applied = ctx.applied or Applied()
             lock_ours = False
-            pb = await _shielded_put_back(backend, ctx, plan, applied, lock_held=True)
+            pb = await _shielded_put_back(backend, ctx, plan, applied, held=lock)
             if pb.interrupted:
                 raise asyncio.CancelledError from exc
             if isinstance(exc, asyncio.CancelledError) or not isinstance(exc, Exception):
                 raise
             back = "put back" if pb.ok else f"couldn't put {len(pb.failed)} of {pb.total} back: {', '.join(pb.failed)}"
-            result.warnings.append(f"Switchyard: {exc}; {back}")
+            result.warnings.append(f"{label}: {exc}; {back}")
             result.applied = applied
             return result
     finally:
         if lock_ours:
-            switchyard.lock.release()
+            lock.release()
 
-    if result.applied and result.applied.did_apply and ctx.routes:
-        rounds = CHECK_ROUNDS_CREATED if result.applied.created else 1
-        config = await _config(ctx)
-        await ctx.say("Checking the names through Switchyard")
-        result.check = await public_check(ctx.routes, config.traffic_address, say=ctx.say, rounds=rounds)
-        if result.check.skipped:
-            result.warnings.append(result.check.skipped)
-        elif not result.check.ok:
-            result.warnings.append(f"{result.check.message} through Switchyard")
+    await backend.check_sync(ctx, result)
     return result
+
+
+def _merge(result: SyncResult, repaired: SyncResult | None) -> None:
+    """Add a repair's plan, writes, check and warnings to the sync's result (the repair's win where both have one)."""
+    if repaired is None:
+        return
+    result.plan = repaired.plan or result.plan
+    result.applied = repaired.applied or result.applied
+    result.check = repaired.check or result.check
+    result.warnings += [w for w in repaired.warnings if w not in result.warnings]
+    if repaired.skipped and not result.skipped:
+        result.skipped = repaired.skipped
 
 
 async def remove(ctx: SwitchContext) -> Plan:
@@ -1218,7 +1380,10 @@ async def _dns_inputs(db: AsyncSession, env: Environment, *, remove: bool = Fals
     if config is None:
         raise DnsRefused(CLOUDFLARE_MISSING, Plan("cloudflare", blockers=[CLOUDFLARE_MISSING]))
     dns = (env.traffic or {}).get("dns") or {}
-    address = dns.get("address") or config.public_ip
+    # A DigitalOcean environment's records point only at its load balancer, whose IP ``edge`` writes (P4 §11.6):
+    # never at the install's public IP, which is another host's (Switchyard's).
+    cloud = environments.is_digitalocean(env)
+    address = dns.get("address") or (None if cloud else config.public_ip)
     proxied = dns.get("proxied")
     proxied = config.proxied if proxied is None else bool(proxied)
     # Every name a member's live release serves, the idle slot's included, and env.hostnames (§10.5): a
@@ -1232,6 +1397,9 @@ async def _dns_inputs(db: AsyncSession, env: Environment, *, remove: bool = Fals
         if env_ids else {}
     if remove:
         return config, {}, rows, env_names
+    if not address and names and cloud:
+        problem = environments.NO_LB_YET.format(env=env.name)
+        raise DnsRefused(problem, Plan("cloudflare", blockers=[problem]))
     if not address and names:
         problem = (f"Set Cloudflare's public IP in Settings → Integrations, or an address for {env.name}'s DNS "
                    "records, so Slipway knows where they point")
@@ -1402,16 +1570,23 @@ async def plan_for(env: Environment, slot: str | None, db: AsyncSession) -> dict
     """``GET …/traffic/plan`` (§10.7), with no write: ``{switch, dns, routes}`` as JSON.
 
     With ``slot``: Activate's plan for that slot; without: the sync plan (server-following names, and the
-    recorded active slot's). Switchyard and Cloudflare errors are raised (the API answers 502).
+    recorded active slot's). Switchyard and Cloudflare errors are raised (the API answers 502), and so are
+    the errors of any other backend. Switchyard's settings are asked for only when the backend is
+    Switchyard; another backend says itself why it can't be used (``configured``).
     """
     mode = "activate" if slot else "sync"
     ctx = await context(db, env, mode, slot=slot, include_active=True)
     switch_plan: Plan | None = None
-    if backend_for(env) is not None:
-        if ctx.config is None:
-            switch_plan = Plan("switchyard", blockers=[SWITCHYARD_MISSING])
+    backend = backend_for(env)
+    if backend is not None:
+        if isinstance(backend, SwitchyardBackend):
+            why = SWITCHYARD_MISSING if ctx.config is None else None
         else:
-            switch_plan = await backend_for(env).plan(ctx)
+            why = await backend.configured(db)
+        if why:
+            switch_plan = Plan(backend.name, blockers=[why])
+        else:
+            switch_plan = await backend.plan(ctx)
     dns: Plan | None = None
     if (env.traffic or {}).get("dns"):
         try:
@@ -1455,7 +1630,7 @@ def smoke_targets(instance: Instance, planned: Iterable[Route]) -> list[SmokeTar
                       and (p.get("service") or "") == route.service), None)
         if match is None:
             out.append(SmokeTarget(route.hostname, None, "", route.health,
-                                   problem=f"{_port_name(route)} is not published on {instance.host.name}"))
+                                   problem=f"{_port_name(route)} is not published on {_host_name(instance)}"))
         else:
             out.append(SmokeTarget(route.hostname, int(match["host"]), _bind(match.get("host_ip")), route.health))
     return out
@@ -1521,7 +1696,7 @@ async def smoke(remote: Any, instance: Instance, planned: Iterable[Route], *, sa
     aren't asked again. Raises TrafficError when the host has neither curl nor wget.
     """
     targets = smoke_targets(instance, planned)
-    host = instance.host.name
+    host = _host_name(instance)
     result = CheckResult(ok=True)
     answers: dict[str, dict[str, Any]] = {}
     for t in targets:
@@ -1583,9 +1758,16 @@ async def save_last_check(instance_id: uuid.UUID, check: CheckResult, deployment
 # -------------------------------------------------------------------- public check
 
 
-async def _ask(route: Route, address: str) -> dict[str, Any]:
-    """One request for ``route`` through Switchyard, on a connection of its own."""
-    verify = route.tls_mode not in ("internal", "off")
+def no_address(via: str) -> str:
+    """Why the public check was skipped: there is no address to send the requests to."""
+    if via == "Switchyard":
+        return NO_TRAFFIC_ADDRESS
+    return f"Slipway has no address for {via}, so the names weren't checked through it"
+
+
+async def _ask(route: Route, address: str, *, insecure: bool = False) -> dict[str, Any]:
+    """One request for ``route`` through the traffic path at ``address``, on a connection of its own."""
+    verify = not insecure and route.tls_mode not in ("internal", "off")
     url = _url("http" if route.tls_mode == "off" else "https", address, None, route.health)
     try:
         async with httpx.AsyncClient(verify=verify, timeout=CHECK_TIMEOUT, follow_redirects=False,
@@ -1597,19 +1779,27 @@ async def _ask(route: Route, address: str) -> dict[str, Any]:
         return {"hostname": route.hostname, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
-async def public_check(planned: Iterable[Route], traffic_address: str, *, say: Log = _quiet,
-                       rounds: int = CHECK_ROUNDS, delay: float = CHECK_DELAY) -> CheckResult:
-    """Ask Switchyard for every name (§10.8), as a visitor would; only failures are asked again.
+async def public_check(planned: Iterable[Route], address: str, *, say: Log = _quiet,
+                       rounds: int = CHECK_ROUNDS, delay: float = CHECK_DELAY, insecure: bool = False,
+                       via: str = "Switchyard") -> CheckResult:
+    """Ask for every name at ``address`` (§10.8), as a visitor would; only failures are asked again.
 
-    Skipped, with ``skipped`` set (a warning), when Switchyard's traffic address isn't set.
+    ``address`` is where the names are served: Switchyard's traffic address, or a load balancer's
+    ``<ip>:443``. ``via`` names that path in the log and the skip text. ``insecure`` skips every
+    certificate check (Let's Encrypt staging certificates), and says so. Skipped, with ``skipped`` set (a
+    warning), when there is no address.
     """
     planned = list(planned)
-    if not traffic_address:
-        await say(NO_TRAFFIC_ADDRESS)
-        return CheckResult(ok=True, skipped=NO_TRAFFIC_ADDRESS)
-    for route in planned:
-        if route.tls_mode == "internal":
-            await say(f"{route.hostname} uses Switchyard's internal certificate, so it isn't verified")
+    if not address:
+        text = no_address(via)
+        await say(text)
+        return CheckResult(ok=True, skipped=text)
+    if insecure:
+        await say("Certificates aren't verified in this check: they are Let's Encrypt staging certificates")
+    else:
+        for route in planned:
+            if route.tls_mode == "internal":
+                await say(f"{route.hostname} uses {via}'s internal certificate, so it isn't verified")
     answers: dict[str, dict[str, Any]] = {}
     waiting = planned
     for n in range(1, rounds + 1):
@@ -1619,9 +1809,9 @@ async def public_check(planned: Iterable[Route], traffic_address: str, *, say: L
             await sleep(delay)
         still = []
         for route in waiting:
-            answer = answers[route.hostname] = await _ask(route, traffic_address)
+            answer = answers[route.hostname] = await _ask(route, address, insecure=insecure)
             if passes(answer.get("code")):
-                await say(f"{route.hostname} answered {answer['code']} on {route.health} through Switchyard")
+                await say(f"{route.hostname} answered {answer['code']} on {route.health} through {via}")
             else:
                 still.append(route)
         waiting = still
@@ -1665,24 +1855,33 @@ def probe_command(*, host: str, port: int, database: str, user: str, sslmode: st
 _PG_HBA_RE = re.compile(r'no pg_hba\.conf entry for host "([^"]+)"')
 
 
-def probe_problem(output: str, *, slot: Instance, env_name: str, host: str, port: int) -> str:
-    """The step's error when the probe failed: psql's last line and, for pg_hba, the LAN address to set."""
+def probe_problem(output: str, *, slot: Instance, env_name: str, host: str, port: int,
+                  managed: bool = False) -> str:
+    """The step's error when the probe failed: psql's last line and, for pg_hba, the LAN address to set. On a
+    managed database (P4 §10.2) there is no pg_hba.conf or LAN address to set: its trusted sources let the slot's
+    droplet in, so the text says to deploy the slot again (its ``database`` step puts them right)."""
     lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
     last = lines[-1] if lines else "no answer"
-    text = (f"{slot.name} on {slot.host.name} can't sign in to {env_name}'s database at {host}:{port} "
+    name = _host_name(slot)
+    text = (f"{slot.name} on {name} can't sign in to {env_name}'s database at {host}:{port} "
             f"({last[:300]}).")
+    if managed:
+        return (text + f" The managed database lets in only the droplets in its trusted sources: deploy to "
+                f"{slot.slot or slot.name} again, which sets them before anything uses the database")
     found = _PG_HBA_RE.search(output or "")
     if found:
-        return (text + f' It says "no pg_hba.conf entry for host {found.group(1)}": set host {slot.host.name}\'s '
+        return (text + f' It says "no pg_hba.conf entry for host {found.group(1)}": set host {name}\'s '
                 f"LAN address to {found.group(1)} and update the data server")
     return (text + ' If it says "no pg_hba.conf entry for host <address>", set host '
-            f"{slot.host.name}'s LAN address to that address and update the data server")
+            f"{name}'s LAN address to that address and update the data server")
 
 
 async def probe_database(remote: Any, slot: Instance, *, env_name: str, host: str, port: int, database: str,
                          user: str, password: str, sslmode: str = "disable",
-                         scrub: Callable[[str], str] | None = None) -> str | None:
-    """Run the probe on the slot's host; None when it signed in, else the step's error text."""
+                         scrub: Callable[[str], str] | None = None, managed: bool = False) -> str | None:
+    """Run the probe on the slot's host; None when it signed in, else the step's error text. ``managed``: the
+    database is a managed one (P4 §10.2, probed with ``sslmode=require``), whose failure text names no LAN
+    address."""
     command = probe_command(host=host, port=port, database=database, user=user, sslmode=sslmode)
     try:
         status, output = await remote.run(command, check=False, timeout=PROBE_COMMAND_TIMEOUT,
@@ -1693,4 +1892,4 @@ async def probe_database(remote: Any, slot: Instance, *, env_name: str, host: st
         output = output.replace(password, "<hidden>")
     if status == 0 and output.strip().splitlines()[-1:] == ["1"]:
         return None
-    return probe_problem(output, slot=slot, env_name=env_name, host=host, port=port)
+    return probe_problem(output, slot=slot, env_name=env_name, host=host, port=port, managed=managed)

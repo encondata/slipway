@@ -9,6 +9,10 @@ This page is for the people who set environments up and run them. The design, wi
 message, is [phase3-environments.md](phase3-environments.md). The app side is
 [manifest.md](manifest.md#environments-attach-and-server).
 
+Slots can also run on machines Slipway makes itself: droplets on DigitalOcean, or VMs on Proxmox and ESXi.
+[Where it runs](#where-it-runs) below gives the choice; [digitalocean.md](digitalocean.md) and
+[machines.md](machines.md) describe each in full.
+
 Instances that aren't in an environment work exactly as before.
 
 ## Words used here
@@ -40,10 +44,54 @@ exists, even for a slot it doesn't have yet. An environment's name is 2 to 26 lo
 digits and hyphens, starting with a letter. The limit leaves room for `-green` inside the 32
 characters some apps allow for their own names.
 
+## Where it runs
+
+The flow's second step asks **Where** the environment runs:
+
+| Where | Slots run on | Data | Traffic |
+|---|---|---|---|
+| **Hosts**, each one you added | your SSH hosts, as described on this page | in the slot, or on a data server host | Switchyard, and optionally Cloudflare DNS |
+| **Hosts**, with **New VM on <account>** for a slot | a VM Slipway makes on Proxmox or ESXi at the slot's first deploy ([machines.md](machines.md)) | the same: in the slot, or on a data server VM | the same |
+| **DigitalOcean** | one droplet per app slot, made by Slipway ([digitalocean.md](digitalocean.md)) | a managed PostgreSQL cluster and a Spaces bucket | a DigitalOcean load balancer, with Cloudflare DNS always on |
+
+A slot can mix: blue on a host you added and green on a new VM, for example. All the new VMs of one
+environment use one account and one network.
+
+**Hosts Slipway made** (droplets and VMs) are ordinary rows in the Hosts list, marked with a provider chip
+(`DigitalOcean droplet`, `Proxmox VM`, `ESXi VM`) that links their environment and slot, and a build chip:
+`Not built yet`, `Building`, `Ready`, `Gone`, and for VMs `Lost`, `Hidden` or `Off` when the hypervisor was
+read. They belong to their environment: only its slots run there, and Delete, Reset key, Check before they
+are built, and edits of their address or credentials are refused with the reason. Their label and
+description can still change. They go when their slot is removed or the environment is deleted.
+
+Slipway trusts such a host's SSH key without anyone pressing Verify: it never trusts a key on first
+contact. On DigitalOcean it makes the host key itself and pins it before the droplet exists. On Proxmox it
+reads the new VM's key through the guest agent; on ESXi it makes the key and hands it to cloud-init.
+
+On a page of an environment that runs on DigitalOcean or on VMs you also find:
+
+- in the header, `DigitalOcean · <region>`, `Production` and `Retiring` chips;
+- callouts for billing objects of an environment that never went live, SSH open to the internet, a gone
+  or powered-off droplet, a pending create, a certificate near its end, and an environment taken off the
+  air (a VM left off by a resize shows in the environment's notice);
+- on DigitalOcean, a **DigitalOcean** card: account and team, region, the load balancer's address, the
+  certificate with **Renew now**, the estimate, the sizes with **Grow…**, and every object Slipway recorded,
+  read live;
+- on the **Slots** card, each made host's size and chips, a `Resize pending: applies at <slot>'s next
+  deploy` line, and for VMs their live power (`Running`, `Off`, `Busy: <task>`), **Resize…** and
+  **Forget the VM…**;
+- for a single slot that keeps its data on a VM, a **VM snapshots** card;
+- in the danger zone, **Retire…**, **Un-retire…** and **Take off the air…** for production;
+- Delete, Remove slot, Deploy, Add a slot and Retry dialogs that name the droplets and VMs, their prices
+  or sizes, and the choices that go with them (a snapshot first, `Delete <env>'s data with it`,
+  `Forget the VMs Slipway can't remove`).
+
 ## What you need first
 
 1. **Hosts.** One per slot, and in Blue/Green a third one for the data server. Each must be added
    and verified (its SSH key pinned). See [Hosts and their LAN address](#hosts-and-their-lan-address).
+   A slot can instead be a new VM ([machines.md](machines.md)); a DigitalOcean environment needs no host
+   of yours ([digitalocean.md](digitalocean.md)).
 2. **Switchyard**, connected under *Settings → Integrations*, with its **traffic address** set. Two
    slots need it: Switchyard is how traffic moves. See [Switchyard](#switchyard-and-its-traffic-address).
 3. **Cloudflare** (optional), if Slipway should publish the DNS records. See [Cloudflare](#cloudflare).
@@ -158,8 +206,11 @@ that holds it.
    `slipway.yml`.
 2. **Servers**: Single slot, or Blue/Green. A single slot can keep its data on a server of its own.
    Blue/Green is offered only when the branch's `slipway.yml` declares a data server and
-   expand/contract migrations.
-3. **Hosts**: one for Blue, one for Green and one for the data server.
+   expand/contract migrations. **Where** chooses Hosts or DigitalOcean ([Where it runs](#where-it-runs)),
+   and **Production** shows when a production DigitalOcean account exists.
+3. **Hosts**: one for Blue, one for Green and one for the data server. Each may be a host you added or
+   a new VM. For DigitalOcean this step is **DigitalOcean** instead: the account, region, droplet and
+   database sizes, a standby node, and Let's Encrypt staging.
 4. **Settings**: the app's settings, optional services and environment variables. Every member's
    `.env` gets them. A variable may not set a key that `data.attach.env` or `data.server.env`
    writes.
@@ -169,7 +220,8 @@ that holds it.
 6. **Data**: start empty (with the first admin, when the app has one) or from a snapshot of the same
    app; how many backups to keep.
 7. **Review & Deploy**: Slipway creates the environment, starts its first deployment and opens the
-   environment page.
+   environment page. It lists each new VM, and for DigitalOcean the monthly estimate, whose total you
+   type to confirm it.
 
 The app's **secrets are generated when the environment is created**, from `slipway.yml` at the
 branch head. Both slots and the data server share them, so sessions and two-factor codes survive a
@@ -494,6 +546,10 @@ every slot and of the data server.
 
 To remove the data for good, delete the volumes and the kept folder on each host by hand.
 
+An environment on DigitalOcean or on VMs Slipway made is different: its machines, disks and cloud objects
+go with it, and so does its data unless a snapshot is taken first. See
+[digitalocean.md](digitalocean.md#delete) and [machines.md](machines.md#removing-a-slot-or-deleting-the-environment).
+
 ## Jobs, locking and restarts
 
 - An environment runs **one job at a time**, with one exception: an Activate (or Switch back) may
@@ -519,7 +575,11 @@ To remove the data for good, delete the volumes and the kept folder on each host
 | `environments:read` | viewer, developer, maintainer, admin | the Environments pages: slots, traffic, DNS records |
 | `environments:write` | maintainer, admin | create environments, change their settings, add slots. Privileged: like `instances:write`, an environment runs its branch's `slipway.yml` commands on every host it uses |
 | `environments:delete` | maintainer, admin | remove slots and delete environments (typed name) |
-| `traffic:switch` | developer, maintainer, admin | Activate, Switch back, Publish names, Claim a DNS record, Resolve, and Discard (with `deployments:create`) |
+| `traffic:switch` | developer, maintainer, admin | Activate, Switch back, Publish names, Claim a DNS record, Resolve, and Discard (with `deployments:create`); Renew now and Take off the air on DigitalOcean |
+| `providers:read` | developer, maintainer, admin | see the DigitalOcean, Proxmox and ESXi accounts (never their secrets) |
+| `providers:write` | admin | add, change, test, trust and remove those accounts |
+| `providers:spend` | maintainer, admin | confirm a monthly cost: create a DigitalOcean environment, add a slot to it, grow its sizes |
+| `machines:write` | maintainer, admin | make VMs for environments, resize them, take and delete VM snapshots, forget a lost VM |
 
 Deploys need `deployments:create`, and also `traffic:switch` when the deploy will go live by itself.
 Backups, restore, reset and snapshots use phase 2's `data:*` permissions on the data owner. Roll back
@@ -555,11 +615,15 @@ the reason, a typed name that doesn't match `422`.
 | `GET /environments/{id}/traffic/plan` (`?slot=` for an Activate) | what Switchyard and DNS would change; writes nothing |
 | `POST /environments/{id}/traffic/resolve` `{confirm}` | Resolve an unresolved switch |
 | `GET /environments/{id}/dns`, `POST /environments/{id}/dns/claim` `{hostname}` | DNS records and their status; claim one |
-| `POST /environments/{id}/slots` `{host_id, update_data_server?}` | add a slot |
-| `DELETE /environments/{id}/slots/{slot}` `{confirm}` | remove a slot |
-| `DELETE /environments/{id}` `{confirm, snapshot?: {name}}` | delete |
+| `POST /environments/{id}/slots` `{host_id?, machine?, confirm_cost?, update_data_server?}` | add a slot (on a host, a new VM, or DigitalOcean) |
+| `DELETE /environments/{id}/slots/{slot}` `{confirm, forget_vms?}` | remove a slot |
+| `DELETE /environments/{id}` `{confirm, snapshot?: {name}, drop_data?, confirm_production?, confirm_no_snapshot?, forget_vms?}` | delete |
 | `GET/PUT /settings/cloudflare`, `POST /settings/cloudflare/test` | Cloudflare settings |
 | `PUT /settings/switchyard` | gains `traffic_address` |
+
+DigitalOcean's routes (accounts, the cost, `GET .../cloud`, retire, take off the air, renew) are listed in
+[digitalocean.md](digitalocean.md#api), and the VM routes (machines, resize, Forget, VM snapshots, free
+addresses) in [machines.md](machines.md#api).
 
 Instance endpoints called on a slot refuse what belongs to the environment (its settings, deploy,
 delete, proxy sync, and data actions on an app slot that shares a data server), each with a message

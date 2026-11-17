@@ -22,7 +22,7 @@ from slipway.core.permissions import Perm
 from slipway.db.base import utcnow
 from slipway.models import BuildSource, Host, Instance, InstanceStatus, Repository
 from slipway.schemas import BRANCH_MAX, ClaimIn, ClaimOut, InstanceOut, PortMapping, VolumeMapping
-from slipway.services import audit, data, deployer, discovery, ssh
+from slipway.services import audit, data, deployer, discovery, hosts, ssh
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/hosts", tags=["hosts"])
@@ -56,15 +56,28 @@ def _ssh_error(exc: ssh.SSHError) -> HTTPException:
     return HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
 
 
+def _not_built(exc: ssh.HostNotBuilt) -> HTTPException:
+    """A host a provider hasn't built yet (phase 4 §3.3): nothing to list or claim on, so 409 with its text."""
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+
 @router.get("/{host_id}/unmanaged")
 async def list_unmanaged(host_id: uuid.UUID, ctx: Lister, db: DB) -> list[discovery.Group]:
     """Compose projects and standalone containers on the host that no instance manages."""
+    host = await db.get(Host, host_id)
+    if host is not None and not ssh.host_is_built(host):
+        try:
+            ssh.SSHTarget.from_host(host)
+        except ssh.HostNotBuilt as exc:
+            raise _not_built(exc) from exc
     host = await _host(db, host_id)
     projects, containers = await _claimed(db, host)
     await db.commit()  # release the DB connection during SSH
     try:
         async with open_session(ssh.SSHTarget.from_host(host)) as remote:
             _, output = await remote.run(discovery.DISCOVER_COMMAND, timeout=120)
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     return discovery.parse(output, claimed_projects=projects, claimed_containers=containers)
@@ -124,6 +137,12 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
     if body.deploy and not ctx.can(Perm.DEPLOYMENTS_CREATE):
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing permission: {Perm.DEPLOYMENTS_CREATE}")
     key = _check_group(body)
+    found = await db.get(Host, host_id)
+    if found is not None:
+        # Only an environment's slots run on a host it made (phase 4 §3.3, phase 5 §10.4).
+        problem = await hosts.owned_host_problem(db, found, action="claim")
+        if problem:
+            raise HTTPException(status.HTTP_409_CONFLICT, problem)
     host = await _host(db, host_id)
     repo = await db.get(Repository, body.repository_id)
     if repo is None:
@@ -155,6 +174,8 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
             if group is not None and body.import_env:
                 command = discovery.env_command([c.id for c in group.containers], group.env_files)
                 _, env_output = await remote.run(command, timeout=300)
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     if group is None:

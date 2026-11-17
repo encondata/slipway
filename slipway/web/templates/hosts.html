@@ -5,7 +5,7 @@
 <div class="page-head">
   <div>
     <h1>Hosts</h1>
-    <p class="lede">Linux machines running Docker. Slipway reaches them over SSH and pins each host key on first contact.</p>
+    <p class="lede">Linux machines running Docker. Slipway reaches them over SSH and pins each host key on first contact. Droplets and VMs Slipway made for an environment are listed too; that environment changes them.</p>
   </div>
   <div class="actions">
     {% if auth.can(Perm.HOSTS_WRITE) %}<button class="btn btn-primary" data-open="add-host">{{ icon("plus") }} Add Host</button>{% endif %}
@@ -18,18 +18,21 @@
   <div class="table-wrap"><table class="table">
     <thead><tr><th>Host</th><th>Label</th><th>Health</th><th>CPU</th><th>RAM</th><th>Docker</th>{% if can_instances %}<th>Instances</th>{% endif %}<th>Checked</th><th class="num">Actions</th></tr></thead>
     <tbody>
-    {% for h in hosts %}
+    {% for h in hosts %}{% set hv = views[h.id] %}
       <tr>
-        <td><a class="primary-cell" href="/hosts/{{ h.id }}" style="color:inherit"><span class="row-icon">{{ icon("hosts") }}</span><span><strong>{{ h.name }}</strong><small class="mono">{{ h.username }}@{{ h.address }}</small></span></a></td>
+        <td><a class="primary-cell" href="/hosts/{{ h.id }}" style="color:inherit"><span class="row-icon">{{ icon("cloud" if hv.made else "hosts") }}</span><span><strong>{{ h.name }}</strong><small class="mono">{{ h.username }}@{{ h.address if hv.built else (h.hostname if hv.provider != "digitalocean" else "address not known yet") }}</small></span></a>
+          {%- if hv.made %}<div>{{ provider_chip(hv, auth) }}</div>{% endif %}</td>
         <td>{% if h.label %}<span class="chip">{{ h.label }}</span>{% else %}<span class="subtle">—</span>{% endif %}</td>
-        <td>{{ badge("host", h.status) }}</td>
+        <td>{% if hv.built %}{{ badge("host", h.status) }}{% endif %}{% if hv.chip %} {{ build_chip(hv) }}{% endif %}</td>
         <td>{% if h.metrics.cpu_percent is defined %}{{ meter("CPU", h.metrics.cpu_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td>{% if h.metrics.mem_percent is defined %}{{ meter("RAM", h.metrics.mem_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td class="mono subtle">{{ h.docker_version or "—" }}</td>
         {% if can_instances %}<td>{{ counts.get(h.id, 0) }}</td>{% endif %}
         <td class="muted nowrap">{{ h.last_checked_at|timeago }}</td>
         <td class="actions-cell">
-          {% if h.is_pinned or auth.can(Perm.HOSTS_WRITE) %}
+          {% if hv.off.check %}
+          <span class="subtle owned-note" title="{{ hv.off.check }}">{{ "Made by Slipway" if hv.owned else "Not built yet" }}</span>
+          {% elif h.is_pinned or (auth.can(Perm.HOSTS_WRITE) and not hv.made) %}
           <button class="btn btn-sm" data-api="POST /api/v1/hosts/{{ h.id }}/check" data-success="Health check finished" data-then="reload">{{ icon("activity", "i-sm") }} {{ "Check" if h.is_pinned else "Verify" }}</button>
           {% endif %}
           <a class="btn btn-sm" href="/hosts/{{ h.id }}">Details</a>

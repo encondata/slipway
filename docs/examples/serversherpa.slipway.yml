@@ -17,6 +17,11 @@
 # ServerSherpa as Blue/Green app slots that share a data server (its db and
 # storage stacks on a host of their own). An instance outside an environment
 # ignores them and deploys exactly as above. docs/environments.md has the rest.
+#
+# DigitalOcean: edge and data.managed let Slipway run ServerSherpa on droplets
+# behind a cloud load balancer, with a managed PostgreSQL cluster and a Spaces
+# bucket. Caddy serves plain HTTP on :80 behind the load balancer, and the
+# services bind to 127.0.0.1. Nothing else reads them.
 version: 1
 name: ServerSherpa
 env_file: deploy/stack/env.example
@@ -79,6 +84,20 @@ images:
   - "serversherpa-learn:{STACK_IMAGE_TAG}"
   - "serversherpa-status:{STACK_IMAGE_TAG}"
 
+# Behind a cloud load balancer (DigitalOcean): Caddy on :80, the services on 127.0.0.1.
+# A setting named in env (STACK_PROXY_IP) takes this value there and isn't asked for.
+edge:
+  port: 80
+  health: /healthz
+  env:
+    STACK_CADDY: "1"
+    STACK_NETWORK_SUBNET: 172.30.0.0/24
+    STACK_PROXY_IP: 172.30.0.2
+    STACK_BIND_IP: 127.0.0.1
+    STACK_HOSTS_IP: "{edge.address}"
+    STACK_TRUSTED_PROXIES: "{edge.trusted}"
+  projects: ["ss-{STACK_ENV}-proxy"]
+
 data:
   app: serversherpa                       # never change it: snapshots seed only an app with the same id
   format: pg-custom                       # pg_dump -Fc --no-owner --no-acl (ss-stack pgdump)
@@ -126,6 +145,15 @@ data:
            password: "{secret.POSTGRES_PASSWORD}", tls: disable, ca_b64: ""}
       objects: {endpoint: "https://spaces.{STACK_DOMAIN}", region: us-east-1, bucket: "{SS_SPACES_BUCKET}",
                 access_key: serversherpa, secret_key: "{secret.SPACES_SECRET_KEY}", path_style: "true"}
+  # Managed data (DigitalOcean): a PostgreSQL cluster and a Spaces bucket in place of the db and storage stacks.
+  managed:
+    skip: [spaces]
+    db:      {version: "16", database: serversherpa, user: serversherpa, password: "{secret.POSTGRES_PASSWORD}"}
+    objects: {cors: [portal, kiosk, wiki]}
+    env:
+      SS_SPACES_BUCKET: "{data.objects.bucket}"   # the env_file's default is "serversherpa"; Spaces names are global
+    commands:
+      has_data: [deploy/stack/ss-stack, has-data, "{slipway.env_dir}", --external]
 
 commands:
   build:        [deploy/stack/ss-stack, build, "{slipway.env_dir}"]

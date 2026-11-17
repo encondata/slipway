@@ -5,11 +5,19 @@ a job of a standalone instance meets exactly the checks it met before (I1); a jo
 of a whole environment (``instance`` None), also meets the environment's fences: the runner keys of D8, the
 data owner's hold and dirty state (§7.5), an unresolved switch (§10.6), the data server's readiness (§6) and
 the permission a deploy that goes live needs. The caller audits, commits and submits the job, as before.
+
+Phases 4 and 5 add the not-built rule for hosts a provider makes (a droplet, a VM): a deploy builds its host
+(its steps start with ``resolve`` then ``prepare``), Remove slot and the teardown may run on an owned host in any
+phase, and every other job waits until the host is built (Decision 28). SSH hosts keep phase 3's unpinned
+refusal. Production environments add P4 §13's fences: the typed name or phrases (``confirm_refusal``, asked
+first when a job is queued) and the retiring and off-the-air rules (``production_problem``). The system actor (``system='renewals'``) may queue only a certificate renewal (P4 §15.12), and the kinds
+of later slices register their own refusals in ``KIND_PROBLEMS`` (Decision 45).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy import select
@@ -25,17 +33,35 @@ from slipway.models import (
     EnvironmentStatus,
     Instance,
     InstanceStatus,
+    Machine,
+    MachineStage,
+    ProviderAccount,
     User,
 )
-from slipway.services import data, environments
+from slipway.services import data, environments, hosts, machines, ssh
 
 BUSY = "A job is already running for this instance; wait for it to finish"
 DELETING = "This instance is being deleted"
 UNPINNED = "Host {host} has not been verified yet; run a connection check first"
+# The not-built rule (Decision 28) for a host a provider makes, and the VM data server's own text (P5 §10.4).
+NOT_BUILT = "{slot}'s server isn't built yet: deploy to {slot} first"
+DATA_VM_NOT_MADE = "Deploy {env} first: its data server's VM isn't made yet"
+VM_DESTROYING = "{vm} is being removed; only the retry of that removal can run"
 # Kinds refused while the data owner's data is held (§7.5): Retry, the restore kinds, Back up now, removing a
-# slot and the teardown stay allowed.
+# slot and the teardown stay allowed. A VM snapshot of held data would keep the half-changed data (P5 §10.1).
 HOLD_REFUSES = (DeploymentKind.DEPLOY, DeploymentKind.ACTIVATE, DeploymentKind.DISCARD, DeploymentKind.SNAPSHOT,
-                DeploymentKind.ADMIN, DeploymentKind.CONTENT)
+                DeploymentKind.ADMIN, DeploymentKind.CONTENT, DeploymentKind.VM_SNAPSHOT)
+# Kinds that run on an owned host whatever its phase: they remove it (Decision 28).
+REMOVING_KINDS = (DeploymentKind.REMOVE_SLOT, DeploymentKind.TEARDOWN)
+# Who other than a person may queue a job, and the one kind each may queue (P4 §15.12).
+SYSTEM_KINDS = {"renewals": DeploymentKind.CERTIFICATE}
+
+# A kind's own refusals, registered by the module that owns the kind (Decision 45: phase 5's vm_jobs registers
+# vm_snapshot, vm_revert and vm_drop here, so they need no edit of this file). ``job_refusal`` calls the one of
+# the job's kind, for a job of an environment, after the environment's fences; it answers None, a text (409) or
+# a JobRefused. Keyword arguments: db, env, instance, members, options, user, retry_of.
+KindProblem = Callable[..., Awaitable["JobRefused | str | None"]]
+KIND_PROBLEMS: dict[str, KindProblem] = {}
 
 
 class JobRefused(Exception):
@@ -106,17 +132,29 @@ async def environment_fence(db: AsyncSession, env: Environment, members: dict[st
     if unresolved:
         app_deploy = kind == DeploymentKind.DEPLOY and slot in environments.APP_SLOTS
         stops_app = kind == DeploymentKind.SNAPSHOT and bool(opts.get("stop_app"))
+        # A certificate renewal rewrites the load balancer's HTTPS rule, which a switch left half-done (P4 §14.3).
         if app_deploy or stops_app or kind in (DeploymentKind.REMOVE_SLOT, DeploymentKind.DISCARD,
-                                               DeploymentKind.ADMIN, DeploymentKind.CONTENT, *data.RESTORE_KINDS):
+                                               DeploymentKind.ADMIN, DeploymentKind.CONTENT,
+                                               DeploymentKind.CERTIFICATE, *data.RESTORE_KINDS):
             return JobRefused(409, unresolved)
 
-    # A deploy to the app slot that serves traffic.
-    if kind == DeploymentKind.DEPLOY and instance is not None and instance.slot in environments.APP_SLOTS:
+    # A deploy to the app slot that serves traffic. While that slot's host isn't built (a droplet found gone,
+    # P4 D28) nothing serves from it, so its deploy builds it again; so too once that deploy rebuilt the host
+    # but failed before a release went live on it (its old release went with the old disk), so its retry or
+    # another deploy can finish the job.
+    if kind == DeploymentKind.DEPLOY and instance is not None and instance.slot in environments.APP_SLOTS \
+            and (instance.host is None or ssh.host_is_built(instance.host)) and not release_gone(instance):
         apps = environments.app_members(members)
         if len(apps) == 2 and env.active_slot_id == instance.id:
             other = "green" if instance.slot == "blue" else "blue"
             return JobRefused(409, f"{instance.slot} serves traffic: deploy to {other}, then activate it")
     return None
+
+
+def release_gone(instance: Instance) -> bool:
+    """Whether the slot's live release went with its gone droplet (``app_state.gone_live``, P4 D28) and no
+    release has gone live on it since: it serves nothing."""
+    return bool((instance.app_state or {}).get("gone_live")) and data.live_state(instance) is None
 
 
 def identity_text(env: Environment, owner: Instance, key: str) -> str:
@@ -152,6 +190,57 @@ def identity_problem(env: Environment, owner: Instance | None, instance: Instanc
     for key in sorted(owner.live_identity):
         if key in variables and str(variables[key]) != str(owner.live_identity[key]):
             return identity_text(env, owner, key)
+    return None
+
+
+def confirm_refusal(env: Environment, kind: str, options: dict[str, Any] | None) -> JobRefused | None:
+    """The typed confirmations a job of a production environment needs (P4 §13), checked first (422) when it is
+    queued: the environment's name for an Activate or Switch back (``options.confirm``, Decision 39), and for its
+    teardown the phrase ``delete production <name>`` (``options.confirm_production``) and, when it goes without a
+    snapshot, ``delete production <name> without a snapshot``. A retry is asked them again, since a retry never
+    copies them (``ENV_ONE_SHOT``). A chained activate while nothing is live (the first deploy's) moves no
+    traffic away and needs no name. ``job_refusal`` doesn't ask these, so a page can still offer the job."""
+    opts = options or {}
+    if not env.production:
+        return None
+    if kind == DeploymentKind.ACTIVATE:
+        if opts.get("chain") and env.active_slot_id is None:
+            return None
+        if opts.get("confirm") != env.name:
+            return JobRefused(422, f"Type the environment's name, {env.name}, exactly to confirm")
+    if kind == DeploymentKind.TEARDOWN:
+        phrase = environments.production_phrase(env)
+        if opts.get("confirm_production") != phrase:
+            return JobRefused(422, f"Type {phrase} to confirm")
+        if opts.get("no_snapshot") and opts.get("confirm_no_snapshot") != environments.no_snapshot_phrase(env):
+            return JobRefused(422, f"Type {environments.no_snapshot_phrase(env)} to confirm")
+    return None
+
+
+async def production_problem(db: AsyncSession, env: Environment, kind: str, options: dict[str, Any] | None,
+                             members: dict[str, Instance]) -> JobRefused | None:
+    """P4 §13's fences that read the environment's state: no slot of a retiring production is activated; only a
+    retiring production with a live slot is taken off the air (``deactivate_problem``, for every environment);
+    a production teardown needs the environment retiring and off the air, and a snapshot first unless its data
+    owner never held data or the delete went without one (``no_snapshot``). The teardown's ``check`` may ask
+    this again at run time."""
+    opts = options or {}
+    if kind == DeploymentKind.DEACTIVATE:
+        problem = environments.deactivate_problem(env, members)
+        return JobRefused(409, problem) if problem else None
+    if not env.production:
+        return None
+    if kind == DeploymentKind.ACTIVATE and env.retiring_at is not None:
+        return JobRefused(409, f"{env.name} is retiring: it only goes dark")
+    if kind == DeploymentKind.TEARDOWN:
+        if env.retiring_at is None:
+            return JobRefused(409, f"Retire {env.name} first: a production environment is deleted only after it is "
+                                   "retired")
+        if env.active_slot_id is not None:
+            return JobRefused(409, f"Deactivate {env.name} first: it still takes traffic")
+        if not (opts.get("snapshot_first") or opts.get("no_snapshot")) \
+                and not await environments.never_held_data(db, env, members):
+            return JobRefused(422, "A production environment is deleted only after a snapshot")
     return None
 
 
@@ -217,9 +306,22 @@ async def job_refusal(db: AsyncSession, *, instance: Instance | None = None, env
         running = await data.active_job(db, instance.id)
         if running is not None:
             return JobRefused(409, environments.busy_text(env, running))
-    if target is not None and kind not in (DeploymentKind.TEARDOWN, DeploymentKind.PUBLISH) \
-            and not target.host.is_pinned:
-        return JobRefused(400, UNPINNED.format(host=target.host.name))
+    # Production's state fences (P4 §13), before the target's host: a retiring production only goes dark.
+    fenced = await production_problem(db, env, kind, opts, mem)
+    if fenced is not None:
+        return fenced
+    target_host = target.host if target is not None else None
+    if target_host is not None and not _ssh_host(target_host):
+        problem = await not_built_problem(db, env, target, kind, retry_of=retry_of)
+        if problem is not None:
+            return problem
+    elif target_host is not None and kind not in (DeploymentKind.TEARDOWN, DeploymentKind.PUBLISH) \
+            and not target_host.is_pinned:
+        return JobRefused(400, UNPINNED.format(host=target_host.name))
+    if opts.get("forget_vms"):
+        problem = _forget_vms_problem(user, kind)
+        if problem is not None:
+            return problem
 
     fenced = await environment_fence(db, env, mem, instance=instance, kind=kind, options=opts, retry_of=retry_of)
     if fenced is not None:
@@ -255,16 +357,79 @@ async def job_refusal(db: AsyncSession, *, instance: Instance | None = None, env
         if not state.available:
             return JobRefused(409, state.reason or "Nothing to discard")
     elif kind == DeploymentKind.REMOVE_SLOT:
-        problem = await environments.remove_slot_problem(db, env, slot, mem)
+        # forget_vms lets a forgettable VM blocker pass (P5 §9.5); its permissions were checked above.
+        problem = await environments.remove_slot_problem(db, env, slot, mem, forget_vms=bool(opts.get("forget_vms")))
         if problem:
             return JobRefused(409, problem)
     elif kind == DeploymentKind.PUBLISH:
         problem = await environments.publish_problem(db, env)
         if problem:
             return JobRefused(409, problem)
+    own = KIND_PROBLEMS.get(str(kind))
+    if own is not None:
+        found = await own(db=db, env=env, instance=instance, members=mem, options=opts, user=user, retry_of=retry_of)
+        if isinstance(found, JobRefused):
+            return found
+        if found:
+            return JobRefused(409, str(found))
     missing = _missing_permission(user, needs)
     if missing:
         return JobRefused(403, missing)
+    return None
+
+
+def _ssh_host(host: Any) -> bool:
+    return (getattr(host, "provider", None) or "ssh") == "ssh"
+
+
+async def _machine_of(db: AsyncSession, host: Any) -> Machine | None:
+    if (host.provider or "ssh") not in ("proxmox", "esxi") or host.id is None:
+        return None
+    return await db.scalar(select(Machine).where(Machine.host_id == host.id))
+
+
+async def not_built_problem(db: AsyncSession, env: Environment, target: Instance, kind: str, *,
+                            retry_of: Deployment | None = None) -> JobRefused | None:
+    """The not-built rule for a job whose target's host a provider makes (Decision 28; P4 §3.3, P5 §10.4), or
+    None. A VM being removed takes only the retry of the job removing it. A deploy is allowed whatever the
+    host's phase: its ``prepare`` step builds the host (and a VM's account must then be usable). Remove slot and
+    the teardown are allowed on a host the environment owns in any phase. Every other kind waits until the host
+    is built."""
+    host = target.host
+    machine = await _machine_of(db, host)
+    if machine is not None and machine.stage == MachineStage.DESTROYING:
+        removing = retry_of is not None and retry_of.kind in REMOVING_KINDS and kind == retry_of.kind
+        if not removing:
+            return JobRefused(409, VM_DESTROYING.format(vm=machine.name))
+        return None
+    if kind in REMOVING_KINDS and hosts.owned_by(env, host):
+        return None
+    if kind == DeploymentKind.DEPLOY:
+        if machine is not None and machine.stage != MachineStage.READY:
+            account = await db.get(ProviderAccount, machine.account_id)
+            why = machines.account_problem(account)
+            if why:
+                name = account.name if account is not None else "Its account"
+                return JobRefused(409, f"{name} can't be used: {why}")
+        return None
+    if ssh.host_is_built(host):
+        return None
+    if target.slot == environments.DATA_SLOT and machine is not None:
+        return JobRefused(409, DATA_VM_NOT_MADE.format(env=env.name))
+    if kind == DeploymentKind.ACTIVATE and environments.is_vm_host(host):
+        # As the activate's own check words it (env_jobs._host_problem, P5 §10.4).
+        return JobRefused(409, environments.VM_NOT_MADE.format(slot=target.slot or target.name))
+    return JobRefused(409, NOT_BUILT.format(slot=target.slot or target.name))
+
+
+def _forget_vms_problem(user: User | None, kind: str) -> JobRefused | None:
+    """``forget_vms`` (P5 §9.5, §9.9): only on Remove slot or the teardown, by someone who may write VMs and
+    delete environments. The environment's typed name is the API's to check, as for every removing job."""
+    if kind not in REMOVING_KINDS:
+        return JobRefused(409, "Only removing a slot or deleting the environment can forget its VMs")
+    for permission in (Perm.MACHINES_WRITE, Perm.ENVIRONMENTS_DELETE):
+        if user is None or not user.can(permission):
+            return JobRefused(403, f"Forgetting a VM needs the {permission} permission")
     return None
 
 
@@ -289,7 +454,10 @@ async def control_refusal(db: AsyncSession, instance: Instance, action: str) -> 
 # jobs). ``switch`` is an activate's record of its own writes (§10.2 step 2); a retry starts its own. ``then``
 # is a snapshot's "delete the environment afterwards": a retried snapshot never deletes it, since the teardown
 # needs environments:delete and the typed name of whoever asks for it. ``go_live`` is decided again (D11).
-ENV_ONE_SHOT = frozenset({"confirm", "forget_traffic", "after", "switch", "then", "go_live"})
+# Phases 4 and 5 add the typed confirmations of production and of a delete without a snapshot, the retry's own
+# choices (``rebuild_data``: make a gone cluster again, empty; ``forget_vms``; ``drop_data``), each asked again.
+ENV_ONE_SHOT = frozenset({"confirm", "forget_traffic", "after", "switch", "then", "go_live", "confirm_production",
+                          "confirm_no_snapshot", "rebuild_data", "forget_vms", "drop_data", "then_options"})
 
 
 def _retry_go_live(env: Environment, instance: Instance, parent: Deployment, members: dict[str, Instance]) -> bool:
@@ -304,7 +472,8 @@ def _retry_go_live(env: Environment, instance: Instance, parent: Deployment, mem
 
 async def queue_job(db: AsyncSession, *, instance: Instance | None = None, environment: Environment | None = None,
                     user: User | None, kind: str = DeploymentKind.DEPLOY, retry_of: Deployment | None = None,
-                    options: dict[str, Any] | None = None, needs: tuple[str, ...] = (), **refs: Any) -> Deployment:
+                    options: dict[str, Any] | None = None, needs: tuple[str, ...] = (), system: str | None = None,
+                    **refs: Any) -> Deployment:
     """Add a queued job (the caller audits, commits and submits it); raise JobRefused.
 
     ``refs`` are the rows the job points at (``backup_id``, ``restore_backup_id``, ``snapshot_id``). A retry
@@ -316,9 +485,21 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
     ``options.go_live`` (``environments.goes_live`` unless given). An environment-level job (``instance`` None,
     ``options.slot`` its target slot) gets its steps from ``environments.env_steps_for``. Queueing any job of an
     environment clears its chain notice, and queueing its teardown marks it ``deleting``.
+
+    ``system`` names a queue that no person asked for: ``renewals`` (P4 §15.12) may queue only a ``certificate``
+    job of an environment, with ``user`` None. It skips the permission checks, records no ``triggered_by`` and
+    ``options.by = 'renewals'``, and leaves the environment's notice as it is (Decision 23). The environment's
+    fences still apply.
     """
     from slipway.services import deployer  # the deployer imports data, which imports environments
 
+    if system is not None:
+        if system not in SYSTEM_KINDS:
+            raise ValueError(f"{system!r} can't queue jobs")
+        if kind != SYSTEM_KINDS[system] or retry_of is not None:
+            raise ValueError(f"{system} may queue only a {SYSTEM_KINDS[system]} job")
+        if user is not None or instance is not None or environment is None:
+            raise ValueError(f"{system} queues an environment's job with no user")
     if instance is None and environment is None:
         raise ValueError("a job needs an instance or an environment")
     env = environment if environment is not None else await environments.environment_of(db, instance)
@@ -342,6 +523,12 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
         if instance.slot in environments.APP_SLOTS and "go_live" not in opts_in:
             opts_in["go_live"] = (_retry_go_live(env, instance, retry_of, mem) if retry_of is not None
                                   else environments.goes_live(env, str(instance.slot), mem))
+    if system is not None:
+        opts_in["by"] = system
+    if env is not None:
+        typed = confirm_refusal(env, kind, opts_in)
+        if typed is not None:
+            raise typed
     refused = await job_refusal(db, instance=instance, environment=env, user=user, kind=kind, options=opts_in,
                                 retry_of=retry_of, members=mem, needs=needs)
     if refused is not None:
@@ -368,6 +555,9 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
         # The job settles the conditional steps itself when it starts; this list is what the page shows meanwhile.
         # A member gets its environment's lists (§8.4), as the deployer gives them when the job starts.
         member = {"environment": env, "members": mem} if env is not None else {}
+        if env is not None and kind == DeploymentKind.DEPLOY:
+            # A deploy on a provider's host lists prepare, and resize when its rule holds now (Decisions 12, 14).
+            member["provider"] = await deployer.provider_steps(db, instance, env, mem)
         server = env is not None and env.data_mode == DataMode.SERVER
         steps = deployer.steps_for(
             instance, kind, snapshot=values.get("snapshot_id") is not None and kind != DeploymentKind.SNAPSHOT,
@@ -401,8 +591,10 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
                          retry_of_id=retry_of.id if retry_of else None,
                          steps=environments.env_steps_for(env, kind, opts_in, mem), **values)
     db.add(dep)
-    if env is not None:
-        env.notice = None  # cleared by any later job of the environment (§8.5)
+    if env is not None and system is None:
+        # Cleared by any later job of the environment (§8.5), but not by the renewal loop's: a renewal must never
+        # erase a stopped chain's notice and its Continue follow-up (Decision 23).
+        env.notice = None
         if kind == DeploymentKind.TEARDOWN:
             env.status = EnvironmentStatus.DELETING
     try:

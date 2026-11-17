@@ -24,7 +24,10 @@
 {% set RUNNING_LABELS = {"deploy": "Building", "restore": "Restoring", "reset": "Resetting", "rollback": "Rolling back",
                          "backup": "Backing up", "snapshot": "Taking snapshot", "admin": "Creating admin",
                          "content": "Adding content", "activate": "Activating", "publish": "Publishing",
-                         "discard": "Discarding", "remove_slot": "Removing", "teardown": "Deleting"} %}
+                         "discard": "Discarding", "remove_slot": "Removing", "teardown": "Deleting",
+                         "certificate": "Renewing", "deactivate": "Taking off the air",
+                         "vm_snapshot": "Taking VM snapshot", "vm_revert": "Reverting",
+                         "vm_drop": "Deleting VM snapshot"} %}
 
 {#- ``job`` is the kind of the deployment (or of the instance's active job): a running restore reads
     Restoring, and a finished job that isn't a deploy reads Done. -#}

@@ -148,7 +148,9 @@ async def test_migration_0009_upgrade_downgrade_round_trip(migration_url):
     engine = create_async_engine(url)
     try:
         ids = await _seed_0008(engine)
-        _ok(url, "upgrade", "head")
+        # To 0009, not head: the refused downgrade below must leave 0009 behind, and later revisions have
+        # their own tests (test_migration_0012.py checks that the models equal the migrations at head).
+        _ok(url, "upgrade", "0009")
 
         # Host labels carry over; every existing host is an SSH host.
         assert [tuple(r) for r in await _rows(engine, "SELECT label, provider, lan_address FROM hosts")] == [
@@ -174,7 +176,6 @@ async def test_migration_0009_upgrade_downgrade_round_trip(migration_url):
         fks = await _inspect(engine, lambda i: {fk["name"]: fk for fk in i.get_foreign_keys("deployments")})
         assert fks["fk_deployments_instance_id_instances"]["options"]["ondelete"].upper() == "CASCADE"
         assert fks["fk_deployments_environment_id_environments"]["options"]["ondelete"].upper() == "SET NULL"
-        _ok(url, "check")  # the migration matches the models exactly
 
         # The downgrade refuses while an environment is live, and changes nothing.
         env_id, env_job, retry = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
@@ -219,8 +220,7 @@ async def test_migration_0009_upgrade_downgrade_round_trip(migration_url):
         assert "queued" in _where(indexes["ux_deployments_one_active"])
         assert not {"ux_deployments_one_active_env", "ux_deployments_one_active_activate"} & set(indexes)
 
-        _ok(url, "upgrade", "head")
-        _ok(url, "check")
+        _ok(url, "upgrade", "0009")
         assert [tuple(r) for r in await _rows(engine, "SELECT label FROM hosts")] == [("prod",)]
     finally:
         await engine.dispose()

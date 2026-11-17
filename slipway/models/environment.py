@@ -65,6 +65,10 @@ class ResourceOrigin(StrEnum):
     CLAIMED = "claimed"  # it existed; Slipway keeps it current and never deletes it
 
 
+# The production environments ux_environments_one_production allows one of per app.
+ONE_PRODUCTION = "production AND retiring_at IS NULL AND deleted_at IS NULL"
+
+
 def _default_traffic() -> dict[str, Any]:
     return {"switch": "none", "dns": None}
 
@@ -82,6 +86,22 @@ class Environment(UUIDPrimaryKey, Timestamps, Base):
         ),
         CheckConstraint("(status = 'deleted') = (deleted_at IS NOT NULL)", name="deleted"),
         CheckConstraint("data_mode IN ('slot', 'server', 'managed')", name="data_mode"),
+        # Phase 4: a DigitalOcean environment always names its account, and only it does (a VM environment is
+        # placement ssh: its accounts are on its machines). DigitalOcean data is always managed.
+        CheckConstraint("(provider = 'digitalocean') = (provider_account_id IS NOT NULL)", name="provider_account"),
+        CheckConstraint("provider <> 'digitalocean' OR data_mode = 'managed'", name="do_managed"),
+        CheckConstraint("NOT production OR provider = 'digitalocean'", name="production_do"),
+        CheckConstraint("retiring_at IS NULL OR production", name="retiring"),
+        CheckConstraint("NOT production OR NOT auto_activate", name="production_auto"),
+        # One production environment per app (repository and manifest) that isn't being retired.
+        Index(
+            "ux_environments_one_production",
+            "repository_id",
+            "manifest_file",
+            unique=True,
+            postgresql_where=text(ONE_PRODUCTION),
+            sqlite_where=text(ONE_PRODUCTION),
+        ),
     )
 
     name: Mapped[str] = mapped_column(String(ENVIRONMENT_NAME_MAX))
@@ -123,6 +143,20 @@ class Environment(UUIDPrimaryKey, Timestamps, Base):
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     deleted_at: Mapped[datetime | None]
     deleted_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+
+    # Phase 4. The placement: ``ssh`` (hosts added by hand, or VMs Slipway makes) or ``digitalocean``.
+    provider: Mapped[str] = mapped_column(String(16), default="ssh", server_default="ssh")
+    # RESTRICT: an account can't be dropped while an environment row (deleted ones included) points at it.
+    provider_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("provider_accounts.id", ondelete="RESTRICT")
+    )
+    provider_team: Mapped[str | None] = mapped_column(String(80))  # frozen by the first DigitalOcean step
+    # DigitalOcean: {region, droplet_size, droplet_image, db_size, db_nodes, db_version, acme_staging, vpc_range,
+    # lb_ip, edge, slipway_addresses, certificate, plan, cost} (phase 4 §3.2).
+    cloud: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+    production: Mapped[bool] = mapped_column(default=False, server_default=false())
+    retiring_at: Mapped[datetime | None]
+    retired_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
     repository: Mapped[Repository] = relationship(lazy="selectin")
 

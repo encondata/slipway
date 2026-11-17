@@ -2,6 +2,8 @@
 
 Host keys are pinned on first successful connection (trust on first use). Every later
 connection must present the same key, otherwise it is refused with ``HostKeyMismatch``.
+A host a provider makes (a droplet, a VM) is never trusted on first use: its key is written only
+by its provider's ``prepare``, and ``SSHTarget.from_host`` refuses it until it is built (``HostNotBuilt``).
 """
 
 from __future__ import annotations
@@ -37,6 +39,13 @@ LONG_LINE_CHARS = 4 * 1024 * 1024
 _SEP = "::slipway::"
 _UNSAFE_COMMENT = re.compile(r"[^A-Za-z0-9@._-]+")
 CREDENTIALS_UNREADABLE = "No usable SSH credentials are stored for this host (missing or could not be decrypted); re-enter them on the host page"
+# A droplet's or VM's key is Slipway's own and can't be entered on the host page (that edit is refused for a host an
+# environment made), so the text names the only fix that works.
+OWNED_KEY_UNREADABLE = (
+    "Slipway can't read the SSH key it made for this host (missing or could not be decrypted). Put the old key "
+    "back in SLIPWAY_ENCRYPTION_KEY, after the new one: the key of a droplet or VM Slipway made can't be entered "
+    "by hand"
+)
 _KEY_MISMATCH = (
     "The host key presented by the server does not match the pinned key. "
     "If the server was rebuilt, reset the pinned key; otherwise this may be an attack."
@@ -71,6 +80,14 @@ class HostKeyNotPinned(SSHError):
     pass
 
 
+class HostNotBuilt(Exception):
+    """A host a provider makes (a droplet, a VM) isn't built yet, so there is nothing to connect to.
+
+    Deliberately not an ``SSHError``: nothing that treats an SSHError as a network failure (the poller,
+    the API's 502) should ever see it. Every API path that can meet it answers 409 with its text.
+    """
+
+
 class CommandFailed(SSHError):
     def __init__(self, command: str, exit_status: int, output: str) -> None:
         tail = "\n".join(output.strip().splitlines()[-TAIL_LINES:])
@@ -89,9 +106,14 @@ class SSHTarget:
     key_passphrase: str | None = None
     password: str | None = None
     pinned_host_key: str | None = None
+    owned: bool = False  # a host an environment made (a droplet or a VM): its key can't be entered by hand
 
     @classmethod
-    def from_host(cls, host: Host) -> SSHTarget:
+    def from_host(cls, host: Host, *, building: bool = False) -> SSHTarget:
+        """The target for ``host``. Raises ``HostNotBuilt`` for a provider's host that isn't built yet, before
+        any connection, unless ``building`` (only the providers' ``prepare`` drivers pass it)."""
+        if not building and not host_is_built(host):
+            raise HostNotBuilt(f"{host.name} isn't built yet: deploy {host.label or host.name} to build it")
         return cls(
             hostname=host.hostname,
             port=host.port,
@@ -100,7 +122,15 @@ class SSHTarget:
             key_passphrase=host.key_passphrase,
             password=host.password if host.auth_method == "password" else None,
             pinned_host_key=host.host_key,
+            owned=getattr(host, "owner_environment_id", None) is not None,
         )
+
+
+def host_is_built(host: Host) -> bool:
+    """``Host.is_built``, also for a row not saved yet (its ``provider`` is None until the insert, which means
+    ``ssh``): an ssh host always is; a provider's host only once its phase is ``ready``."""
+    provider = getattr(host, "provider", None) or "ssh"
+    return provider == "ssh" or (getattr(host, "provider_state", None) or {}).get("phase") == "ready"
 
 
 @dataclass
@@ -529,7 +559,7 @@ async def _offered_key(target: SSHTarget, pinned: asyncssh.SSHKey) -> asyncssh.S
 
 async def connect(target: SSHTarget, *, allow_unpinned: bool = False) -> RemoteSession:
     if not target.private_key and not target.password:
-        raise SSHError(CREDENTIALS_UNREADABLE)
+        raise SSHError(OWNED_KEY_UNREADABLE if target.owned else CREDENTIALS_UNREADABLE)
     pinned = _pinned_key(target)
     if pinned is not None:
         # Accept only the pinned key, and only its own algorithms.

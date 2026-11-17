@@ -290,7 +290,10 @@ async def test_settings_need_settings_write(client, make_client):
     await make_user("dev@example.com", roles=["maintainer"])
     await login(client, "dev@example.com")
     assert (await client.get("/api/v1/settings/switchyard")).status_code == 403
-    assert (await client.get("/settings/integrations")).status_code in (403, 404)
+    # Phase 4 opens the page to providers:read (a maintainer's), but the Switchyard card still needs settings:write.
+    page = await client.get("/settings/integrations")
+    assert page.status_code == 200
+    assert 'PUT /api/v1/settings/switchyard' not in page.text and "<h2>Switchyard</h2>" not in page.text
 
 
 async def test_instance_routes_api(admin_client, fake_sy):
