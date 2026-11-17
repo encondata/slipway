@@ -10,6 +10,9 @@
  *   <button data-claim="<n>"> in the unmanaged list opens #claim-dialog filled from that group
  *   <button data-copy="text"> / data-copy-target="#el"
  *   <select data-fill> with <option data-fill-<field>="value">   (picking an option fills untouched fields)
+ *   <form data-once>                                       (after it succeeds its submit button stays disabled)
+ *   <button data-update-target data-branch=.. data-sha=..> opens #update-confirm filled from its data-*
+ *   <section data-update-run="<run id>">                   (follows an upgrade of Slipway: steps, status, log)
  */
 (function () {
   "use strict";
@@ -36,7 +39,10 @@
       if (res.status === 401 && !/^\/api\/v1\/auth\/login(?:[?#]|$)/.test(url) && location.pathname !== "/login") {
         location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
       }
-      throw new Error(errorText(data) || res.statusText || "Request failed");
+      const err = new Error(errorText(data) || res.statusText || "Request failed");
+      err.status = res.status;
+      err.detail = Boolean(data && data.detail !== undefined);
+      throw err;
     }
     return data;
   }
@@ -187,6 +193,8 @@
     if (!form) return;
     ev.preventDefault();
     if (form.dataset.confirm && !confirm(form.dataset.confirm)) return;
+    const once = form.dataset.once !== undefined;
+    if (once && form._sent) return; // a second click while the first is on its way, or after it succeeded
     const [method, url] = form.dataset.form.split(" ");
     const submit = ev.submitter || $('[type="submit"]', form);
     let body;
@@ -195,8 +203,11 @@
     if (submit && submit.name) body[submit.name] = submit.value === "true" ? true : submit.value === "false" ? false : submit.value;
     setLoading(submit, true);
     formError(form, "");
+    if (once) form._sent = true;
+    let ok = false;
     try {
       const data = await api(method, url, body);
+      ok = true;
       form.dispatchEvent(new CustomEvent("slipway:success", { detail: data, bubbles: true }));
       if (form.dataset.resultField && data) {
         const target = $(form.dataset.resultTarget);
@@ -212,9 +223,11 @@
       if (data && data.warning) leaving ? flashAfterReload(data.warning, "warning") : toast(data.warning, "warning");
       then(form.dataset.then, data);
     } catch (err) {
+      if (once) form._sent = false;
       if (!formError(form, err.message)) toast(err.message, "error");
     } finally {
       setLoading(submit, false);
+      if (ok && once && submit) submit.disabled = true;
     }
   });
 
@@ -635,6 +648,153 @@
     update();
   }
 
+  // ------------------------------------------------------ Slipway updates
+  // Every value here came from git or the server (branch names, subjects, authors, messages, the log), so it is
+  // only ever set with textContent, .value or a checked href; never with innerHTML.
+  const RUN_ID = /^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$/;
+  const SHA = /^[0-9a-f]{40}$/;
+  const COMPARE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/;
+  const ANSI = /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+  const RUN_STATUS = {
+    running: ["Running", "warning spin"], succeeded: ["Upgraded", "success"], failed: ["Failed", "error"],
+    rolled_back: ["Rolled back", "warning"], rollback_failed: ["Rollback failed", "error"],
+    interrupted: ["Interrupted", "error"], unknown: ["Unknown", ""],
+  };
+  const RUN_FINAL = ["succeeded", "failed", "rolled_back", "rollback_failed", "interrupted"];
+  const RUN_DONE_TEXT = {
+    succeeded: "Slipway was upgraded. Reload to use the new version.",
+    rolled_back: "The new version didn't start, so Slipway rolled back to the old one.",
+    rollback_failed: "The roll back failed. Follow the by-hand steps in docs/updates.md.",
+    failed: "The upgrade failed before anything changed.",
+    interrupted: "The upgrade stopped before it finished. Check docs/updates.md.",
+  };
+  const RESTART_LIMIT = 10 * 60 * 1000; // how long to keep polling while Slipway can't be reached
+  const POLL_MS = 2000;
+
+  function openUpgrade(btn) {
+    const dlg = $("#update-confirm");
+    const form = dlg && $("form", dlg);
+    const d = btn.dataset;
+    if (!form || !SHA.test(d.sha || "")) return;
+    const text = (key, value) => $$(`[data-confirm-text="${key}"]`, dlg).forEach((n) => { n.textContent = value || ""; });
+    const show = (key, on) => $$(`[data-confirm-show="${key}"]`, dlg).forEach((n) => { n.hidden = !on; });
+    ["branch", "sha", "short", "author", "subject", "migrations", "privileged"].forEach((k) => text(k, d[k]));
+    const n = Number(d.migrations) || 0;
+    text("migrations-count", n === 1 ? "1 migration" : `${n} migrations`);
+    show("other", !d.followed);
+    show("migrations", Number(d.migrations) > 0);
+    show("privileged", Boolean(d.privileged));
+    const link = $('[data-confirm-link="compare"]', dlg);
+    if (link) {
+      const ok = COMPARE.test(d.compare || "");
+      if (ok) link.setAttribute("href", d.compare);
+      link.hidden = !ok;
+    }
+    $('[name="branch"]', form).value = d.branch || "";
+    $('[name="sha"]', form).value = d.sha;
+    $$("[data-form-error]", dlg).forEach((el) => el.remove());
+    dlg.showModal();
+  }
+
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-update-target]");
+    if (!btn || btn.disabled) return;
+    ev.preventDefault();
+    openUpgrade(btn);
+  });
+
+  // Draws one read of GET /api/v1/updates/runs/<id>. Returns whether to stop polling: the run has finished,
+  // or its status can't be read (a missing or broken status file stays that way).
+  function showRun(el, d) {
+    const status = RUN_STATUS[d.status] ? d.status : "unknown";
+    const final = RUN_FINAL.indexOf(status) >= 0 || d.final === true;
+    const stop = final || status === "unknown";
+    const badge = $("[data-run-status]", el);
+    if (badge) {
+      badge.className = "badge " + RUN_STATUS[status][1];
+      badge.textContent = RUN_STATUS[status][0];
+    }
+    const items = $$("[data-step]", el);
+    const names = items.map((li) => li.dataset.step);
+    const at = names.indexOf(d.step);
+    const rolledBack = d.step === "rollback" || status === "rolled_back" || status === "rollback_failed";
+    // During or after a rollback, the step that failed (switch or health) is marked failed, and the ones
+    // after it that never ran stay pending. Older status files don't say: then it was the health check.
+    const rb = names.indexOf("rollback");
+    let failedAt = -1;
+    if (d.step === "rollback" && rb > 0) {
+      failedAt = names.indexOf(d.failed_step);
+      if (failedAt < 0 || failedAt >= rb) failedAt = rb - 1;
+    }
+    items.forEach((li, i) => {
+      let state = "pending";
+      if (status === "succeeded") state = "done";
+      else if (failedAt >= 0 && i < rb) state = i < failedAt ? "done" : i === failedAt ? "failed" : "pending";
+      else if (at >= 0 && i < at) state = "done";
+      else if (i === at) state = !final ? "active" : status === "rolled_back" ? "done" : "failed";
+      li.className = "update-step " + state;
+      if (names[i] === "rollback") li.hidden = !rolledBack;
+    });
+    const box = $("[data-run-message]", el);
+    if (box) {
+      const message = typeof d.message === "string" && d.message ? d.message : final ? RUN_DONE_TEXT[status] : "";
+      const kind = status === "succeeded" ? "success" : status === "rolled_back" ? "warning" : final || status === "unknown" ? "error" : "";
+      box.textContent = message || "";
+      box.className = "callout " + kind;
+      box.hidden = !message;
+    }
+    const pre = $("[data-run-log]", el);
+    if (pre && typeof d.log === "string") {
+      const atBottom = !(pre.scrollHeight > 0) || pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      pre.textContent = d.log.replace(ANSI, "");
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+    const reload = $("[data-run-reload]", el);
+    if (reload) reload.hidden = !stop;
+    return stop;
+  }
+
+  function restarting(el, text) {
+    const box = $("[data-run-restarting]", el);
+    if (!box) return;
+    box.hidden = !text;
+    const label = $("[data-run-restarting-text]", box);
+    if (label && text) label.textContent = text;
+  }
+
+  function watchRun(el) {
+    const id = el.dataset.updateRun || "";
+    if (!RUN_ID.test(id)) return;
+    let downSince = 0;
+    async function tick() {
+      let d;
+      try {
+        d = await api("GET", "/api/v1/updates/runs/" + id);
+      } catch (err) {
+        // While the switch recreates Slipway's container nothing answers, or a proxy answers 502/503/504.
+        const unreachable = !err.status || (err.status >= 500 && !err.detail);
+        if (!unreachable && err.status !== 502) {
+          restarting(el, "");
+          const box = $("[data-run-message]", el);
+          if (box) { box.textContent = err.message; box.className = "callout error"; box.hidden = false; }
+          return; // 404, 403, 409: asking again won't change the answer
+        }
+        downSince = downSince || Date.now();
+        if (Date.now() - downSince > RESTART_LIMIT) {
+          restarting(el, "Slipway didn't answer for 10 minutes. Check the server, then reload this page.");
+          return;
+        }
+        restarting(el, unreachable ? "Slipway is restarting…" : "Can't read the upgrade from the server right now: " + err.message + ". Trying again.");
+        setTimeout(tick, POLL_MS);
+        return;
+      }
+      downSince = 0;
+      restarting(el, "");
+      if (!showRun(el, d || {})) setTimeout(tick, POLL_MS);
+    }
+    tick();
+  }
+
   // -------------------------------------------------------------- boot
   document.addEventListener("DOMContentLoaded", () => {
     try {
@@ -647,6 +807,7 @@
       }
     } catch (e) { /* ignore */ }
     $$("[data-deploy-log]").forEach(streamLog);
+    $$("[data-update-run]").forEach(watchRun);
     $$("[data-load]").forEach(load);
     $$("select[data-fill]").forEach(wireFill);
     $$("select[data-branches]").forEach(wireBranches);

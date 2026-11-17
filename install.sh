@@ -144,6 +144,8 @@ say "Pulling images"
 docker compose pull db
 
 say "Building and starting"
+# The build stamp: which commit the image is built from, shown on the Updates page.
+export SLIPWAY_COMMIT="$(git rev-parse HEAD)" SLIPWAY_BRANCH="$BRANCH" SLIPWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if ! docker compose up -d --build; then
   report
   die "Slipway could not be started; the reason is above."

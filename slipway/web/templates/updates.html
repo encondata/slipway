@@ -1,0 +1,284 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty %}
+{# Everything below that came from git or the server (branch names, subjects, authors, messages, logs) is
+   escaped by Jinja here, and set with textContent by slipway.js after that. #}
+{% macro run_badge(status) -%}
+{%- set label, cls = {
+  "running": ("Running", "warning spin"), "succeeded": ("Upgraded", "success"), "failed": ("Failed", "error"),
+  "rolled_back": ("Rolled back", "warning"), "rollback_failed": ("Rollback failed", "error"),
+  "interrupted": ("Interrupted", "error"),
+}.get(status, ("Unknown", "")) -%}
+<span class="badge {{ cls }}" data-run-status>{{ label }}</span>
+{%- endmacro %}
+{% macro upgrade_button(target, label, followed, migrations, disabled_reason) -%}
+<button class="btn {{ 'btn-primary' if followed else 'btn-sm' }}" type="button"
+  {% if disabled_reason %}disabled title="{{ disabled_reason }}"{% else %}data-update-target{% endif %}
+  data-branch="{{ target.branch }}" data-sha="{{ target.sha }}" data-short="{{ target.short }}"
+  data-author="{{ target.author or '' }}" data-subject="{{ target.subject or '' }}"
+  data-followed="{{ '1' if followed else '' }}" data-migrations="{{ migrations if followed else '' }}"
+  data-privileged="{{ (target.privileged_changes or [])|join(', ') }}" data-compare="{{ target.compare_url or '' }}">
+  {{ icon("rocket", "i-sm" if not followed else "") }} {{ label }}</button>
+{%- endmacro %}
+{% block title %}Updates{% endblock %}
+{% block content %}
+{% set running = ov.running %}
+{% set config = ov.config %}
+{% set lc = ov.last_check or {} %}
+{% set host_name = config.host_name if config else "the server" %}
+<div class="page-head">
+  <div>
+    <h1>Updates</h1>
+    <p class="lede">See which version of Slipway runs here and upgrade it without running Docker commands by hand.</p>
+  </div>
+</div>
+
+{% if run_id %}
+{% set r = selected_run or {} %}
+<section class="card" id="update-run" data-update-run="{{ run_id }}" data-final="{{ ov.final_statuses|join(' ') }}">
+  <div class="card-head"><span class="head-icon accent">{{ icon("terminal", "i-lg") }}</span>
+    <div><h2>Upgrade {{ run_id }}</h2>
+      <p>{% if r %}{{ r.branch or "Unknown branch" }}: {{ (r["from"] or "")[:7] or "unknown" }} to {{ (r.to or "")[:7] or "unknown" }}{% if r.by_name %}, started by {{ r.by_name }}{% endif %}{% if r.started_at|from_iso %} {{ r.started_at|from_iso|timeago }}{% endif %}{% else %}Reading this upgrade from the server.{% endif %}</p></div>
+    <span class="spacer"></span>{{ run_badge(r.status if r else "unknown") }}
+  </div>
+  <div class="card-body stack" style="gap: 14px">
+    <ol class="update-steps" aria-label="Steps">
+      {% for name, label in steps %}
+      <li class="update-step" data-step="{{ name }}" {% if name == "rollback" %}hidden{% endif %}><b aria-hidden="true"></b><span>{{ label }}</span></li>
+      {% endfor %}
+    </ol>
+    <div class="callout" data-run-message role="status" hidden></div>
+    <div class="callout primary" data-run-restarting role="status" hidden>{{ icon("restart") }}<div data-run-restarting-text>Slipway is restarting…</div></div>
+    {% if r.launch_log %}<pre class="code" aria-label="Output before the upgrade stopped">{{ r.launch_log }}</pre>{% endif %}
+    <pre class="log" data-run-log aria-label="Upgrade log"></pre>
+    <div class="row wrap">
+      <button class="btn btn-primary" type="button" data-reload-page data-run-reload hidden>{{ icon("restart", "i-sm") }} Reload</button>
+      <a class="btn" href="/updates">Close</a>
+    </div>
+  </div>
+</section>
+{% endif %}
+
+<div class="grid grid-2">
+  <section class="card">
+    <div class="card-head"><span class="head-icon accent">{{ icon("package", "i-lg") }}</span>
+      <div><h2>This Slipway</h2><p>The version this page is served by.</p></div></div>
+    <div class="card-body">
+      <dl class="kv">
+        <dt>{{ icon("package", "i-sm") }} Version</dt><dd class="mono">{{ running.version }}</dd>
+        <dt>{{ icon("commit", "i-sm") }} Commit</dt>
+        <dd>{% if running.commit %}{% if running.commit_url %}<a class="mono" href="{{ running.commit_url }}" target="_blank" rel="noopener noreferrer" title="{{ running.commit }}">{{ running.short }}</a>{% else %}<span class="mono" title="{{ running.commit }}">{{ running.short }}</span>{% endif %}
+          {% elif running.commit_invalid %}<span class="muted">Not valid (the image's commit isn't a full commit sha)</span>
+          {% else %}<span class="muted">Not recorded (built before Slipway recorded its version)</span>{% endif %}</dd>
+        <dt>{{ icon("branch", "i-sm") }} Branch</dt><dd>{% if running.branch %}<span class="mono">{{ running.branch }}</span>{% else %}<span class="muted">Not recorded</span>{% endif %}</dd>
+        <dt>{{ icon("clock", "i-sm") }} Built</dt><dd>{% if running.built_at|from_iso %}{{ running.built_at|from_iso|dt }}{% else %}<span class="muted">Not recorded</span>{% endif %}</dd>
+        {% if ov.in_docker %}<dt>{{ icon("box", "i-sm") }} Container</dt><dd class="mono">{{ running.container }}</dd>{% endif %}
+      </dl>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><span class="head-icon accent">{{ icon("hosts", "i-lg") }}</span>
+      <div><h2>Where it runs</h2><p>The server Slipway runs on, added as a host. Upgrades run there over SSH.</p></div></div>
+    <div class="card-body stack" style="gap: 14px">
+      {% if not ov.in_docker %}
+      <div class="callout">{{ icon("info") }}<div>Slipway isn't running in Docker here, so it can't upgrade itself. Upgrades from this page need Slipway installed with <code>install.sh</code>, which runs it in Docker. Until then, update it the way you installed it.</div></div>
+      {% else %}
+        {% if config and config.host_changed %}
+        <div class="callout error">{{ icon("alert") }}<div>{{ config.host_name or "The host" }} changed since updates were set up: its address, user or key is different now. Check the host, then save it here again.</div></div>
+        {% endif %}
+        {% if hosts %}
+        <form class="stack" style="gap: 12px" method="post" action="/js-required"
+              data-form="PUT /api/v1/updates/config" data-success="Saved. Slipway found its install folder." data-then="reload">
+          <div class="form-grid">
+            <div class="field">
+              <label for="upd-host">Host</label>
+              <select class="input" id="upd-host" name="host_id" required>
+                {% if not config %}<option value="" selected disabled>Choose the server Slipway runs on</option>{% endif %}
+                {% for h in hosts %}<option value="{{ h.id }}" {{ 'selected' if config and config.host_id == h.id|string }}>{{ h.name }} ({{ h.username }}@{{ h.address }})</option>{% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="upd-branch">Branch to follow</label>
+              <input class="input mono" id="upd-branch" name="branch" maxlength="100" value="{{ config.branch if config else '' }}" placeholder="The install's branch, else main">
+            </div>
+          </div>
+          <span class="help muted">Slipway connects to this host, finds its own container there and reads the install folder from it.</span>
+          <div class="row"><button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button></div>
+        </form>
+        {% else %}
+        <div class="callout">{{ icon("info") }}<div>Add the server Slipway runs on as a host and verify its key first. {% if auth.can(Perm.HOSTS_READ) %}<a href="/hosts">Go to Hosts</a>{% endif %}</div></div>
+        {% endif %}
+        {% if config %}
+        <dl class="kv">
+          <dt>{{ icon("hosts", "i-sm") }} Host</dt><dd>{{ config.host_name or "Unknown" }}</dd>
+          <dt>{{ icon("file", "i-sm") }} Install folder</dt><dd class="mono">{{ config.dir }}</dd>
+          <dt>{{ icon("branch", "i-sm") }} Follows</dt><dd class="mono">{{ config.branch }}</dd>
+        </dl>
+        <div class="callout warning">{{ icon("shield") }}<div><strong>{{ config.host_name or "This host" }} is Slipway's own server.</strong> Anyone who can create or deploy instances on it is root on Slipway itself.
+          {% if config.exposed_roles %}Roles that can: {% for role in config.exposed_roles %}<code>{{ role }}</code>{{ ", " if not loop.last }}{% endfor %}.{% endif %}</div></div>
+        {% endif %}
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+<section class="card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("sync", "i-lg") }}</span>
+    <div><h2>Available</h2>
+      <p>{% if lc.at|from_iso %}Last checked {{ lc.at|from_iso|timeago }} on <span class="mono">{{ lc.branch }}</span>. Slipway also checks every 6 hours.{% else %}Not checked yet.{% endif %}</p></div>
+    <span class="spacer"></span>
+    {% if ov.in_docker and config %}
+    <button class="btn" type="button" data-api="POST /api/v1/updates/check" data-success="Check finished" data-then="reload">{{ icon("sync", "i-sm") }} Check now</button>
+    {% endif %}
+  </div>
+  <div class="card-body stack" style="gap: 14px">
+    {% if lc.error %}
+    <div class="callout error">{{ icon("alert") }}<div><strong>The last check failed{% if lc.error_at|from_iso %} {{ lc.error_at|from_iso|timeago }}{% endif %}.</strong> <span class="mono">{{ lc.error }}</span></div></div>
+    {% endif %}
+    {% if ov.remote_error %}
+    <div class="callout warning">{{ icon("alert") }}<div>Couldn't read the running upgrade from the server: <span class="mono">{{ ov.remote_error }}</span></div></div>
+    {% endif %}
+    {% if ov.run and ov.run.status == "running" %}
+    {% if run_id == ov.run.id %}
+    <div class="callout primary">{{ icon("info") }}<div>An upgrade is running. Its steps and log are shown above.</div></div>
+    {% else %}
+    <div class="callout primary">{{ icon("info") }}<div>An upgrade is running. <a href="/updates?run={{ ov.run.id|urlencode }}">See its steps and log</a></div></div>
+    {% endif %}
+    {% endif %}
+    {% if ov.deploying %}
+    <div class="callout">{{ icon("info") }}<div>A deployment is running. Upgrades wait until it finishes.</div></div>
+    {% endif %}
+    {% if lc.at|from_iso and lc.head %}
+      {% set head = lc.head %}
+      {% if lc.dirty %}
+      <div class="callout warning">{{ icon("alert") }}<div>The install folder has local changes to tracked files{% if lc.dirty_files %}: {% for f in lc.dirty_files %}<code>{{ f }}</code>{{ ", " if not loop.last }}{% endfor %}{% endif %}. Move them to <code>docker-compose.override.yml</code> (Docker Compose reads it on its own) or undo them, then check again.</div></div>
+      {% endif %}
+      {% if lc.descends and lc.ahead %}
+      <h3>{{ lc.ahead }} new commit{{ "s" if lc.ahead != 1 }} on <span class="mono">{{ lc.branch }}</span></h3>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Date</th><th>Author</th><th>Subject</th><th>Commit</th></tr></thead>
+        <tbody>{% for c in lc.commits %}
+          {% set url = commit_url(lc.github, c.sha) %}
+          <tr>
+            <td class="muted nowrap">{% if c.date|from_iso %}{{ c.date|from_iso|dt }}{% endif %}</td>
+            <td>{{ c.author }}</td>
+            <td>{{ c.subject }}</td>
+            <td class="mono">{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ c.short }}</a>{% else %}{{ c.short }}{% endif %}</td>
+          </tr>
+        {% endfor %}</tbody>
+      </table></div>
+      {% if lc.ahead > lc.commits|length %}<p class="subtle">Showing the newest {{ lc.commits|length }}.</p>{% endif %}
+      {% if lc.migrations %}
+      <div class="callout warning">{{ icon("database") }}<div>This update changes the database ({{ lc.migrations|length }} migration{{ "s" if lc.migrations|length != 1 }}). A backup is taken first. If the new version doesn't start after changing the database, the backup is restored.</div></div>
+      {% endif %}
+      {% if lc.privileged_changes %}
+      <div class="callout warning">{{ icon("shield") }}<div>This update changes {% for f in lc.privileged_changes %}<code>{{ f }}</code>{{ ", " if not loop.last }}{% endfor %}. These run as root on {{ host_name }}. Check them before you upgrade.
+        {% if lc.compare_url %}<a href="{{ lc.compare_url }}" target="_blank" rel="noopener noreferrer">View changes</a>{% endif %}</div></div>
+      {% elif lc.compare_url %}
+      <p><a href="{{ lc.compare_url }}" target="_blank" rel="noopener noreferrer">View changes {{ icon("external", "i-sm") }}</a></p>
+      {% endif %}
+      {% elif lc.descends %}
+      <div class="callout success">{{ icon("check") }}<div>Slipway is up to date with <span class="mono">{{ lc.branch }}</span>.</div></div>
+      {% else %}
+      <div class="callout warning">{{ icon("alert") }}<div><span class="mono">{{ lc.branch }}</span> doesn't come after the running version, so Slipway can't upgrade to it. Its latest commit is <span class="mono">{{ head.short }}</span>: {{ head.subject }}</div></div>
+      {% endif %}
+      <div class="row wrap">
+        {% if ov.can_upgrade %}
+          {{ upgrade_button({"branch": lc.branch, "sha": head.sha, "short": head.short, "author": head.author, "subject": head.subject,
+                             "privileged_changes": lc.privileged_changes, "compare_url": lc.compare_url},
+                            "Upgrade to " ~ head.short, True, lc.migrations|length, None) }}
+        {% elif ov.reason and ov.reason != "Slipway is up to date" %}
+          <span class="muted" data-upgrade-reason>{{ ov.reason }}</span>
+        {% endif %}
+      </div>
+
+      {% set others = ov.branches|rejectattr("followed")|list %}
+      {% if others %}
+      <h3>Other branches from the last check</h3>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Branch</th><th>Latest commit</th><th>Date</th><th class="num">Actions</th></tr></thead>
+        <tbody>{% for b in others %}
+          <tr>
+            <td class="mono">{{ b.name }}</td>
+            <td><span class="mono subtle">{{ b.short }}</span> {{ b.subject }}<small class="subtle" style="display:block">{{ b.author }}</small></td>
+            <td class="muted nowrap">{% if b.date|from_iso %}{{ b.date|from_iso|dt }}{% endif %}</td>
+            <td class="actions-cell">
+              {% if b.can_switch %}
+                {{ upgrade_button({"branch": b.name, "sha": b.sha, "short": b.short, "author": b.author, "subject": b.subject,
+                                   "privileged_changes": b.privileged_changes, "compare_url": b.compare_url},
+                                  "Switch to " ~ b.name, False, 0, switch_reason) }}
+              {% elif b.valid is sameas false %}
+                <span class="subtle">Slipway only switches to branch names made of letters, digits and . _ / -</span>
+              {% elif b.descends and b.sha == lc["from"] %}
+                <span class="subtle">This is what's running</span>
+              {% else %}
+                <span class="subtle">Older than or beside what's running: Slipway can't move back without restoring a backup</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}</tbody>
+      </table></div>
+      {% endif %}
+    {% elif ov.in_docker and config and not lc.error %}
+      {{ empty("sync", "Not checked yet", "Click Check now to see what's new on " ~ config.branch ~ ".") }}
+    {% elif ov.reason and not lc.error %}
+      <p class="muted">{{ ov.reason }}.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("clock", "i-lg") }}</span>
+    <div><h2>History</h2><p>The last 20 upgrades. Each keeps its log on the server.</p></div></div>
+  {% if ov.runs %}
+  <div class="table-wrap"><table class="table">
+    <thead><tr><th>Started</th><th>Branch</th><th>Change</th><th>By</th><th>Status</th><th class="num">Actions</th></tr></thead>
+    <tbody>{% for r in ov.runs %}
+      <tr class="{{ 'selected' if r.id == run_id }}">
+        <td class="muted nowrap">{% if r.started_at|from_iso %}<span title="{{ r.started_at|from_iso|dt }}">{{ r.started_at|from_iso|timeago }}</span>{% else %}{{ r.id }}{% endif %}</td>
+        <td class="mono">{{ r.branch or "—" }}</td>
+        <td class="mono subtle">{{ (r["from"] or "")[:7] or "?" }} → {{ (r.to or "")[:7] or "?" }}</td>
+        <td>{{ r.by_name or "—" }}</td>
+        <td>{{ run_badge(r.status) }}{% if r.message %}<small class="subtle" style="display:block">{{ r.message }}</small>{% endif %}</td>
+        <td class="actions-cell"><a class="btn btn-sm" href="/updates?run={{ r.id|urlencode }}">{{ icon("logs", "i-sm") }} Log</a></td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% else %}
+  {{ empty("clock", "No upgrades yet", "Upgrades started from this page are listed here with their logs.") }}
+  {% endif %}
+</section>
+
+{% if ov.in_docker and config %}
+<dialog class="modal" id="update-confirm" style="width: min(640px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/updates/runs" data-once data-then="redirect:/updates?run={id}">
+    <div class="modal-head"><h2>Upgrade Slipway</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body">
+      <p>Upgrade Slipway on <strong>{{ host_name }}</strong> to <code data-confirm-text="short"></code> on <strong class="mono" data-confirm-text="branch"></strong>.</p>
+      <dl class="kv">
+        <dt>Commit</dt><dd class="mono" data-confirm-text="sha"></dd>
+        <dt>Branch</dt><dd class="mono" data-confirm-text="branch"></dd>
+        <dt>Latest commit</dt><dd data-confirm-text="subject"></dd>
+        <dt>Author</dt><dd data-confirm-text="author"></dd>
+      </dl>
+      <div class="callout warning" data-confirm-show="other" hidden>{{ icon("branch") }}<div>This isn't the branch Slipway follows. Slipway only lists database changes for the branch it follows; the backup is taken either way.</div></div>
+      <div class="callout warning" data-confirm-show="migrations" hidden>{{ icon("database") }}<div>This update changes the database (<span data-confirm-text="migrations-count"></span>). A backup is taken first. If the new version doesn't start after changing the database, the backup is restored.</div></div>
+      <div class="callout warning" data-confirm-show="privileged" hidden>{{ icon("shield") }}<div>This update changes <span class="mono" data-confirm-text="privileged"></span>. These run as root on {{ host_name }}. Check them before you upgrade.
+        <a data-confirm-link="compare" target="_blank" rel="noopener noreferrer" hidden>View changes</a></div></div>
+      <div>
+        <strong>What happens</strong>
+        <ol class="update-plan">
+          <li>Slipway checks the server and fetches the new version.</li>
+          <li>It builds the new version while this one keeps running.</li>
+          <li>It stops Slipway, backs up the database and starts the new version. Slipway is offline for about a minute.</li>
+          <li>If the new version doesn't start, it rolls back to this version. If the new version already changed the database, the backup is restored too.</li>
+        </ol>
+      </div>
+      <input type="hidden" name="branch" value="">
+      <input type="hidden" name="sha" value="">
+    </div>
+    <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit">{{ icon("rocket", "i-sm") }} Upgrade</button></div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}

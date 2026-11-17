@@ -27,6 +27,7 @@ from slipway.core.config import get_settings
 from slipway.core.crypto import DecryptionError, decrypt, encrypted_columns
 from slipway.db.base import Base
 from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
+from slipway.services import updates
 from slipway.services.deployer import runner
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
@@ -90,13 +91,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await check_encryption_key(db)
     await runner.recover_interrupted()
     poller = asyncio.create_task(poll_hosts_forever(), name="host-poller")
+    update_checker = asyncio.create_task(updates.check_forever(), name="update-checker")
+    update_runs = asyncio.create_task(updates.reconcile_forever(), name="update-runs")
     log.info("Slipway %s started (%s)", __version__, get_settings().env)
     try:
         yield
     finally:
-        poller.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await poller
+        for task in (poller, update_checker, update_runs):
+            task.cancel()
+        for task in (poller, update_checker, update_runs):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await runner.shutdown()
         await dispose_engine()
 

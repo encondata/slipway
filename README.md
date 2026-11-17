@@ -39,7 +39,9 @@ It asks where to install (default `~/slipway`, or `/mnt/user/slipway` on Unraid)
 will use, clones the repository, writes `.env` with fresh secrets and an administrator account, builds the
 image and starts Slipway with PostgreSQL. The database lives in `data/postgres` inside the install folder
 (set `SLIPWAY_DATA_DIR` in `.env` to move it). Run the same command again to update: it keeps `.env` and the
-data, and only prints the admin password while it still works. `SLIPWAY_DIR`, `SLIPWAY_BASE_URL`,
+data, and only prints the admin password while it still works. Or upgrade from Slipway itself: an admin can
+see the running version and start an upgrade under Updates, with a backup and automatic roll back (see
+[docs/updates.md](docs/updates.md)). `SLIPWAY_DIR`, `SLIPWAY_BASE_URL`,
 `SLIPWAY_PORT` and `SLIPWAY_ADMIN_EMAIL` answer the questions up front; `SLIPWAY_REPO` and
 `SLIPWAY_BRANCH` pick another source. Slipway serves plain HTTP on port 8000 for a TLS reverse proxy.
 GitHub sign-in needs an OAuth app: the installer's `.env` says where to put its ID and secret.
