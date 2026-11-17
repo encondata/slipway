@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, meter, empty %}
 {% block title %}Hosts{% endblock %}
+{#- The host list grows with the window: on a wide or ultrawide screen it uses the width instead of stopping at
+    the 1600px every other page keeps. #}
+{% block content_class %} content-fluid{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>

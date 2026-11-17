@@ -24,6 +24,20 @@ async def test_favicon_ico_redirects_to_the_svg_icon(client):
     assert icon.status_code == 200 and icon.headers["content-type"].startswith("image/svg+xml")
 
 
+async def test_hosts_page_fills_wide_screens_and_other_pages_keep_their_cap(client):
+    """The Hosts page's <main> carries content-fluid, which lifts the 1600px content cap so its list grows with
+    an ultrawide window; other pages keep the cap."""
+    from pathlib import Path
+
+    await make_user("wide@example.com", roles=["admin"])
+    await login(client, "wide@example.com")
+    assert '<main class="content content-fluid">' in (await client.get("/hosts")).text
+    assert '<main class="content">' in (await client.get("/environments")).text
+    css = (Path(__file__).resolve().parents[1] / "slipway/web/static/css/slipway.css").read_text()
+    assert ".content.content-fluid { max-width: none; }" in css
+    assert "max-width: 1600px" in css
+
+
 def test_asyncssh_connection_chatter_is_kept_out_of_info_logs(app):
     import logging
 

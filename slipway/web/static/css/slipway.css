@@ -267,6 +267,9 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
 .avatar.sm { width: 28px; height: 28px; font-size: 11px; }
 
 .content { padding: 28px; display: flex; flex-direction: column; gap: 22px; max-width: 1600px; width: 100%; }
+/* A page that sets content_class " content-fluid" (Hosts) fills the window on wide screens. */
+.content.content-fluid { max-width: none; }
+.content.content-fluid .page-head .lede { max-width: 960px; }  /* the intro stays a readable line length */
 
 /* ------------------------------------------------------------ page header */
 .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }

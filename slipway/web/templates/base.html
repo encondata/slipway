@@ -79,7 +79,7 @@
         </details>
       </div>
     </header>
-    <main class="content">
+    <main class="content{% block content_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>
   </div>
