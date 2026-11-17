@@ -40,7 +40,7 @@ build-backend = "setuptools.build_meta"
 include = ["slipway*"]
 
 [tool.setuptools.package-data]
-slipway = ["web/templates/**/*", "web/static/**/*"]
+slipway = ["web/templates/**/*", "web/static/**/*", "updates/*.sh"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

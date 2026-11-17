@@ -28,6 +28,7 @@ class Perm(StrEnum):
     LOGS_READ = "logs:read"
     AUDIT_READ = "audit:read"
     SETTINGS_WRITE = "settings:write"
+    UPDATES_RUN = "updates:run"
 
 
 PERMISSION_DESCRIPTIONS: dict[str, str] = {
@@ -54,6 +55,11 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
     Perm.LOGS_READ: "View platform and application logs",
     Perm.AUDIT_READ: "View the audit log",
     Perm.SETTINGS_WRITE: "Change Slipway-wide settings",
+    Perm.UPDATES_RUN: (
+        "See Slipway's version and upgrade it (privileged: runs the upgrade on Slipway's own server as that "
+        "host's SSH user. Slipway's own server is then a host: anyone who can create or deploy instances on it "
+        "is root on Slipway itself)"
+    ),
 }
 
 ALL_PERMISSIONS: list[str] = [p.value for p in Perm]

@@ -16,7 +16,7 @@ from slipway.api.deps import DB, Auth, not_found, require
 from slipway.core.permissions import Perm
 from slipway.models import Deployment, DeploymentStatus, Host, Instance, InstanceStatus, Repository, User
 from slipway.schemas import BRANCH_MAX, ActionOut, DeploymentOut, InstanceCreate, InstanceOut, InstanceUpdate
-from slipway.services import audit, deployer, ssh, switchyard
+from slipway.services import audit, deployer, ssh, switchyard, updates
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/instances", tags=["instances"])
@@ -132,6 +132,9 @@ async def queue_deployment(db: DB, instance: Instance, user: User) -> Deployment
         raise HTTPException(status.HTTP_409_CONFLICT, "This instance is being deleted")
     if await _active_deployment(db, instance.id) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "A deployment is already in progress for this instance")
+    if await updates.upgrade_running(db):
+        # The upgrade stops Slipway for its backup and switch, which would cut a deployment off half done.
+        raise HTTPException(status.HTTP_409_CONFLICT, updates.MSG_UPGRADING)
     if not instance.host.is_pinned:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,

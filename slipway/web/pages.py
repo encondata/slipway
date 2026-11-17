@@ -37,7 +37,7 @@ from slipway.models import (
     Role,
     User,
 )
-from slipway.services import deployer, switchyard
+from slipway.services import deployer, switchyard, updates
 from slipway.services.auth import AuthContext
 from slipway.services.users import user_count
 from slipway.web.oauth import safe_next
@@ -75,7 +75,20 @@ def fmt_duration(seconds: float | None) -> str:
     return f"{m}m {s:02d}s" if m else f"{s}s"
 
 
-templates.env.filters.update(timeago=timeago, dt=fmt_dt, duration=fmt_duration, shquote=shlex.quote)
+def from_iso(value: object) -> datetime | None:
+    """An ISO 8601 time from stored JSON (``...Z`` or with an offset) as a datetime, or None."""
+    if not isinstance(value, str) or not value or len(value) > 40:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+templates.env.filters.update(
+    timeago=timeago, dt=fmt_dt, duration=fmt_duration, shquote=shlex.quote, from_iso=from_iso,
+)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -108,6 +121,8 @@ def asset_version() -> str:
 
 
 templates.env.globals.update(Perm=Perm, version=__version__, asset_version=asset_version)
+# Links to GitHub, built only from a validated owner/repo and a 40-hex sha (None otherwise).
+templates.env.globals.update(commit_url=updates.commit_url)
 
 
 # ------------------------------------------------------------- OAuth errors
@@ -188,6 +203,7 @@ def _uuid(value: str) -> uuid.UUID | None:
 async def render(request: Request, db: DB, name: str, ctx: AuthContext | None, *, status_code: int = 200, **context: Any) -> HTMLResponse:
     settings = get_settings()
     last_sync = await db.scalar(select(func.max(Repository.synced_at))) if ctx else None
+    updates_ahead = await updates_badge(db) if ctx and ctx.can(Perm.UPDATES_RUN) else 0
     return templates.TemplateResponse(
         request,
         name,
@@ -197,11 +213,28 @@ async def render(request: Request, db: DB, name: str, ctx: AuthContext | None, *
             "csrf_token": ctx.csrf_token if ctx else "",
             "settings": settings,
             "last_sync": last_sync,
+            "updates_ahead": updates_ahead,
             "path": request.url.path,
             **context,
         },
         status_code=status_code,
     )
+
+
+async def updates_badge(db: DB) -> int:
+    """New commits on the followed branch from the last check (the sidebar badge); 0 when the check is stale.
+
+    Reads the stored setting only: no SSH.
+    """
+    state = await updates.load_state(db)
+    check = state["last_check"]
+    if not check or not check.get("descends") or check.get("branch") != state["branch"]:
+        return 0
+    running = updates.running_version()
+    if running["commit"] and check.get("from") != running["commit"]:
+        return 0  # Slipway changed since: those commits may be running now
+    ahead = check.get("ahead")
+    return ahead if isinstance(ahead, int) and ahead > 0 else 0
 
 
 def instance_summary(instances: list[Instance]) -> dict[str, Any]:
@@ -509,6 +542,54 @@ async def analytics(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
 async def logs(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
     need(ctx, Perm.LOGS_READ)
     return await render(request, db, "coming_soon.html", ctx, page="logs")
+
+
+# ----------------------------------------------------------------------- updates
+
+# What each step of the upgrade script does, in the words the page uses.
+UPDATE_STEPS: dict[str, str] = {
+    "preflight": "Check the server",
+    "fetch": "Fetch the new version",
+    "build": "Build it while this version keeps running",
+    "backup": "Stop Slipway and back up the database",
+    "switch": "Start the new version",
+    "health": "Check that it started",
+    "rollback": "Roll back to the old version",
+    "cleanup": "Clean up",
+}
+# The reasons ``updates.overview`` gives that are about the followed branch only: switching to another
+# branch is still possible then.
+_FOLLOWED_ONLY = ("Slipway is up to date",)
+
+
+def switch_reason(ov: dict[str, Any]) -> str | None:
+    """Why no other branch can be switched to now, or None. The last two of overview's reasons (up to date,
+    and the followed branch not descending) only concern the followed branch."""
+    reason = ov.get("reason")
+    if reason is None or reason in _FOLLOWED_ONLY or reason.endswith("Slipway can't move back or sideways"):
+        return None
+    return reason
+
+
+@router.get("/updates")
+async def updates_page(request: Request, db: DB, ctx: PageAuth, run: str = "") -> HTMLResponse:
+    need(ctx, Perm.UPDATES_RUN)
+    ov = await updates.overview(db)
+    hosts = [h for h in (await db.scalars(select(Host).order_by(Host.name))).all() if h.is_pinned]
+    # ?run=<id> opens that run; otherwise a run that is still going opens by itself.
+    run_id = run if updates.valid_id(run) else None
+    if run_id is None and ov["run"] and ov["run"].get("status") == "running":
+        run_id = ov["run"]["id"]
+    selected = next((r for r in ov["runs"] if r["id"] == run_id), None)
+    steps = [(name, UPDATE_STEPS.get(name, name)) for name in ov["steps"]]
+    # Branch to follow: what Slipway saw last (the page then reads GitHub's list live), the followed one first.
+    followed = (ov["config"] or {}).get("branch")
+    known = [b["name"] for b in ov["branches"] if b.get("valid", True) and updates.valid_branch(b["name"])]
+    branch_names = updates.order_branches([*([followed] if followed else []), *known], followed)
+    return await render(
+        request, db, "updates.html", ctx, ov=ov, hosts=hosts, run_id=run_id, selected_run=selected,
+        steps=steps, switch_reason=switch_reason(ov), branch_names=branch_names,
+    )
 
 
 # ---------------------------------------------------------------------- settings

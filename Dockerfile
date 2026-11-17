@@ -20,6 +20,16 @@ COPY alembic ./alembic
 COPY docker/entrypoint.sh /usr/local/bin/slipway-entrypoint
 RUN chmod +x /usr/local/bin/slipway-entrypoint
 
+# Which commit this image was built from, so the Updates page can say what runs. install.sh and the
+# upgrade script pass these; an image built without them reports the commit as unknown. They come after
+# the pip install layers so a new commit doesn't rebuild the dependencies.
+ARG SLIPWAY_COMMIT=
+ARG SLIPWAY_BRANCH=
+ARG SLIPWAY_BUILT_AT=
+ENV SLIPWAY_COMMIT=$SLIPWAY_COMMIT \
+    SLIPWAY_BRANCH=$SLIPWAY_BRANCH \
+    SLIPWAY_BUILT_AT=$SLIPWAY_BUILT_AT
+
 USER slipway
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \

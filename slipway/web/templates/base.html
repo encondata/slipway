@@ -32,6 +32,9 @@
       {% endfor %}
       <hr>
       <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">{{ icon("settings") }} Settings</a>
+      {% if auth.can(Perm.UPDATES_RUN) %}
+      <a href="/updates" class="{{ 'active' if path.startswith('/updates') }}">{{ icon("sync") }} Updates{% if updates_ahead %}<span class="nav-badge" title="{{ updates_ahead }} new commit{{ 's' if updates_ahead != 1 }} to upgrade to">{{ updates_ahead if updates_ahead < 100 else "99+" }}</span>{% endif %}</a>
+      {% endif %}
     </nav>
     <div class="sidebar-art">
       {{ mountains() }}
