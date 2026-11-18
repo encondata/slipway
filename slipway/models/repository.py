@@ -50,8 +50,19 @@ class Repository(UUIDPrimaryKey, Timestamps, Base):
         return self.detected_config.get("compose_file")
 
     @property
+    def has_manifest(self) -> bool:
+        """A slipway.yml at the root: deployed as an app (see services.manifest)."""
+        return bool(self.detected_config.get("manifest"))
+
+    @property
+    def default_source(self) -> str:
+        if self.has_manifest:
+            return "app"
+        return "compose" if self.compose_file and not self.has_dockerfile else "dockerfile"
+
+    @property
     def deployable(self) -> bool:
-        return self.has_dockerfile or bool(self.compose_file)
+        return self.has_dockerfile or bool(self.compose_file) or self.has_manifest
 
     @property
     def default_branch_usable(self) -> bool:

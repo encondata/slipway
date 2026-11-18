@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty %}
+{% block title %}New environment{% endblock %}
+
+{% macro env_row(k="", v="") -%}
+<div class="repeater-row env">
+  <input class="input mono" data-k value="{{ k }}" placeholder="KEY" aria-label="Variable name">
+  <input class="input mono" data-v value="{{ v }}" placeholder="value" type="password" autocomplete="off" aria-label="Variable value">
+  <span class="row" style="gap:2px">
+    <button class="icon-btn" type="button" data-reveal title="Show / hide">{{ icon("search", "i-sm") }}</button>
+    <button class="icon-btn" type="button" data-remove-row title="Remove">{{ icon("trash", "i-sm") }}</button>
+  </span>
+</div>
+{%- endmacro %}
+
+{% macro host_options(slot) -%}
+<option value="">Choose a host</option>
+{% for h in hosts %}
+{%- set label = h.host.name ~ " (" ~ h.host.client_address ~ ")" %}
+<option value="{{ h.host.id }}" data-label="{{ label }}" data-ip="{{ '1' if h.ip else '' }}" {% if not h.pinned %}data-unpinned disabled{% endif %}>{{ label }}{% if not h.pinned %}: Check it first{% endif %}</option>
+{% endfor %}
+{%- endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="breadcrumb"><a href="/environments">Environments</a>{{ icon("chevron-right", "i-sm") }}<span>New</span></div>
+    <h1>New environment</h1>
+    <p class="lede">One app from one branch, in one or two slots. Nothing is changed on a host until you choose Deploy.</p>
+  </div>
+</div>
+
+{% if not repos or not hosts %}
+<section class="card">
+  {% if not repos %}
+    {{ empty("repositories", "No repository with a slipway.yml", "An environment runs an app whose repository has a slipway.yml at its root. Sync your repositories from GitHub first.", None) }}
+  {% else %}
+    {{ empty("hosts", "No hosts yet", "Add a Docker host before creating an environment.", "/hosts?add=1" if auth.can(Perm.HOSTS_READ) and auth.can(Perm.HOSTS_WRITE) else None, "Add host") }}
+  {% endif %}
+</section>
+{% else %}
+{#- slipway.js wireEnvFlow drives the steps; wireAppForm reads the branch's slipway.yml into steps 4 and 6. #}
+<form class="env-flow stack" method="post" action="/js-required" novalidate data-env-flow
+      data-app-form data-repo-select="#env-repo" data-branch-select="#env-branch"
+      data-settings-field="settings" data-services-field="services"
+      data-settings='{}' data-services='null' data-fallback='null'
+      data-traffic-address="{{ traffic_address }}" data-default-tls="{{ default_tls }}"
+      {% if switchyard_configured %}data-switchyard{% endif %} {% if cloudflare %}data-cloudflare{% endif %}>
+  <input type="radio" name="build_source" value="app" checked hidden data-no-send>
+  <input type="hidden" name="data_mode" value="slot" data-no-send>
+
+  <ol class="stepper flow-stepper" data-stepper>
+    {% for name in steps %}<li class="step" data-step-tab="{{ loop.index }}"><b>{{ loop.index }}</b> {{ name }}</li>{% if not loop.last %}<li class="line" aria-hidden="true"></li>{% endif %}{% endfor %}
+  </ol>
+  <p class="sr-only" aria-live="polite" data-flow-live></p>
+
+  {# ------------------------------------------------------------------------------- 1. Environment #}
+  <section class="card flow-step" data-step="1" data-step-name="{{ steps[0] }}">
+    <div class="card-head"><span class="head-icon">{{ icon("environments", "i-lg") }}</span><div><h2>Environment</h2><p>Its name, and the app it runs.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <div class="form-grid">
+        <div class="field span-2">
+          <label for="env-name">Name</label>
+          <input class="input mono" id="env-name" name="name" required maxlength="26" pattern="[a-z][a-z0-9\-]{0,24}[a-z0-9]" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="uat">
+          <span class="help" data-name-help>Up to 26 characters: the slots are <span class="mono" data-name-slots>&lt;name&gt;-blue, &lt;name&gt;-green and &lt;name&gt;-data</span>.</span>
+        </div>
+        <div class="field">
+          <label for="env-repo">Repository</label>
+          <select class="input" id="env-repo" name="repository_id" data-branches="#env-branch" required>
+            {% for r in repos %}<option value="{{ r.id }}" data-default="{{ r.default_branch if r.default_branch_usable else '' }}" data-full-name="{{ r.full_name }}" {{ 'selected' if selected_repo and r.id == selected_repo.id }}>{{ r.full_name }}</option>{% endfor %}
+          </select>
+          <span class="help">Repositories whose default branch has a slipway.yml.</span>
+        </div>
+        <div class="field">
+          <label for="env-branch">Branch</label>
+          <select class="input" id="env-branch" name="branch" required data-current="">
+            {%- if selected_repo and selected_repo.default_branch_usable %}<option>{{ selected_repo.default_branch }}</option>
+            {%- else %}<option value="" selected disabled>Choose a branch</option>{% endif -%}
+          </select>
+        </div>
+      </div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="field" style="margin-top: 10px">
+          <label for="env-manifest">Manifest path</label>
+          <input class="input mono" id="env-manifest" name="manifest_file" value="slipway.yml" autocomplete="off" spellcheck="false">
+          <span class="help">Read from the branch above.</span>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  {# ---------------------------------------------------------------------------------- 2. Servers #}
+  <section class="card flow-step" data-step="2" data-step-name="{{ steps[1] }}">
+    <div class="card-head"><span class="head-icon">{{ icon("hosts", "i-lg") }}</span><div><h2>Servers</h2><p>One slot, or two that take turns serving the traffic.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <div class="choice-grid" data-field="data_mode">
+        <label class="choice"><input type="radio" name="shape" value="single" checked data-no-send>{{ icon("box") }}<span><strong>Single slot</strong><small>One slot: each deploy updates it in place.</small></span></label>
+        <label class="choice"><input type="radio" name="shape" value="bluegreen" data-no-send disabled>{{ icon("environments") }}<span><strong>Blue/Green</strong><small>Each deploy goes to the idle slot; Activate moves the traffic to it. A third host holds the data both slots use.</small><small class="subtle" data-bluegreen-reason>Read slipway.yml first.</small></span></label>
+      </div>
+      <label class="check" data-show-when="shape=single"><input type="checkbox" name="keep_data" data-no-send disabled><span><strong>Keep the data on a server of its own</strong><br><span class="subtle" data-server-reason>The database and file store run on a host of their own, so a second slot can be added later.</span></span></label>
+    </div>
+  </section>
+
+  {# ------------------------------------------------------------------------------------ 3. Hosts #}
+  <section class="card flow-step" data-step="3" data-step-name="{{ steps[2] }}">
+    <div class="card-head"><span class="head-icon">{{ icon("hosts", "i-lg") }}</span><div><h2>Hosts</h2><p>Where each slot runs. Slipway checks a host's key before it uses it.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="env-host-blue">Blue</label>
+          <select class="input" id="env-host-blue" name="hosts.blue" required data-host-select="blue">{{ host_options("blue") }}</select>
+        </div>
+        <div class="field" data-show-when="shape=bluegreen" hidden>
+          <label for="env-host-green">Green</label>
+          <select class="input" id="env-host-green" name="hosts.green" data-host-select="green" data-required-when="shape=bluegreen">{{ host_options("green") }}</select>
+        </div>
+        <div class="field" data-show-when="data_mode=server" hidden>
+          <label for="env-host-data">Data server</label>
+          <select class="input" id="env-host-data" name="hosts.data" data-host-select="data" data-required-when="data_mode=server">{{ host_options("data") }}</select>
+          <span class="help">The data server lets the app slots in by their IP addresses (their LAN address, or the proxy address).</span>
+        </div>
+      </div>
+      <div class="callout warning" data-same-host hidden>{{ icon("alert") }}<span>Blue and Green are on the same host: a problem with that host takes both slots down.</span></div>
+      {% if auth.can(Perm.HOSTS_WRITE) and auth.can(Perm.HOSTS_READ) %}<p class="help" style="margin: 0"><a href="/hosts?add=1">Add a host</a> (it opens the Hosts page; come back here once its key is checked).</p>{% endif %}
+    </div>
+  </section>
+
+  {# --------------------------------------------------------------------------------- 4. Settings #}
+  <section class="card flow-step" data-step="4" data-step-name="{{ steps[3] }}">
+    <div class="card-head"><span class="head-icon accent">{{ icon("settings", "i-lg") }}</span><div><h2>Settings</h2><p>The settings, optional services and variables slipway.yml asks for. Every slot uses them.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <input type="hidden" name="settings" data-type="json">
+      <input type="hidden" name="services" data-type="json">
+      <div data-app-status><p class="muted">Choose a repository and branch to read its slipway.yml.</p></div>
+      <div class="form-grid" data-app-settings data-field="settings"></div>
+      <div class="field" data-app-services-field hidden data-field="services">
+        <span class="label-text">Optional services</span>
+        <div class="row" style="flex-wrap: wrap; gap: 8px 20px" data-app-services></div>
+      </div>
+      <div data-app-summary></div>
+      <div class="field" data-field="env">
+        <span class="label-text">Environment variables</span>
+        <div class="repeater" id="env-vars" data-repeater="env" data-kind="map">
+          <template>{{ env_row() }}</template>
+        </div>
+        <div><button class="btn btn-sm" type="button" data-add-row="#env-vars">{{ icon("plus", "i-sm") }} Add variable</button></div>
+        <span class="help">They reach every slot. One named like a secret replaces it; Slipway generates the secrets and never shows them.</span>
+      </div>
+    </div>
+  </section>
+
+  {# ---------------------------------------------------------------------------------- 5. Traffic #}
+  <section class="card flow-step" data-step="5" data-step-name="{{ steps[4] }}">
+    <div class="card-head"><span class="head-icon">{{ icon("globe", "i-lg") }}</span><div><h2>Traffic</h2><p>The public names slipway.yml gives, and how they reach the slots.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <div class="table-wrap" data-field="hostnames"><table class="table">
+        <thead><tr><th>Public name</th><th>Through</th><th>To</th><th>TLS</th></tr></thead>
+        <tbody data-traffic-rows><tr><td colspan="4" class="muted">Slipway lists the names once the earlier steps are filled in.</td></tr></tbody>
+      </table></div>
+      <div class="field" data-field="traffic">
+        <span class="label-text">Switch</span>
+        <div class="row wrap" style="gap: 8px 20px">
+          <label class="check"><input type="radio" name="traffic.switch" value="switchyard" {{ 'checked' if switchyard_configured else 'disabled' }}><span>Switchyard{% if not switchyard_configured %} <span class="subtle">(set it up in Settings → Integrations first)</span>{% elif traffic_address %} <span class="subtle mono">({{ traffic_address }})</span>{% endif %}</span></label>
+          <label class="check" data-switch-none><input type="radio" name="traffic.switch" value="none" {{ '' if switchyard_configured else 'checked' }}><span>None <span class="subtle">(single slot only: Slipway doesn't publish the names)</span></span></label>
+        </div>
+      </div>
+      <div class="field" data-field="traffic.dns">
+        <label class="check"><input type="checkbox" name="dns_on" data-no-send {{ '' if cloudflare else 'disabled' }}><span>Publish DNS records in Cloudflare{% if not cloudflare %} <span class="subtle">(set it up in Settings → Integrations first)</span>{% else %} <span class="subtle">({{ cloudflare.zone }})</span>{% endif %}</span></label>
+        {% if cloudflare %}
+        <div class="form-grid" data-show-when="dns_on=on" hidden>
+          <div class="field">
+            <label for="env-dns-address">Address</label>
+            <input class="input mono" id="env-dns-address" name="traffic.dns.address" placeholder="{{ cloudflare.public_ip or '203.0.113.10' }}" autocomplete="off" spellcheck="false">
+            <span class="help">The address the records point at{% if cloudflare.public_ip %}; empty uses {{ cloudflare.public_ip }}{% endif %}.</span>
+          </div>
+          <label class="check" style="align-self: end"><input type="checkbox" name="traffic.dns.proxied" {{ 'checked' if cloudflare.proxied }}><span>Proxied <span class="subtle">(through Cloudflare's proxy)</span></span></label>
+        </div>
+        {% endif %}
+      </div>
+      <label class="check" data-show-when="shape=bluegreen" hidden data-field="auto_activate"><input type="checkbox" name="auto_activate"><span><strong>Activate automatically when the smoke test passes</strong><br><span class="subtle">Otherwise traffic stays on the live slot until you choose Activate.</span></span></label>
+    </div>
+  </section>
+
+  {# ------------------------------------------------------------------------------------- 6. Data #}
+  <section class="card flow-step" data-step="6" data-step-name="{{ steps[5] }}">
+    <div class="card-head"><span class="head-icon">{{ icon("database", "i-lg") }}</span><div><h2>Data</h2><p>What the environment's data starts as, and the backups Slipway keeps.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <fieldset class="fieldset" data-app-data hidden data-snapshots='{{ seed_snapshots|tojson }}' data-saved-snapshot="" data-never-live
+                {% if auth.can(Perm.DATA_RESET) %}data-can-seed{% endif %} {% if auth.can(Perm.SNAPSHOTS_DOWNLOAD) %}data-can-download{% endif %}>
+        <legend>Data</legend>
+        <div class="field" data-field="keep_backups">
+          <label for="env-keep-backups">Backups to keep</label>
+          <input class="input" id="env-keep-backups" name="keep_backups" type="number" min="1" max="100" style="max-width: 140px" value="5">
+          <span class="help">Slipway backs up the database before every deploy to a slot and every change that replaces data, and keeps the newest of these.</span>
+        </div>
+        <div class="field" data-app-start hidden data-field="seed_snapshot_id">
+          <span class="label-text">Start with</span>
+          <div class="row wrap" style="gap: 8px 20px">
+            <label class="check"><input type="radio" name="seed_from" value="empty" data-no-send checked><span>Start empty</span></label>
+            <label class="check"><input type="radio" name="seed_from" value="snapshot" data-no-send {{ 'disabled' if not auth.can(Perm.DATA_RESET) }}><span>From a snapshot</span></label>
+          </div>
+          {% if not auth.can(Perm.DATA_RESET) %}<span class="help">Starting from a snapshot needs the data:reset permission{% if not auth.can(Perm.SNAPSHOTS_DOWNLOAD) %}, and one of another repository also snapshots:download{% endif %}</span>{% endif %}
+          <select class="input" data-app-snapshot aria-label="Snapshot" hidden {{ 'disabled' if not auth.can(Perm.DATA_RESET) }}></select>
+          <input type="hidden" name="seed_snapshot_id" data-type="json" data-keep-empty disabled>
+          <p class="help" style="margin: 0" data-app-snapshot-note hidden></p>
+        </div>
+        <div class="stack" style="gap: 12px" data-app-admin data-optional-group="first_admin" data-field="first_admin" hidden></div>
+        <label class="check" data-app-seed hidden><input type="checkbox" name="seed_content" checked><span><strong>Add starter content</strong><br><span class="subtle">Slipway runs the app's seed command at the first Activate, on the slot that goes live.</span></span></label>
+      </fieldset>
+      <p class="muted" style="margin: 0" data-no-data hidden>This slipway.yml declares no data: there is nothing to start.</p>
+    </div>
+  </section>
+
+  {# --------------------------------------------------------------------------- 7. Review & Deploy #}
+  <section class="card flow-step" data-step="7" data-step-name="{{ steps[6] }}">
+    <div class="card-head"><span class="head-icon accent">{{ icon("rocket", "i-lg") }}</span><div><h2>Review &amp; Deploy</h2><p>Check every choice before Slipway creates the environment.</p></div></div>
+    <div class="card-body stack" style="gap: 16px">
+      <div class="callout error" role="alert" data-step-error hidden></div>
+      <dl class="kv" data-review></dl>
+      <p style="margin: 0"><strong>Secrets:</strong> generated by Slipway and never shown.</p>
+      <div class="callout warning">{{ icon("alert") }}<span>An app's commands run as trusted code with host-level access: anyone who can push to this branch and deploy it can take control of its hosts.</span></div>
+      <p class="help" style="margin: 0">Deploy creates the environment and starts its first deployment, then opens it.</p>
+    </div>
+  </section>
+
+  <div class="callout error flow-result" role="alert" data-flow-result hidden>{{ icon("alert") }}<span><span data-flow-message></span> <a data-flow-open hidden href="/environments"></a></span></div>
+
+  <div class="flow-foot">
+    <button class="btn" type="button" data-flow-restart>{{ icon("restart") }} Start over</button>
+    <span class="spacer"></span>
+    <button class="btn" type="button" data-flow-back>Back</button>
+    <button class="btn btn-primary" type="button" data-flow-next>Next {{ icon("arrow-right", "i-sm") }}</button>
+    <button class="btn btn-primary" type="button" data-flow-deploy hidden>{{ icon("rocket") }} Deploy</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

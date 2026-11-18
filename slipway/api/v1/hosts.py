@@ -15,7 +15,7 @@ from slipway.api.deps import DB, Auth, not_found, require
 from slipway.core.permissions import Perm
 from slipway.models import Deployment, DeploymentStatus, Host, HostAuthMethod, HostStatus, Instance, InstanceStatus
 from slipway.schemas import HostCreate, HostOut, HostUpdate, host_out
-from slipway.services import audit, deployer, ssh
+from slipway.services import audit, data, deployer, ssh
 from slipway.services.auth import AuthContext
 from slipway.services.hosts import check_host
 
@@ -103,10 +103,11 @@ async def create_host(body: HostCreate, ctx: Writer, request: Request, db: DB) -
         hostname=body.hostname,
         port=body.port,
         username=body.username,
-        environment=body.environment or "",
+        label=body.label or "",
         description=body.description or "",
         deploy_root=body.deploy_root or "/opt/slipway",
         proxy_address=body.proxy_address or None,
+        lan_address=body.lan_address or None,
         metrics={},
         created_by_id=ctx.user.id,
     )
@@ -181,12 +182,14 @@ async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request
         moved = (body.hostname and body.hostname != host.hostname) or (body.port and body.port != host.port)
         old_address = host.address
         old_fingerprint = await _stored_fingerprint(db, host) if moved else None
-        for field in ("hostname", "port", "username", "environment", "description", "deploy_root"):
+        for field in ("hostname", "port", "username", "label", "description", "deploy_root"):
             value = getattr(body, field)
             if value is not None:
                 setattr(host, field, value)
         if body.proxy_address is not None:
             host.proxy_address = body.proxy_address or None
+        if body.lan_address is not None:
+            host.lan_address = body.lan_address or None
         _apply_credentials(host, body)
         summary = f"Updated host {host.name}"
         if moved:  # possibly a different machine: forget the pinned host key and re-verify
@@ -209,8 +212,9 @@ async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request
     notes: list[str] = []
     try:
         async with AsyncExitStack() as stack:
-            for inst in to_move:
-                await stack.enter_async_context(deployer.runner.exclusive(inst.id))
+            # Every runner key of the instances on the host: members of one environment share theirs (§8.2).
+            keys = {k for inst in to_move for k in data.runner_keys(inst)}
+            await stack.enter_async_context(deployer.runner.exclusive(tuple(keys)))
             if await _deploying(db, to_move):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,

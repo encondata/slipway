@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import posixpath
@@ -62,6 +63,31 @@ case "$1" in
       inspect) [ -n "$FAKE_NO_IMAGE" ] && { echo "Error: No such image: $5" >&2; exit 1; } ;;
       ls) [ -n "$FAKE_IMAGES" ] && printf '%s\\n' $FAKE_IMAGES ;;
     esac ;;
+  volume)
+    if [ -z "$FAKE_VOLUME_FILE" ]; then [ -n "$FAKE_VOLUMES" ] && printf '%s\\n' $FAKE_VOLUMES; exit 0; fi
+    # Volumes are "NAME LABEL" lines in $FAKE_VOLUME_FILE (LABEL: its com.docker.compose.project, may be empty).
+    touch "$FAKE_VOLUME_FILE"
+    case "$2" in
+      ls)
+        [ -n "$FAKE_NO_DOCKER" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+        want=""
+        for a in "$@"; do case "$a" in label=com.docker.compose.project=*) want=${a#label=com.docker.compose.project=} ;; esac; done
+        while read -r name label; do
+          if [ -z "$want" ] || [ "$label" = "$want" ]; then echo "$name"; fi
+        done < "$FAKE_VOLUME_FILE" ;;
+      inspect)  # volume inspect -f FORMAT -- NAME
+        eval "v=\\${$#}"
+        awk -v v="$v" '$1 == v {print $2; found=1} END {if (!found) exit 1}' "$FAKE_VOLUME_FILE" ;;
+      rm)
+        shift 2; [ "$1" = -- ] && shift
+        for v in "$@"; do
+          [ "$v" = "$FAKE_VOLUME_BUSY" ] && { echo "Error response from daemon: remove $v: volume is in use" >&2; exit 1; }
+          awk -v v="$v" '$1 != v' "$FAKE_VOLUME_FILE" > "$FAKE_VOLUME_FILE.new" && mv "$FAKE_VOLUME_FILE.new" "$FAKE_VOLUME_FILE"
+        done ;;
+    esac ;;
+  system)  # system df -v --format ...: "NAME SIZE" lines from $FAKE_VOLUME_SIZES ("NAME SIZE,NAME SIZE")
+    [ -n "$FAKE_NO_DOCKER" ] && exit 1
+    [ -n "$FAKE_VOLUME_SIZES" ] && printf '%s\\n' "$FAKE_VOLUME_SIZES" | tr ',' '\\n' ;;
   run)
     if [ -n "$FAKE_OLD_DOCKER" ]; then  # Docker before 20.10
       case " $* " in *" --pull"*) printf "unknown flag: --pull\\nSee 'docker run --help'.\\n" >&2; exit 125 ;; esac
@@ -93,29 +119,81 @@ def _in_shell(shell: str, command: str, env: dict[str, str]) -> subprocess.Compl
 
 
 class ShellRemote:
-    """A RemoteSession stand-in that runs every command in ``shell`` on this machine."""
+    """A RemoteSession stand-in that runs every command in ``shell`` on this machine.
+
+    ``input`` goes to the command's stdin and ``scrub`` is applied to each line before anything else sees it,
+    as RemoteSession.run does. ``timeout_on``: a command containing that text starts and keeps running in the
+    background while ``run`` raises the SSHError a real timeout gives (``timed_out`` holds those processes).
+    """
 
     def __init__(self, shell: str, env: dict[str, str]) -> None:
         self.shell, self.env = shell, env
         self.commands: list[str] = []
+        self.inputs: list[tuple[str, str, int]] = []  # (command, sha256 of the input, its length)
+        self.timeout_on: str | None = None
+        self.timed_out: list[subprocess.Popen] = []
 
-    async def run(self, command, *, check=True, on_line=None, timeout=None):
+    async def run(self, command, *, check=True, on_line=None, timeout=None, input=None, scrub=None):
         self.commands.append(command)
-        result = await asyncio.to_thread(_in_shell, self.shell, command, self.env)
+        if input is not None:
+            self.inputs.append((command, hashlib.sha256(input.encode()).hexdigest(), len(input)))
+        if self.timeout_on and self.timeout_on in command:
+            proc = subprocess.Popen([self.shell, "-c", command], env=self.env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            self.timed_out.append(proc)
+            await asyncio.sleep(0.5)  # long enough for it to write its lock line
+            raise ssh.SSHError(f"Command timed out after {timeout}s")
+        result = await asyncio.to_thread(
+            subprocess.run, [self.shell, "-c", command], env=self.env, capture_output=True, text=True, timeout=120,
+            **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}))
         output = result.stdout + result.stderr
+        lines = output.splitlines()
+        if scrub is not None:
+            lines = [scrub(line) for line in lines]
+            output = "\n".join(lines)
         if on_line is not None:
-            for line in output.splitlines():
+            for line in lines:
                 await on_line(line)
         if check and result.returncode:
             raise ssh.CommandFailed(command, result.returncode, output)
         return result.returncode, output
 
-    async def put(self, local, remote):
+    async def put(self, local, remote, mode=None):
         shutil.copyfile(local, remote)
+        if mode is not None:
+            os.chmod(remote, mode)
 
     async def write_text(self, remote, content, mode=0o600):
         Path(remote).write_text(content)
         os.chmod(remote, mode)
+
+    async def read_stream(self, path, chunk=None):
+        if not Path(path).is_file() or Path(path).is_symlink():
+            raise ssh.SSHError(f"Could not read {path}: it isn't a regular file")
+        with open(path, "rb") as fh:
+            while block := fh.read(chunk or 1024 * 1024):
+                yield block
+
+    async def write_stream(self, path, chunks, mode=0o600):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        written = 0
+        with os.fdopen(fd, "wb") as fh:
+            if hasattr(chunks, "__aiter__"):
+                async for block in chunks:
+                    fh.write(block)
+                    written += len(block)
+            else:
+                for block in chunks:
+                    fh.write(block)
+                    written += len(block)
+        os.chmod(path, mode)
+        return written
+
+    def stop_timed_out(self) -> None:
+        for proc in self.timed_out:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, 9)
+            proc.wait()
 
 
 def _local(remote):

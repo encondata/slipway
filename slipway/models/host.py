@@ -34,12 +34,23 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     hostname: Mapped[str] = mapped_column(String(255))
     port: Mapped[int] = mapped_column(default=22)
     username: Mapped[str] = mapped_column(String(64))
-    environment: Mapped[str] = mapped_column(String(32), default="")  # prod / staging / dev ...
+    # A free-text label such as prod / staging / dev (called "environment" before phase 3, D21).
+    label: Mapped[str] = mapped_column(String(32), default="")
     description: Mapped[str] = mapped_column(String(255), default="")
     deploy_root: Mapped[str] = mapped_column(String(255), default="/opt/slipway")
     # Address the reverse proxy uses to reach this host's published ports, when it is not ``hostname``
     # (Slipway reaching the host by another name or over a VPN, say).
     proxy_address: Mapped[str | None] = mapped_column(String(255))
+    # An IP literal: the address this host's connections to other LAN hosts come from, when it isn't
+    # ``upstream_address`` (a multi-homed host). A data server lets its app slots in by this address.
+    lan_address: Mapped[str | None] = mapped_column(String(45))
+    # Who made the machine: ``ssh`` (added by hand); phase 4 ``digitalocean``, phase 5 ``proxmox``, ``esxi``.
+    provider: Mapped[str] = mapped_column(String(16), default="ssh", server_default="ssh")
+    provider_id: Mapped[str | None] = mapped_column(String(200))
+    # Phase 4: the environment that made this host and destroys it. Always None in phase 3.
+    owner_environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="SET NULL")
+    )
 
     auth_method: Mapped[str] = mapped_column(String(16), default=HostAuthMethod.KEY)
     private_key: Mapped[str | None] = mapped_column(EncryptedText)
@@ -70,6 +81,11 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     def upstream_address(self) -> str:
         """Where the reverse proxy sends traffic for this host's published ports."""
         return self.proxy_address or self.hostname
+
+    @property
+    def client_address(self) -> str:
+        """The address other LAN hosts see this host's connections come from (a data server's allow list)."""
+        return self.lan_address or self.upstream_address
 
     @property
     def is_pinned(self) -> bool:

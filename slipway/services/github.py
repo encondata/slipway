@@ -213,8 +213,24 @@ class GitHubClient:
         return {
             "dockerfile": "Dockerfile" in names,
             "compose_file": next((n for n in COMPOSE_FILENAMES if n in names), None),
+            "manifest": "slipway.yml" in names,
             "files": sorted(names)[:50],
         }
+
+    async def get_file(self, repo: RepoRef, path: str, ref: str, *, limit: int = 256 * 1024) -> str | None:
+        """The text of ``path`` at ``ref`` (None when there is no such file or it is too big)."""
+        url = f"{_repo_path(repo)}/contents/{quote(path, safe='/')}"
+        try:
+            resp = await self._client.get(url, params={"ref": ref}, headers={"Accept": "application/vnd.github.raw+json"})
+        except httpx.HTTPError as exc:
+            raise _failed(f"GitHub API {url}", exc) from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise GitHubError(f"GitHub API {url}: {resp.text[:200] or resp.reason_phrase}", resp.status_code)
+        if len(resp.content) > limit or resp.headers.get("content-type", "").startswith("application/json"):
+            return None  # a directory listing, or too big
+        return resp.content.decode("utf-8", "replace")
 
     async def get_readme(self, repo: RepoRef) -> str | None:
         path = f"{_repo_path(repo)}/readme"

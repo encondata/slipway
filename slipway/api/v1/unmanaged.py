@@ -17,12 +17,12 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from slipway.api.deps import DB, not_found, require
-from slipway.api.v1.instances import _check_folder, queue_deployment
+from slipway.api.v1.instances import _check_folder, _check_slug_free, queue_deployment
 from slipway.core.permissions import Perm
 from slipway.db.base import utcnow
 from slipway.models import BuildSource, Host, Instance, InstanceStatus, Repository
 from slipway.schemas import BRANCH_MAX, ClaimIn, ClaimOut, InstanceOut, PortMapping, VolumeMapping
-from slipway.services import audit, deployer, discovery, ssh
+from slipway.services import audit, data, deployer, discovery, ssh
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/hosts", tags=["hosts"])
@@ -47,7 +47,7 @@ async def _host(db: DB, host_id: uuid.UUID) -> Host:
 async def _claimed(db: DB, host: Host) -> tuple[set[str], set[str]]:
     """Compose project names and standalone container ids the host's instances already stand for."""
     instances = (await db.scalars(select(Instance).where(Instance.host_id == host.id))).all()
-    projects = {i.compose_project for i in instances}
+    projects = {i.compose_project for i in instances} | {p for i in instances for p in deployer.app_known_projects(i)}
     containers = {i.claimed_container for i in instances if i.claimed_container}
     return projects, containers
 
@@ -132,6 +132,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
         slug = deployer.slugify(body.name)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await _check_slug_free(db, slug)  # <env>-blue, -green and -data belong to environments (phase 3 §3.2)
     if not body.branch and not repo.default_branch_usable:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -192,6 +193,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
     # Checked again after SSH: another request may have claimed the group or taken the name meanwhile.
     if await db.scalar(select(Instance).where(Instance.slug == slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"An instance named '{slug}' already exists")
+    await _check_slug_free(db, slug)
     projects, containers = await _claimed(db, host)
     if group.project in projects or group.container_id in containers:
         raise HTTPException(status.HTTP_409_CONFLICT, f"{group.name} on {host.name} was claimed meanwhile")
@@ -272,7 +274,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
                      summary=f"Deploy {instance.name}@{instance.branch}", request=request)
     await db.commit()
     if dep is not None:
-        deployer.runner.submit(dep.id, instance.id)
+        deployer.runner.submit(dep.id, data.job_keys(dep, instance))
     return ClaimOut(
         **InstanceOut.of(instance).model_dump(),
         deployment_id=dep.id if dep else None, env_imported=sorted(env), env_skipped=skipped,

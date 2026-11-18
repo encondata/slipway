@@ -20,6 +20,10 @@ COPY alembic ./alembic
 COPY docker/entrypoint.sh /usr/local/bin/slipway-entrypoint
 RUN chmod +x /usr/local/bin/slipway-entrypoint
 
+# Stored snapshots (encrypted). docker-compose.yml mounts data/files here; Slipway runs as uid 10001.
+ENV SLIPWAY_STORAGE_DIR=/var/lib/slipway
+RUN mkdir -p /var/lib/slipway && chown 10001:10001 /var/lib/slipway && chmod 700 /var/lib/slipway
+
 # Which commit this image was built from, so the Updates page can say what runs. install.sh and the
 # upgrade script pass these; an image built without them reports the commit as unknown. They come after
 # the pip install layers so a new commit doesn't rebuild the dependencies.

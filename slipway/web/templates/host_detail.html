@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, badge, meter %}
+{% from "_macros.html" import icon, badge, meter, slot_chip %}
 {% block title %}{{ host.name }}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="breadcrumb"><a href="/hosts">Hosts</a>{{ icon("chevron-right", "i-sm") }}<span>{{ host.name }}</span></div>
     <h1 class="row">{{ host.name }} {{ badge("host", host.status) }}</h1>
-    <p class="lede mono">{{ host.username }}@{{ host.address }}{% if host.environment %} · {{ host.environment }}{% endif %}</p>
+    <p class="lede mono">{{ host.username }}@{{ host.address }}{% if host.label %} · {{ host.label }}{% endif %}</p>
   </div>
   <div class="actions">
     {% if host.is_pinned or auth.can(Perm.HOSTS_WRITE) %}
@@ -61,6 +61,10 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
         <dt>{{ icon("terminal", "i-sm") }} OS</dt><dd>{{ host.os_info or "—" }}</dd>
         <dt>{{ icon("instances", "i-sm") }} Running containers</dt><dd>{{ host.metrics.containers_running if host.metrics.containers_running is defined else "—" }}</dd>
         <dt>{{ icon("database", "i-sm") }} Deploy root</dt><dd class="mono">{{ host.deploy_root }}</dd>
+        {% if host.proxy_address or host.lan_address %}
+        <dt>{{ icon("globe", "i-sm") }} Proxy address</dt><dd class="mono">{{ host.upstream_address }}</dd>
+        <dt>{{ icon("globe", "i-sm") }} LAN address</dt><dd class="mono">{{ host.client_address }}</dd>
+        {% endif %}
       </dl>
     </div>
   </section>
@@ -79,6 +83,20 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
     </div>
   </section>
 </div>
+
+{% if env_slots %}
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("environments", "i-lg") }}</span><div><h2>Environments on this host</h2><p>Slots of environments that run here. Each is deployed from its environment's page.</p></div></div>
+  <div class="table-wrap"><table class="table">
+    <thead><tr><th>Environment</th><th>Slot</th><th>Status</th><th>Release</th></tr></thead>
+    <tbody>{% for e, slot, i in env_slots %}
+      <tr><td><a href="/environments/{{ e.id }}"><strong>{{ e.name }}</strong></a>{% if e.is_deleted %} <span class="badge">Deleted</span>{% endif %}</td>
+        <td>{{ slot_chip(slot, e.active_slot_id == i.id) }}</td><td>{{ badge("instance", i.status) }}</td>
+        <td class="mono subtle">{{ (i.current_commit_sha or "")[:7] or "—" }}</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+</section>
+{% endif %}
 
 {% if auth.can(Perm.INSTANCES_READ) %}
 {% set can_repos = auth.can(Perm.REPOS_READ) %}

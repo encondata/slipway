@@ -68,8 +68,8 @@
           {# On create, data-fill-* resets the build defaults and name when another repository is picked. #}
           <select class="input" id="repo-select" name="repository_id" data-branches="#branch-select" {{ 'disabled' if editing else 'data-fill' }}>
             {% for r in repos %}
-            <option value="{{ r.id }}" data-default="{{ r.default_branch if r.default_branch_usable else '' }}"
-              {%- if not editing %} data-fill-name="{{ r.name }}-prod" data-fill-compose_file="{{ r.compose_file or 'docker-compose.yml' }}" data-fill-build_source="{{ 'compose' if r.compose_file and not r.has_dockerfile else 'dockerfile' }}"{% endif %}
+            <option value="{{ r.id }}" data-default="{{ r.default_branch if r.default_branch_usable else '' }}" data-full-name="{{ r.full_name }}"
+              {%- if not editing %} data-fill-name="{{ r.name }}-prod" data-fill-compose_file="{{ r.compose_file or 'docker-compose.yml' }}" data-fill-build_source="{{ r.default_source }}"{% endif %}
               {{ 'selected' if selected_repo and r.id == selected_repo.id }}>{{ r.full_name }}{% if r.archived %} (archived){% elif not r.deployable %} (no Dockerfile detected){% endif %}</option>
             {% endfor %}
           </select>
@@ -88,10 +88,11 @@
     <section class="card">
       <div class="card-head"><span class="head-icon accent">{{ icon("instances", "i-lg") }}</span><div><h2>Build Configuration</h2><p>How Slipway builds and packages your application.</p></div></div>
       <div class="card-body stack" style="gap: 16px">
-        {% set src = instance.build_source if editing else ("compose" if selected_repo and selected_repo.compose_file and not selected_repo.has_dockerfile else "dockerfile") %}
+        {% set src = instance.build_source if editing else (selected_repo.default_source if selected_repo else "dockerfile") %}
         <div class="choice-grid">
           <label class="choice"><input type="radio" name="build_source" value="dockerfile" {{ 'checked' if src == 'dockerfile' }} {{ 'disabled' if locked }}>{{ icon("file") }}<span><strong>Dockerfile</strong><small>Build a single container from a Dockerfile</small></span></label>
           <label class="choice"><input type="radio" name="build_source" value="compose" {{ 'checked' if src == 'compose' }} {{ 'disabled' if locked }}>{{ icon("package") }}<span><strong>docker compose</strong><small>Use a compose file to build multiple services</small></span></label>
+          <label class="choice"><input type="radio" name="build_source" value="app" {{ 'checked' if src == 'app' }} {{ 'disabled' if locked }}>{{ icon("rocket") }}<span><strong>App (slipway.yml)</strong><small>The repository says how it is built, started and configured</small></span></label>
         </div>
         <div class="form-grid" data-show-when="build_source=dockerfile">
           <div class="field"><label for="df">Dockerfile path</label><input class="input mono" id="df" name="dockerfile_path" {{ 'disabled' if paths_locked }} value="{{ instance.dockerfile_path if editing else 'Dockerfile' }}"></div>
@@ -102,6 +103,57 @@
           <input class="input mono" id="cf" name="compose_file" {{ 'disabled' if paths_locked }} value="{{ instance.compose_file if editing else (selected_repo.compose_file if selected_repo and selected_repo.compose_file else 'docker-compose.yml') }}">
           <span class="help">Ports and volumes come from the compose file; host ports can be changed under Runtime Configuration. The variables below override the repository's <code>.env</code> (next to the compose file) and are passed literally.</span>
         </div>
+        <div class="stack" style="gap: 14px" data-show-when="build_source=app" data-app-form
+             data-repo-select="#repo-select" data-branch-select="#branch-select"
+             data-settings='{{ ((instance.app_settings or {}) if editing else {})|tojson }}'
+             data-services='{{ (instance.app_services if editing else none)|tojson }}'
+             data-fallback='{{ ((instance.app_state or {}).get("manifest") if editing else none)|tojson }}'>
+          <div class="field">
+            <label for="mf">Manifest</label>
+            <input class="input mono" id="mf" name="manifest_file" {{ 'disabled' if paths_locked }} value="{{ instance.manifest_file if editing else 'slipway.yml' }}">
+            <span class="help">Read from the branch above. It names the settings below, the secrets Slipway generates once and keeps, the services and their ports, and the commands that build, start and stop the app.</span>
+          </div>
+          <input type="hidden" name="app_settings" data-type="json">
+          <input type="hidden" name="app_services" data-type="json">
+          <div data-app-status><p class="muted">Choose a repository and branch to read its slipway.yml.</p></div>
+          <div class="form-grid" data-app-settings></div>
+          <div class="field" data-app-services-field hidden>
+            <span class="label-text">Optional services</span>
+            <div class="row" style="flex-wrap: wrap; gap: 8px 20px" data-app-services></div>
+          </div>
+          <div data-app-summary></div>
+          {# Shown once the branch's slipway.yml declares data (its capabilities); slipway.js fills it in (appData). #}
+          {%- set never_live = not editing or not instance.current_commit_sha %}
+          <fieldset class="fieldset" data-app-data hidden data-snapshots='{{ seed_snapshots|tojson }}'
+                    data-saved-snapshot="{{ (instance.seed_snapshot_id or '') if editing else '' }}"
+                    {% if never_live %}data-never-live{% endif %} {% if editing %}data-editing{% endif %}
+                    {% if auth.can(Perm.DATA_RESET) %}data-can-seed{% endif %} {% if auth.can(Perm.SNAPSHOTS_DOWNLOAD) %}data-can-download{% endif %}>
+            <legend>Data</legend>
+            <div class="field">
+              <label for="keep-backups">Backups to keep</label>
+              <input class="input" id="keep-backups" name="keep_backups" type="number" min="1" max="100" style="max-width: 140px"
+                     value="{{ instance.keep_backups if editing and instance.keep_backups else 5 }}">
+              <span class="help">Slipway backs up the database before every deploy and every change that replaces data, and keeps the newest of these. Backups you take yourself stay until you delete them.</span>
+            </div>
+            <div class="field" data-app-start hidden>
+              <span class="label-text">Start with</span>
+              <div class="row wrap" style="gap: 8px 20px">
+                {%- set seed_fixed = editing and instance.seed_snapshot_id and not auth.can(Perm.DATA_RESET) %}
+                <label class="check"><input type="radio" name="seed_from" value="empty" data-no-send checked {{ 'disabled' if seed_fixed }}><span>Empty</span></label>
+                <label class="check"><input type="radio" name="seed_from" value="snapshot" data-no-send {{ 'disabled' if not auth.can(Perm.DATA_RESET) }}><span>A snapshot</span></label>
+              </div>
+              {% if seed_fixed %}<span class="help">Changing what it starts with needs the data:reset permission</span>
+              {% elif not auth.can(Perm.DATA_RESET) %}<span class="help">Starting from a snapshot needs the data:reset permission</span>{% endif %}
+              <select class="input" data-app-snapshot aria-label="Snapshot" hidden {{ 'disabled' if not auth.can(Perm.DATA_RESET) }}></select>
+              <input type="hidden" name="seed_snapshot_id" data-type="json" data-keep-empty disabled>
+              <p class="help" style="margin: 0" data-app-snapshot-note hidden></p>
+            </div>
+            <div class="stack" style="gap: 12px" data-app-admin data-optional-group="first_admin" hidden></div>
+            {% if editing %}<p class="help" style="margin: 0">The first admin is set on the instance's page.</p>{% endif %}
+            <label class="check" data-app-seed hidden><input type="checkbox" name="seed_content" {{ 'checked' if not editing or instance.seed_content }}><span><strong>Add starter content</strong><br><span class="subtle">After an empty first start, Slipway runs the app's seed command.</span></span></label>
+          </fieldset>
+        </div>
+        <div class="callout warning" data-show-when="build_source=app">{{ icon("alert") }}<span>An app's commands run as trusted code with host-level access, like a compose file: anyone who can push to this branch and deploy it can take control of the host.</span></div>
         <div class="callout warning" data-show-when="build_source=compose">{{ icon("alert") }}<span>Compose files run as trusted code with host-level access: anyone who can push to this branch and deploy it can take control of the host.</span></div>
         {% if locked and not paths_locked %}<p class="help">This instance was claimed from containers already on the host: the host and build mode are fixed, and the paths can change until the first deployment.</p>
         {% elif locked %}<p class="help">Host and build settings are fixed after the first deployment. To change them, destroy this instance and create a new one.</p>{% endif %}
@@ -177,7 +229,7 @@
             <span class="help">Use absolute host paths or named volumes. Each deploy gets a fresh release directory.</span>
           </div>
         </div>
-        <div class="field" data-show-when="build_source=compose">
+        <div class="field" data-show-when="build_source=compose|app">
           <span class="label-text">Host port overrides <span class="subtle">(optional)</span></span>
           {% set published = instance.published_ports if editing else [] %}
           {% if published %}

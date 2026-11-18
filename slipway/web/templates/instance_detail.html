@@ -1,31 +1,65 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge %}
+{% from "_data_dialogs.html" import restore_dialog, backup_dialog, snapshot_dialog, reset_dialog, start_over_dialog, first_admin_dialog, backups_card with context %}
 {% block title %}{{ instance.name }}{% endblock %}
 {% block content %}
 {% set live = instance.status not in ("created",) %}
 {% set can_hosts = auth.can(Perm.HOSTS_READ) %}
+{# A data hold turns Deploy, Start and Restart off until the data is put right (spec §8.4). #}
+{% set held = member.hold if member else (d.hold_text if d else None) %}
+{# A slot of an environment: Deploy, Configure, the data and the danger zone are on the environment's page. #}
+{% set stale_off = member.stale if member and member.stale else None %}
+{% set data_only_job = active_job and active_job.kind in ("backup", "snapshot", "admin", "content") %}
 <div class="page-head">
   <div>
     <div class="breadcrumb"><a href="/instances">Instances</a>{{ icon("chevron-right", "i-sm") }}<span>{{ instance.name }}</span></div>
-    <h1 class="row">{{ instance.name }} {{ badge("instance", instance.status) }}</h1>
+    <h1 class="row">{{ instance.name }} {{ badge("instance", instance.status, active_job.kind if active_job else None) }}
+      {%- if data_only_job %} {% if auth.can(Perm.DEPLOYMENTS_READ) %}<a href="/deployments/{{ active_job.id }}" class="badge warning spin">{{ active_job.kind|kind_label }}…</a>{% else %}<span class="badge warning spin">{{ active_job.kind|kind_label }}…</span>{% endif %}{% endif %}</h1>
     <p class="lede">{{ instance.repository.full_name }} · <span class="mono">{{ instance.branch }}</span> on {% if can_hosts %}<a href="/hosts/{{ instance.host.id }}">{{ instance.host.name }}</a>{% else %}{{ instance.host.name }}{% endif %}</p>
   </div>
   <div class="actions">
     {% if auth.can(Perm.INSTANCES_OPERATE) and live and instance.status != "deploying" %}
       {% if instance.status == "stopped" %}
-      <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/start" data-success="Started" data-then="reload">{{ icon("play") }} Start</button>
+      <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/start" data-success="Started" data-then="reload" {% if held or stale_off %}disabled title="{{ held or stale_off }}"{% endif %}>{{ icon("play") }} Start</button>
       {% else %}
       <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/stop" data-confirm="Stop {{ instance.name }}?" data-success="Stopped" data-then="reload">{{ icon("stop") }} Stop</button>
       {% endif %}
-      <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/restart" data-success="Restarted" data-then="reload">{{ icon("restart") }} Restart</button>
+      <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/restart" data-success="Restarted" data-then="reload" {% if held or stale_off %}disabled title="{{ held or stale_off }}"{% endif %}>{{ icon("restart") }} Restart</button>
     {% endif %}
+    {% if member %}
+    {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a class="btn btn-primary" href="/environments/{{ member.env.id }}">{{ icon("environments") }} Open {{ member.env.name }}</a>{% endif %}
+    {% else %}
     {% if auth.can(Perm.INSTANCES_WRITE) %}<a class="btn" href="/instances/{{ instance.id }}/edit">{{ icon("edit") }} Configure</a>{% endif %}
     {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}
     {# Without deployments:read the deployment page would be a 403, so stay here and say it was queued. #}
-    <button class="btn btn-primary" data-api="POST /api/v1/instances/{{ instance.id }}/deploy" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Deployment queued"{% endif %} {{ 'disabled' if instance.status == 'deploying' }}>{{ icon("rocket") }} Deploy {{ instance.branch }}</button>
+    <button class="btn btn-primary" data-api="POST /api/v1/instances/{{ instance.id }}/deploy" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Deployment queued"{% endif %} {{ 'disabled' if instance.status == 'deploying' or active_job or held }} {% if held %}title="{{ held }}"{% endif %}>{{ icon("rocket") }} Deploy {{ instance.branch }}</button>
+    {% endif %}
     {% endif %}
   </div>
 </div>
+
+{% if member %}
+{%- set slot_name = "the data server" if member.slot == "data" else "the " ~ member.slot ~ " slot" %}
+<div class="callout primary member-banner">{{ icon("environments") }}<div>This is {{ slot_name }} of environment {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a href="/environments/{{ member.env.id }}"><strong>{{ member.env.name }}</strong></a>{% else %}<strong>{{ member.env.name }}</strong>{% endif %}{% if member.slot != "data" %} ({{ "live" if member.live else "idle" }}){% endif %}. Its settings, secrets, data and names belong to the environment.</div></div>
+{% if held %}<div class="callout error" role="alert">{{ icon("alert") }}<div><strong>{{ held }}</strong></div></div>{% endif %}
+{% if member.stale %}<div class="callout warning">{{ icon("alert") }}<span>{{ member.stale }}.</span></div>{% endif %}
+{% endif %}
+
+{% if d and d.dirty %}
+{%- set first_job = d.first_job -%}
+{% if held %}
+<div class="callout error" role="alert">{{ icon("alert") }}<div><strong>{{ held }}</strong>
+  <div class="row wrap" style="margin-top: 10px">
+    {% if auth.can(Perm.DEPLOYMENTS_READ) and d.last_job %}<a class="btn btn-sm" href="/deployments/{{ d.last_job.id }}">View the job</a>{% endif %}
+    {% if d.hold_backup and auth.can(Perm.DATA_RESTORE) and d.hold_backup.b.restorable and not d.hold_backup.restore_off %}
+    <button class="btn btn-sm" type="button" data-open="restore-backup" data-fill='{{ d.hold_backup.fill|tojson }}'>Restore {{ d.hold_backup.b.name }}…</button>
+    {% endif %}
+  </div></div></div>
+{% else %}
+<div class="callout warning">{{ icon("alert") }}<div>{{ instance.name }}'s data was changed by failed {{ (first_job.kind if first_job else "deploy")|kind_noun }} {{ d.first_d8 }}{% if first_job and first_job.commit_sha %} ({{ first_job.short_sha }}){% endif %}. Roll back, retry or deploy a fix.
+  {%- if d.rollback_job and auth.can(Perm.DEPLOYMENTS_READ) %} <a href="/deployments/{{ d.rollback_job.id }}#roll-back-panel">Roll back…</a>{% endif %}</div></div>
+{% endif %}
+{% endif %}
 
 {% if instance.claim_pending %}
 <div class="callout primary">{{ icon("info") }}<div><strong>Claimed, not deployed by Slipway yet.</strong>
@@ -46,8 +80,24 @@
         <dt>{{ icon("branch", "i-sm") }} Branch</dt><dd class="mono">{{ instance.branch }}</dd>
         <dt>{{ icon("commit", "i-sm") }} Running commit</dt><dd class="mono">{{ instance.current_commit_sha[:12] if instance.current_commit_sha else "—" }}</dd>
         <dt>{{ icon("clock", "i-sm") }} Last deployed</dt><dd>{{ instance.last_deployed_at|timeago }}</dd>
-        <dt>{{ icon("instances", "i-sm") }} Build</dt><dd>{% if instance.build_source == "compose" %}docker compose · <span class="mono">{{ instance.compose_file }}</span>{% else %}Dockerfile · <span class="mono">{{ instance.dockerfile_path }}</span> (context <span class="mono">{{ instance.build_context }}</span>){% endif %}</dd>
-        {% if instance.build_source == "compose" %}
+        {% set app = instance.build_source == "app" %}
+        {% set app_state = instance.app_state or {} %}
+        <dt>{{ icon("instances", "i-sm") }} Build</dt><dd>{% if app %}App · <span class="mono">{{ instance.manifest_file }}</span>{% if app_state.manifest %} ({{ app_state.manifest.name }}){% endif %}{% elif instance.build_source == "compose" %}docker compose · <span class="mono">{{ instance.compose_file }}</span>{% else %}Dockerfile · <span class="mono">{{ instance.dockerfile_path }}</span> (context <span class="mono">{{ instance.build_context }}</span>){% endif %}</dd>
+        {% if app %}
+        <dt>{{ icon("box", "i-sm") }} Compose projects</dt><dd>{% for p in app_state.projects or [] %}<span class="chip mono">{{ p }}</span> {% else %}<span class="muted">From slipway.yml, on the first deploy</span>{% endfor %}</dd>
+        {% if not member %}
+        <dt>{{ icon("settings", "i-sm") }} App settings</dt><dd>{% for k, v in (instance.app_settings or {})|dictsort %}<span class="chip mono">{{ k }}={{ v }}</span> {% else %}<span class="muted">None set</span>{% endfor %}</dd>
+        {% set optional = (app_state.manifest.services if app_state.manifest else [])|selectattr("optional")|list %}
+        {% if optional %}<dt>{{ icon("package", "i-sm") }} Optional services</dt><dd>{% for s in optional %}{% set on = (s.name in instance.app_services) if instance.app_services is not none else s.default %}<span class="chip mono{{ '' if on else ' subtle' }}">{{ s.name }} {{ "on" if on else "off" }}</span> {% endfor %}</dd>{% endif %}
+        <dt>{{ icon("key", "i-sm") }} Secrets</dt><dd>{% for k in (instance.app_secrets or {}).keys()|sort %}<span class="chip mono">{{ k }}</span> {% else %}<span class="muted">{{ "None" if instance.last_deployed_at else "Generated on the first deploy" }}</span>{% endfor %}
+          {% if instance.app_secrets %}<span class="subtle">Generated by Slipway and kept with the instance; an environment variable of the same name replaces one.</span>{% endif %}</dd>
+        {% endif %}
+        {% if d %}
+        {% if d.seed_snapshot and not instance.current_commit_sha %}<dt>{{ icon("database", "i-sm") }} Data</dt><dd>Starts from snapshot <span class="mono">{{ d.seed_snapshot.name }}</span> on its first deploy</dd>{% endif %}
+        {% if d.first_admin %}<dt>{{ icon("user", "i-sm") }} First admin</dt><dd>{{ d.admin_email }} <span class="subtle">({% if d.first_admin.status == "pending" %}Not created yet{% elif d.first_admin.existed %}Already existed{% else %}Created {{ d.first_admin.done_at|dt }}{% endif %})</span></dd>{% endif %}
+        {% if instance.identity_source and instance.identity_changed_at %}<dt>{{ icon("key", "i-sm") }} {{ d.labels.identity|capitalize }}</dt><dd>From {{ instance.identity_source }} since {{ instance.identity_changed_at|dt }}</dd>{% endif %}
+        {% endif %}
+        {% elif instance.build_source == "compose" %}
         <dt>{{ icon("box", "i-sm") }} Compose project</dt><dd class="mono">{{ instance.compose_project }}</dd>
         {% else %}
         <dt>{{ icon("box", "i-sm") }} Container</dt><dd class="mono">{{ instance.running_container_name }}</dd>
@@ -59,14 +109,16 @@
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.ports %}<span class="chip mono">{{ p.host }} → {{ p.container }}/{{ p.protocol }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         <dt>{{ icon("database", "i-sm") }} Volumes</dt><dd>{% for v in instance.volumes %}<span class="chip mono">{{ v.source }} → {{ v.target }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         {% else %}
-        <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.published_ports %}<span class="chip mono">{{ p.service }} {{ p.host }} → {{ p.container }}/{{ p.protocol }}</span>{% if p.declared %} <span class="subtle">(compose file: {{ p.declared }})</span>{% endif %} {% else %}<span class="muted">{{ "None published" if instance.last_deployed_at else "From the compose file, on the first deploy" }}</span>{% endfor %}</dd>
+        <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.published_ports %}<span class="chip mono">{{ p.service }} {{ p.host }} → {{ p.container }}/{{ p.protocol }}</span>{% if p.declared %} <span class="subtle">({{ "slipway.yml" if app else "compose file" }}: {{ p.declared }})</span>{% endif %} {% else %}<span class="muted">{{ "None published" if instance.last_deployed_at else ("From slipway.yml" if app else "From the compose file") ~ ", on the first deploy" }}</span>{% endfor %}</dd>
         {% endif %}
         <dt>{{ icon("alert", "i-sm") }} Taken ports</dt><dd>{{ "Move to the next free port" if instance.auto_ports else "Stop the deploy" }}</dd>
+        {% if not member %}
         <dt>{{ icon("globe", "i-sm") }} Hostnames</dt><dd>
           {%- set entries = {} -%}
           {%- for e in instance.proxy_entries or [] %}{% set _ = entries.update({e.hostname: e}) %}{% endfor -%}
-          {%- set route_names = (instance.routes or [])|map(attribute="hostname")|list -%}
-          {%- for r in instance.routes or [] %}
+          {%- set all_routes = (instance.routes or []) + ((app_state.routes or []) if app else []) -%}
+          {%- set route_names = all_routes|map(attribute="hostname")|list -%}
+          {%- for r in all_routes %}
           {%- set e = entries.get(r.hostname) -%}
           <div class="row" style="gap: 6px; flex-wrap: wrap; margin-bottom: 4px">
             <a class="chip mono" href="{{ 'http' if r.tls_mode == 'off' else 'https' }}://{{ r.hostname }}" target="_blank" rel="noopener">{{ r.hostname }}</a>
@@ -80,7 +132,7 @@
           {%- for e in instance.proxy_entries or [] if e.hostname not in route_names %}
           <div class="row" style="gap: 6px"><span class="chip mono">{{ e.hostname }}</span><span class="badge danger" title="{{ e.message }}">Not removed</span> <span class="subtle">{{ e.message }}</span></div>
           {%- endfor %}
-          {% if auth.can(Perm.INSTANCES_WRITE) and (instance.routes or instance.proxy_entries) and instance.status != "created" %}
+          {% if auth.can(Perm.INSTANCES_WRITE) and (all_routes or instance.proxy_entries) and instance.status != "created" %}
           <div style="margin-top: 6px"><button class="btn btn-sm" data-api="POST /api/v1/instances/{{ instance.id }}/proxy/sync" data-then="reload">{{ icon("sync", "i-sm") }} Sync proxy</button></div>
           {% endif %}
         </dd>
@@ -92,6 +144,7 @@
           {% for k in (instance.env or {}).keys()|sort %}<span class="chip mono">{{ k }}</span> {% else %}<span class="muted">None</span>{% endfor %}
           {%- endif -%}
         </dd>
+        {% endif %}
         {% if can_hosts %}<dt>{{ icon("hosts", "i-sm") }} Folder on host</dt><dd><span class="mono">{{ folder }}</span>
           {%- if folder_in_ram %} <span class="badge warning" title="Unraid clears it when it restarts">Cleared at restart</span> <span class="subtle">Unraid keeps only <code>/mnt</code> and <code>/boot</code>; {% if auth.can(Perm.INSTANCES_WRITE) %}<a href="/instances/{{ instance.id }}/edit">set a folder under /mnt/user</a>{% else %}ask for a folder under /mnt/user{% endif %} and Slipway moves the files.</span>{% endif %}</dd>{% endif %}
       </dl>
@@ -120,15 +173,16 @@
   <div class="card-head"><span class="head-icon accent">{{ icon("rocket", "i-lg") }}</span><h2>Deployments</h2></div>
   {% if deployments %}
   <div class="table-wrap"><table class="table">
-    <thead><tr><th>Status</th><th>Commit</th><th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
-    <tbody>{% for d in deployments %}
+    <thead><tr><th>Status</th><th>What</th><th>Commit</th><th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
+    <tbody>{% for dep in deployments %}
       <tr>
-        <td>{{ badge("deployment", d.status) }}</td>
-        <td><span class="mono">{{ d.short_sha or "—" }}</span> <span class="muted">{{ (d.commit_message or "")|truncate(70) }}</span></td>
-        <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>
-        <td class="muted nowrap">{{ d.created_at|timeago }}</td>
-        <td class="muted">{{ d.duration_seconds|duration }}</td>
-        <td class="actions-cell"><a class="btn btn-sm" href="/deployments/{{ d.id }}">View log</a></td>
+        <td>{{ badge("deployment", dep.status, dep.kind) }}</td>
+        <td class="nowrap">{{ (dep.kind or "deploy")|kind_label }}</td>
+        <td><span class="mono">{{ dep.short_sha or "—" }}</span> <span class="muted">{{ (dep.commit_message or "")|truncate(70) }}</span></td>
+        <td class="muted">{{ dep.triggered_by.display_name if dep.triggered_by else "—" }}</td>
+        <td class="muted nowrap">{{ dep.created_at|timeago }}</td>
+        <td class="muted">{{ dep.duration_seconds|duration }}</td>
+        <td class="actions-cell"><a class="btn btn-sm" href="/deployments/{{ dep.id }}">View log</a></td>
       </tr>
     {% endfor %}</tbody>
   </table></div>
@@ -136,13 +190,85 @@
 </section>
 {% endif %}
 
-{% if auth.can(Perm.INSTANCES_WRITE) %}
+{% if d and auth.can(Perm.DATA_READ) %}{{ backups_card(instance, d) }}{% endif %}
+
+{% if d and (d.man.first_admin or d.first_admin) %}
+{%- set fa = d.first_admin -%}
+{%- set pending = fa and fa.status == "pending" -%}
+{%- set field_labels = {} -%}
+{%- for f in (d.man.first_admin.fields if d.man.first_admin else []) %}{% set _ = field_labels.update({f.name: f.label}) %}{% endfor -%}
 <section class="card">
-  <div class="card-head"><span class="head-icon" style="color: var(--error)">{{ icon("alert", "i-lg") }}</span><div><h2>Danger zone</h2><p>Destroying removes the containers, images and release files from {{ instance.host.name }}.{% if instance.claim %} Volumes are kept{% if instance.claim.working_dir %}, and so is {{ instance.claim.working_dir }}{% endif %}.{% endif %}{% if instance.status == "deploying" %} Wait for the running deployment to finish first.{% endif %}</p></div></div>
-  <div class="card-body row wrap">
-    <button class="btn btn-danger solid" data-api="DELETE /api/v1/instances/{{ instance.id }}" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Destroy {{ instance.name }}? Containers and files on {{ instance.host.name }} will be removed." data-then="redirect:/instances">{{ icon("trash") }} Destroy instance</button>
-    <button class="btn btn-danger" data-api="DELETE /api/v1/instances/{{ instance.id }}?purge=false" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Remove {{ instance.name }} from Slipway but leave everything running on the host?" data-then="redirect:/instances">Remove from Slipway only</button>
+  <div class="card-head"><span class="head-icon">{{ icon("user", "i-lg") }}</span><div><h2>First admin</h2><p>The account the app's first-admin command creates, so someone can sign in to a fresh {{ instance.name }}.</p></div></div>
+  <div class="card-body stack" style="gap: 12px">
+    {% if fa %}
+    <dl class="kv">
+      {% for k, v in (fa.fields or {}).items() %}<dt>{{ field_labels.get(k, k) }}</dt><dd>{{ v }}</dd>{% endfor %}
+      <dt>Sign-in</dt><dd>{{ "A password set here" if fa.mode == "password" else ((d.man.first_admin.invite.label if d.man.first_admin and d.man.first_admin.invite else "An email invitation")) }}</dd>
+      <dt>State</dt><dd>{% if pending %}<span class="badge warning">Not created yet</span>{% elif fa.existed %}<span class="badge">Already existed</span>{% else %}<span class="badge success">Created {{ fa.done_at|dt }}</span>{% endif %}</dd>
+    </dl>
+    {% if pending and fa.last_error %}<div class="callout warning">{{ icon("alert") }}<span>{{ fa.last_error }}</span></div>{% endif %}
+    {% else %}
+    <p class="muted" style="margin: 0">None set.</p>
+    {% endif %}
+    <div class="row wrap">
+      {% if d.man.first_admin %}
+      {% if pending or (not fa and not instance.current_commit_sha) %}
+        {% if auth.can(Perm.INSTANCES_WRITE) %}<button class="btn btn-sm" type="button" data-open="first-admin" {{ 'disabled' if d.busy }}>{{ icon("edit", "i-sm") }} {{ "Change…" if fa else "Set…" }}</button>{% endif %}
+        {% if pending and auth.can(Perm.DEPLOYMENTS_CREATE) and instance.status == "running" and "first_admin" in d.caps %}
+        <button class="btn btn-sm btn-primary" type="button" data-api="POST /api/v1/instances/{{ instance.id }}/first-admin/run"
+                {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Queued"{% endif %} {% if d.busy or held %}disabled title="{{ held or 'A job is running for this instance' }}"{% endif %}>{{ icon("play", "i-sm") }} Create it now</button>
+        {% endif %}
+      {% endif %}
+      {% if not pending and instance.current_commit_sha and auth.can(Perm.DATA_RESET) %}
+        <button class="btn btn-sm" type="button" data-open="first-admin" {{ 'disabled' if d.busy }}>{{ icon("plus", "i-sm") }} Create another first admin…</button>
+      {% endif %}
+      {% endif %}
+    </div>
   </div>
 </section>
+{% endif %}
+
+{% if d and instance.content_pending %}
+<section class="card">
+  <div class="card-body row wrap" style="padding-top: 18px">
+    <span class="muted">{{ icon("package", "i-sm") }} The starter content wasn't added (the last try ended in a warning).</span>
+    <span class="spacer" style="flex: 1"></span>
+    {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}<button class="btn btn-sm" type="button" data-api="POST /api/v1/instances/{{ instance.id }}/content/run"
+      {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Queued"{% endif %} {% if d.busy or held %}disabled title="{{ held or 'A job is running for this instance' }}"{% endif %}>Add starter content</button>{% endif %}
+  </div>
+</section>
+{% endif %}
+
+{% set can_reset_data = d and auth.can(Perm.DATA_RESET) and ("reset" in d.caps or d.start_over) %}
+{% if (auth.can(Perm.INSTANCES_WRITE) or can_reset_data) and not member %}
+<section class="card">
+  <div class="card-head"><span class="head-icon" style="color: var(--error)">{{ icon("alert", "i-lg") }}</span><div><h2>Danger zone</h2><p>Destroying removes the containers, images and release files from {{ instance.host.name }}.{% if instance.claim %} Volumes are kept{% if instance.claim.working_dir %}, and so is {{ instance.claim.working_dir }}{% endif %}.{% endif %}{% if d %} Volumes and backups stay on {{ instance.host.name }} (backups, with their sign-in keys, move to <code>.slipway-kept</code>).{% endif %}{% if instance.status == "deploying" %} Wait for the running deployment to finish first.{% endif %}</p></div></div>
+  <div class="card-body row wrap">
+    {% if can_reset_data %}
+      {% if d.start_over and not instance.current_commit_sha %}
+      <button class="btn btn-danger" type="button" data-open="start-over" {% if d.busy %}disabled title="A job is running for this instance; wait for it to finish"{% endif %}>{{ icon("restart") }} Start over…</button>
+      {% else %}
+      <button class="btn btn-danger" type="button" data-open="reset-data" {% if d.reset_off %}disabled title="{{ d.reset_off }}"{% endif %}>{{ icon("restart") }} Reset data…</button>
+      {% endif %}
+    {% endif %}
+    {% if auth.can(Perm.INSTANCES_WRITE) %}
+    <button class="btn btn-danger solid" data-api="DELETE /api/v1/instances/{{ instance.id }}" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Destroy {{ instance.name }}? Containers and files on {{ instance.host.name }} will be removed." data-then="redirect:/instances">{{ icon("trash") }} Destroy instance</button>
+    <button class="btn btn-danger" data-api="DELETE /api/v1/instances/{{ instance.id }}?purge=false" {{ 'disabled' if instance.status == 'deploying' }} data-confirm="Remove {{ instance.name }} from Slipway but leave everything running on the host?" data-then="redirect:/instances">Remove from Slipway only</button>
+    {% endif %}
+  </div>
+  {% if can_reset_data and d.reset_off and not (d.start_over and not instance.current_commit_sha) %}<div class="card-body" style="padding-top: 0"><p class="subtle" style="margin: 0">Reset data is off: {{ d.reset_off }}</p></div>{% endif %}
+</section>
+{% endif %}
+
+{% if d %}
+{% if auth.can(Perm.DATA_RESTORE) and auth.can(Perm.DATA_READ) %}{{ restore_dialog(instance, d) }}{% endif %}
+{% if auth.can(Perm.DATA_BACKUP) and "backup" in d.caps %}{{ backup_dialog(instance, d) }}{{ snapshot_dialog(instance, d) }}{% endif %}
+{% if can_reset_data %}{% if d.start_over and not instance.current_commit_sha %}{{ start_over_dialog(instance, d) }}{% else %}{{ reset_dialog(instance, d) }}{% endif %}{% endif %}
+{% if d.man.first_admin %}
+  {% set fa = d.first_admin %}
+  {% set pending = fa and fa.status == "pending" %}
+  {% if (pending or (not fa and not instance.current_commit_sha)) and auth.can(Perm.INSTANCES_WRITE) %}{{ first_admin_dialog(instance, d) }}
+  {% elif not pending and instance.current_commit_sha and auth.can(Perm.DATA_RESET) %}{{ first_admin_dialog(instance, d, another=True) }}{% endif %}
+{% endif %}
 {% endif %}
 {% endblock %}

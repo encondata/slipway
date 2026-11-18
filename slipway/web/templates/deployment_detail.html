@@ -1,18 +1,145 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge %}
-{% block title %}Deployment {{ dep.short_sha or dep.id|string|truncate(8, True, "") }}{% endblock %}
+{% from "_data_dialogs.html" import restore_dialog, rollback_dialog, retry_dialog with context %}
+{% set kind = d.kind %}
+{% set TITLES = {"deploy": "Deployment", "restore": "Restore", "rollback": "Roll back", "reset": "Reset", "backup": "Backup",
+                 "snapshot": "Snapshot", "admin": "First admin", "content": "Starter content"} %}
+{% block title %}{% if instance is none %}{{ d.label }}{% else %}{{ TITLES.get(kind, "Deployment") }}{% endif %} {{ dep.short_sha or dep.id|string|truncate(8, True, "") }}{% endblock %}
 {% block content %}
+{% if instance is none %}
+{#- A job of a whole environment (phase 3 §12.5): no instance; the environment is in the breadcrumb and the What card. #}
+{% set retry = d.actions.retry %}
+{% set can_envs = auth.can(Perm.ENVIRONMENTS_READ) %}
+{#- The retry needs its kind's permission (data.RETRY_PERMISSION) and any it also needs (discard: deployments:create). #}
+{% set ns = namespace(ok=auth.can(retry.permission)) %}
+{% for p in retry.also_needs or [] %}{% if not auth.can(p) %}{% set ns.ok = false %}{% endif %}{% endfor %}
+{% set may_retry = ns.ok %}
+<div class="page-head">
+  <div>
+    <div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}{% if env and can_envs %}<a href="/environments/{{ env.id }}">{{ env.name }}</a>{% else %}<span>{{ env.name if env else "Environment" }}</span>{% endif %}</div>
+    <h1 class="row">{{ d.label }}{% if env %} · {{ env.name }}{% endif %} {{ badge("deployment", dep.status, kind) }}</h1>
+    <p class="lede">{% if env and auth.can(Perm.REPOS_READ) %}{{ env.repository.full_name }} · {% endif %}<span class="mono">{{ dep.branch }}</span></p>
+  </div>
+  <div class="actions">
+    {% if env and can_envs %}<a class="btn" href="/environments/{{ env.id }}">{{ icon("environments") }} Open environment</a>{% endif %}
+    {% if not dep.is_active and may_retry %}
+      {% if retry.available %}
+        {% if retry.needs_confirm or retry.offers_forget_traffic %}
+        <button class="btn btn-primary" type="button" data-open="retry-env-job">{{ icon("restart") }} Retry…</button>
+        {% else %}
+        <button class="btn btn-primary" data-api="POST /api/v1/deployments/{{ dep.id }}/retry" data-then="redirect:/deployments/{id}">{{ icon("restart") }} Try again</button>
+        {% endif %}
+      {% elif dep.status in ("failed", "cancelled") %}
+        <button class="btn btn-primary" type="button" disabled title="{{ retry.reason }}">{{ icon("restart") }} Try again</button>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+<div class="grid grid-4">
+  <div class="card stat"><div class="label">{{ icon("commit") }} Commit</div><div class="value mono" style="font-size: 22px">{{ dep.short_sha or "—" }}</div><div class="hint truncate">{{ dep.commit_message or "—" }}</div></div>
+  <div class="card stat"><div class="label">{{ icon("user") }} Triggered by</div><div class="value" style="font-size: 22px">{{ dep.triggered_by.display_name if dep.triggered_by else "Slipway" }}</div><div class="hint">{{ dep.created_at|dt }}</div></div>
+  <div class="card stat"><div class="label">{{ icon("clock") }} Duration</div><div class="value" style="font-size: 22px">{{ dep.duration_seconds|duration }}</div><div class="hint">{% if dep.finished_at %}Finished {{ dep.finished_at|timeago }}{% else %}In progress{% endif %}</div></div>
+  <div class="card stat"><div class="label">{{ icon("environments") }} What</div><div class="value" style="font-size: 22px">{{ d.label }}</div><div class="hint">{{ env.name if env else "" }}{% if (dep.options or {}).get("back") %} · switch back{% endif %}</div></div>
+</div>
+
+{% if d.switch %}<div class="callout {{ 'success' if dep.status == 'succeeded' else 'warning' }}">{{ icon("globe") }}<span>{{ d.switch }}.</span></div>{% endif %}
+{% if dep.retry_of_id %}<div class="callout primary">{{ icon("info") }}<span>Retry of <a href="/deployments/{{ dep.retry_of_id }}">{{ (d.retry_of.kind if d.retry_of else kind)|kind_noun }} {{ dep.retry_of_id|string|truncate(8, True, "") }}</a>.</span></div>{% endif %}
+{% if not retry.available and retry.reason and dep.status in ("failed", "cancelled") %}
+<p class="subtle" style="margin: 0">Retry isn't available: {{ retry.reason }}</p>
+{% endif %}
+
+{% if dep.steps %}
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("check", "i-lg") }}</span><div><h2>Steps</h2><p>Each step starts a section of the job's output below.</p></div></div>
+  <div class="card-body"><ol class="steps" data-steps>{% for st in dep.steps %}
+    <li class="step-{{ st.status }}"><span class="badge {{ {'succeeded': 'success', 'failed': 'error', 'running': 'warning spin', 'warning': 'warning', 'skipped': 'plain'}.get(st.status, '') }}">{{ "Not run" if st.status == "pending" and not dep.is_active else st.status|capitalize }}</span>
+      <strong>{{ st.name }}</strong>{% if st.note %} <span class="subtle">{{ st.note }}</span>{% endif %}</li>
+  {% endfor %}</ol></div>
+</section>
+{% endif %}
+
+{% if dep.error %}<div class="callout error">{{ icon("alert") }}<pre class="mono" style="margin:0; white-space: pre-wrap">{{ dep.error }}</pre></div>{% endif %}
+
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("terminal", "i-lg") }}</span><div><h2>Output</h2><p>{{ "Streaming live…" if dep.is_active else "Complete log" }}</p></div>
+    <span class="spacer"></span><button class="btn btn-sm" data-copy-target="#deploy-log">{{ icon("copy", "i-sm") }} Copy</button></div>
+  <div class="card-body">
+    <pre class="log" id="deploy-log" data-deploy-log="/api/v1/deployments/{{ dep.id }}" data-initial-status="{{ dep.status }}" {% if dep.is_active %}data-reload-on-finish{% endif %}></pre>
+  </div>
+</section>
+
+{% if not dep.is_active and may_retry and retry.available and (retry.needs_confirm or retry.offers_forget_traffic) and env %}
+{% from "_environment_dialogs.html" import retry_env_dialog with context %}
+{{ retry_env_dialog(dep, env, d) }}
+{% endif %}
+{% else %}
 {% set can_instances = auth.can(Perm.INSTANCES_READ) %}
+{% set retry = d.actions.retry %}
+{% set rollback = d.actions.rollback %}
+{% set undo = d.actions.undo %}
+{# A retry needs the kind's own permission as well (data.RETRY_PERMISSION), and data:reset when the job puts back
+   identity keys (options.restore_identity), as POST /deployments/{id}/retry checks. #}
+{% set retry_puts_keys = (dep.options or {}).get("restore_identity") %}
+{% set may_retry_kind = auth.can(Perm.DEPLOYMENTS_CREATE) and auth.can(retry.permission or Perm.DEPLOYMENTS_CREATE) %}
+{% set rns = namespace(missing=none) %}
+{% for p in retry.also_needs or [] %}{% if rns.missing is none and not auth.can(p) %}{% set rns.missing = p %}{% endif %}{% endfor %}
+{% set can_retry = may_retry_kind and (not retry_puts_keys or auth.can(Perm.DATA_RESET)) and rns.missing is none %}
+{% if retry_puts_keys and not auth.can(Perm.DATA_RESET) %}
+{% set retry_why = "This restore puts back the backup's " ~ d.labels.identity ~ "; retrying it needs data:reset" %}
+{% elif rns.missing %}
+{% set retry_why = "Retrying this " ~ (kind|kind_label|lower) ~ " needs the " ~ rns.missing ~ " permission" %}
+{% endif %}
+{% set retry_off = retry_why if retry.available and may_retry_kind and not can_retry else None %}
+{% set gated = retry.needs_confirm %}
+{% set offers_skip = retry.offers_skip_backup and auth.can(Perm.DATA_RESET) %}
 <div class="page-head">
   <div>
     <div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}{% if can_instances %}<a href="/instances/{{ dep.instance.id }}">{{ dep.instance.name }}</a>{% else %}<span>{{ dep.instance.name }}</span>{% endif %}</div>
-    <h1 class="row">{{ dep.instance.name }} {{ badge("deployment", dep.status) }}</h1>
+    <h1 class="row">{% if dep.environment_id %}{{ dep|dep_label }} · {{ dep.environment.name if dep.environment else dep.instance.name }}{% elif kind == "deploy" %}{{ dep.instance.name }}{% else %}{{ kind|kind_label }} of {{ dep.instance.name }}{% endif %} {{ badge("deployment", dep.status, kind) }}</h1>
     <p class="lede">{% if auth.can(Perm.REPOS_READ) %}{{ dep.instance.repository.full_name }} · {% endif %}<span class="mono">{{ dep.branch }}</span>{% if auth.can(Perm.HOSTS_READ) %} → {{ dep.instance.host.name }}{% endif %}</p>
   </div>
   <div class="actions">
     {% if can_instances %}<a class="btn" href="/instances/{{ dep.instance.id }}">{{ icon("box") }} Open instance</a>{% endif %}
+    {% if dep.environment and auth.can(Perm.ENVIRONMENTS_READ) %}<a class="btn" href="/environments/{{ dep.environment.id }}">{{ icon("environments") }} Open {{ dep.environment.name }}</a>{% endif %}
     {% if auth.can(Perm.DEPLOYMENTS_CREATE) and not dep.is_active %}
-    <button class="btn btn-primary" data-api="POST /api/v1/instances/{{ dep.instance.id }}/deploy" data-then="redirect:/deployments/{id}">{{ icon("restart") }} Redeploy</button>
+      {% if retry.available and can_retry %}
+        {% if gated %}
+        <button class="btn btn-primary" type="button" data-open="retry-job" title="Runs the same {{ kind|kind_noun }} again; steps the first attempt finished aren't repeated">{{ icon("restart") }} Retry…</button>
+        {% elif kind == "deploy" %}
+        <button class="btn btn-primary" data-api="POST /api/v1/deployments/{{ dep.id }}/retry" data-then="redirect:/deployments/{id}"
+                title="Runs commit {{ dep.short_sha }} again. The download, upload and build are reused when they are still on the host; the settings, ports and start run again.">{{ icon("restart") }} Retry {{ dep.short_sha }}</button>
+        {% if offers_skip %}<button class="btn btn-danger" type="button" data-open="retry-job">Retry without the backup…</button>{% endif %}
+        {% else %}
+        <button class="btn btn-primary" data-api="POST /api/v1/deployments/{{ dep.id }}/retry" data-then="redirect:/deployments/{id}">{{ icon("restart") }} Try again</button>
+        {% if offers_skip %}<button class="btn btn-danger" type="button" data-open="retry-job">Retry without the backup…</button>{% endif %}
+        {% endif %}
+      {% elif retry_off %}
+        <button class="btn btn-primary" type="button" disabled title="{{ retry_off }}">{{ icon("restart") }} Retry…</button>
+      {% endif %}
+      {#- A slot of an environment is deployed from the environment's page (Slipway picks the slot). #}
+      {% if kind == "deploy" and not dep.instance.environment_id %}
+        {% if retry.available and can_retry %}
+        <button class="btn" data-api="POST /api/v1/instances/{{ dep.instance.id }}/deploy" data-then="redirect:/deployments/{id}"
+                title="Deploys the latest commit of {{ dep.instance.branch }}">{{ icon("rocket") }} Deploy latest</button>
+        {% else %}
+        <button class="btn btn-primary" data-api="POST /api/v1/instances/{{ dep.instance.id }}/deploy" data-then="redirect:/deployments/{id}">{{ icon("restart") }} Redeploy</button>
+        {% endif %}
+      {% endif %}
+      {#- The lag check refused this deploy to the idle slot (§7.6), and still would (pages.deploy_again): deploy
+          again, ticking the acknowledgement in its dialog. #}
+      {% if d.again %}
+        <button class="btn" type="button" data-open="deploy-again"
+                title="Deploys {{ d.again.branch }} to {{ d.again.slot }} again, once you confirm that this release removes nothing {{ d.again.active }} uses">{{ icon("rocket") }} Deploy again, confirming…</button>
+      {% endif %}
+    {% endif %}
+    {#- Undo is a restore: data:restore is all it needs (POST /instances/{id}/data/restore), not deployments:create. #}
+    {% if not dep.is_active and undo.available and auth.can(Perm.DATA_RESTORE) and d.undo %}
+      {% if d.undo.restore_off %}
+      <button class="btn" type="button" disabled title="{{ d.undo.restore_off }}">{{ icon("restart") }} Undo…</button>
+      {% else %}
+      <button class="btn" type="button" data-open="restore-backup" data-fill='{{ d.undo.fill|tojson }}' title="Restores the backup taken just before this job">{{ icon("restart") }} Undo…</button>
+      {% endif %}
     {% endif %}
   </div>
 </div>
@@ -21,16 +148,82 @@
   <div class="card stat"><div class="label">{{ icon("commit") }} Commit</div><div class="value mono" style="font-size: 22px">{{ dep.short_sha or "—" }}</div><div class="hint truncate">{{ dep.commit_message or ("Resolving…" if dep.is_active else "Not resolved") }}</div></div>
   <div class="card stat"><div class="label">{{ icon("user") }} Triggered by</div><div class="value" style="font-size: 22px">{{ dep.triggered_by.display_name if dep.triggered_by else "—" }}</div><div class="hint">{{ dep.created_at|dt }}</div></div>
   <div class="card stat"><div class="label">{{ icon("clock") }} Duration</div><div class="value" style="font-size: 22px">{{ dep.duration_seconds|duration }}</div><div class="hint">{% if dep.finished_at %}Finished {{ dep.finished_at|timeago }}{% else %}In progress{% endif %}</div></div>
-  <div class="card stat"><div class="label">{{ icon("instances") }} Build</div><div class="value" style="font-size: 22px">{{ "Compose" if dep.instance.build_source == "compose" else "Dockerfile" }}</div><div class="hint mono">{{ dep.instance.compose_file if dep.instance.build_source == "compose" else dep.instance.dockerfile_path }}</div></div>
+  <div class="card stat"><div class="label">{{ icon("instances") }} What</div><div class="value" style="font-size: 22px">{{ kind|kind_label }}</div><div class="hint mono">{% if kind == "deploy" %}{{ {"compose": "Compose", "app": "App"}.get(dep.instance.build_source, "Dockerfile") }} · {{ {"compose": dep.instance.compose_file, "app": dep.instance.manifest_file}.get(dep.instance.build_source, dep.instance.dockerfile_path) }}{% else %}{{ dep.instance.manifest_file }}{% endif %}</div></div>
 </div>
+
+{% if dep.retry_of_id %}<div class="callout primary">{{ icon("info") }}<span>Retry of <a href="/deployments/{{ dep.retry_of_id }}">{{ (d.retry_of.kind if d.retry_of else kind)|kind_noun }} {{ dep.retry_of_id|string|truncate(8, True, "") }}</a>:
+  {%- if (dep.options or {}).get("inherit") %} the same {{ kind|kind_noun }}, keeping the backup from before the first attempt.
+  {%- elif kind == "deploy" %} the same commit, reusing its release and build where they are still on the host.
+  {%- else %} the same {{ kind|kind_noun }}.{% endif %}</span></div>{% endif %}
+
+{% if d.backup or d.restore_backup or d.snapshot %}
+<section class="card">
+  <div class="card-body" style="padding-top: 18px">
+    <dl class="kv">
+      {% if d.backup %}<dt>{{ icon("database", "i-sm") }} Backup taken first</dt><dd><span class="mono">{{ d.backup.name }}</span>{% if (dep.options or {}).get("inherit") %} <span class="subtle">(kept from the first attempt)</span>{% endif %} <span class="subtle">· {{ d.backup.taken_at|dt }}{% if d.backup.db_bytes %} · {{ d.backup.db_bytes|bytes }}{% endif %}</span></dd>{% endif %}
+      {% if d.restore_backup %}<dt>{{ icon("restart", "i-sm") }} Restores</dt><dd><span class="mono">{{ d.restore_backup.name }}</span> <span class="subtle">· taken {{ d.restore_backup.taken_at|dt }}</span></dd>{% endif %}
+      {% if d.snapshot %}<dt>{{ icon("package", "i-sm") }} Snapshot</dt><dd>{% if auth.can(Perm.DATA_READ) %}<a href="/snapshots">{{ d.snapshot.name }}</a>{% else %}{{ d.snapshot.name }}{% endif %} <span class="subtle">· {{ d.snapshot.status }}</span></dd>{% endif %}
+    </dl>
+  </div>
+</section>
+{% endif %}
+
+{% if kind in ("restore", "rollback", "reset") and dep.status in ("failed", "cancelled") and (dep.instance.data_dirty or {}).get("hold") %}
+<div class="callout error">{{ icon("alert") }}<span>The database may be empty or half-restored, and the app is stopped. Retry this job, or restore the backup taken just before it.</span></div>
+{% endif %}
+
+{% if kind == "deploy" and not dep.is_active %}
+  {#- d.rollback.off: the permissions POST /deployments/{id}/rollback asks (data:reset too on shared data, D17). #}
+  {% if rollback.available and d.rollback and not d.rollback.off %}
+  {%- set er = d.rollback.env %}
+  <section class="card" id="roll-back-panel">
+    <div class="card-head"><span class="head-icon" style="color: var(--warning-text)">{{ icon("restart", "i-lg") }}</span><div><h2>Roll back</h2><p>
+      {%- if er %}Put {{ dep.environment.name }}'s data back as it was before this deploy changed it, and start {{ "the data server and " if er.case == "data" }}{{ er.lead or "the live slot" }} (<span class="mono">{{ er.lead_sha7 }}</span>) again.
+      {%- else %}Put the data back as it was before this deploy changed it, and run <span class="mono">{{ d.sha7 }}</span> again.{% endif %}</p></div>
+      <span class="spacer"></span><button class="btn btn-danger" type="button" data-open="roll-back">{{ icon("restart") }} Roll back…</button></div>
+    {% if rollback.also_undoes %}<div class="card-body" style="padding-top: 0"><p class="subtle" style="margin: 0">{{ rollback.also_undoes }}</p></div>{% endif %}
+  </section>
+  {#- A standalone instance's page shows phase 2's (no permission text, I1). #}
+  {% elif dep.status in ("failed", "cancelled") and (rollback.reason or (d.rollback and d.rollback.off and dep.environment_id)) and dep.instance.build_source == "app" %}
+  <p class="subtle" id="roll-back-panel" style="margin: 0">Roll back isn't available: {{ rollback.reason or d.rollback.off }}</p>
+  {% endif %}
+{% endif %}
+{% if not retry.available and retry.reason and dep.status in ("failed", "cancelled") and kind != "deploy" %}
+<p class="subtle" style="margin: 0">Retry isn't available: {{ retry.reason }}</p>
+{% endif %}
+
+{% if dep.steps %}
+<section class="card">
+  <div class="card-head"><span class="head-icon">{{ icon("check", "i-lg") }}</span><div><h2>Steps</h2><p>Each step starts a section of the {{ "build output" if kind == "deploy" else "job's output" }} below.</p></div></div>
+  <div class="card-body"><ol class="steps" data-steps>{% for st in dep.steps %}
+    <li class="step-{{ st.status }}"><span class="badge {{ {'succeeded': 'success', 'failed': 'error', 'running': 'warning spin', 'warning': 'warning', 'skipped': 'plain'}.get(st.status, '') }}">{{ "Not run" if st.status == "pending" and not dep.is_active else st.status|capitalize }}</span>
+      <strong>{{ st.name }}</strong>{% if st.note %} <span class="subtle">{{ st.note }}</span>{% endif %}
+      {%- if st.status == "warning" and not dep.is_active and auth.can(Perm.DEPLOYMENTS_CREATE) %}
+        {%- if st.key == "first_admin" %} <button class="btn btn-sm" type="button" data-api="POST /api/v1/instances/{{ dep.instance.id }}/first-admin/run" data-then="redirect:/deployments/{id}">Create it now</button>
+        {%- elif st.key == "seed" and dep.instance.content_pending %} <button class="btn btn-sm" type="button" data-api="POST /api/v1/instances/{{ dep.instance.id }}/content/run" data-then="redirect:/deployments/{id}">Add starter content</button>{% endif %}
+      {%- endif %}</li>
+  {% endfor %}</ol></div>
+</section>
+{% endif %}
 
 {% if dep.error %}<div class="callout error">{{ icon("alert") }}<pre class="mono" style="margin:0; white-space: pre-wrap">{{ dep.error }}</pre></div>{% endif %}
 
 <section class="card">
-  <div class="card-head"><span class="head-icon">{{ icon("terminal", "i-lg") }}</span><div><h2>Build output</h2><p>{{ "Streaming live…" if dep.is_active else "Complete log" }}</p></div>
+  <div class="card-head"><span class="head-icon">{{ icon("terminal", "i-lg") }}</span><div><h2>{{ "Build output" if kind == "deploy" else "Output" }}</h2><p>{{ "Streaming live…" if dep.is_active else "Complete log" }}</p></div>
     <span class="spacer"></span><button class="btn btn-sm" data-copy-target="#deploy-log">{{ icon("copy", "i-sm") }} Copy</button></div>
   <div class="card-body">
     <pre class="log" id="deploy-log" data-deploy-log="/api/v1/deployments/{{ dep.id }}" data-initial-status="{{ dep.status }}" {% if dep.is_active %}data-reload-on-finish{% endif %}></pre>
   </div>
 </section>
+
+{% if not dep.is_active and auth.can(Perm.DEPLOYMENTS_CREATE) %}
+  {% if retry.available and can_retry and (gated or offers_skip) %}{{ retry_dialog(dep, instance, d, skip_only=not gated) }}{% endif %}
+  {% if d.rollback and not d.rollback.off %}
+    {%- if d.rollback.env %}{% from "_environment_dialogs.html" import env_rollback_dialog with context %}{{ env_rollback_dialog(dep.environment, d.rollback.env, id="roll-back") }}
+    {%- else %}{{ rollback_dialog(dep, instance, d) }}{% endif %}
+  {% endif %}
+  {% if d.again %}{% from "_environment_dialogs.html" import deploy_again_dialog with context %}{{ deploy_again_dialog(dep, d.again) }}{% endif %}
+{% endif %}
+{% if not dep.is_active and d.undo and not d.undo.restore_off and auth.can(Perm.DATA_RESTORE) %}{{ restore_dialog(instance, d) }}{% endif %}
+{% endif %}
 {% endblock %}

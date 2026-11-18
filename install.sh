@@ -143,6 +143,19 @@ fi
 say "Pulling images"
 docker compose pull db
 
+env_value() { sed -n "s/^$1=//p" .env | tail -1; }
+
+# Stored snapshots go in <data folder>/files, which Slipway (uid 10001 in its container) must own,
+# with mode 700. Without root, a throwaway container (from the database image) sets that.
+FILES="$(env_value SLIPWAY_DATA_DIR)"; FILES="${FILES:-./data}"; FILES="${FILES%/}/files"
+case "$FILES" in /*) ;; *) FILES="$DIR/${FILES#./}" ;; esac
+mkdir -p "$FILES" 2>/dev/null || [ -d "$FILES" ] || die "Could not create $FILES."
+if ! { chown 10001:10001 "$FILES" && chmod 700 "$FILES"; } 2>/dev/null; then
+  docker compose run --rm --no-deps --user root -v "$FILES:/files" --entrypoint sh db \
+    -c 'chown 10001:10001 /files && chmod 700 /files' </dev/null >/dev/null \
+    || die "Could not give $FILES to Slipway. Run: sudo chown 10001:10001 $FILES && sudo chmod 700 $FILES, then run this again."
+fi
+
 say "Building and starting"
 # The build stamp: which commit the image is built from, shown on the Updates page.
 export SLIPWAY_COMMIT="$(git rev-parse HEAD)" SLIPWAY_BRANCH="$BRANCH" SLIPWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -151,7 +164,6 @@ if ! docker compose up -d --build; then
   die "Slipway could not be started; the reason is above."
 fi
 
-env_value() { sed -n "s/^$1=//p" .env | tail -1; }
 ADMIN_EMAIL="$(env_value SLIPWAY_ADMIN_EMAIL)"
 ADMIN_PASSWORD="$(env_value SLIPWAY_ADMIN_PASSWORD)"
 URL="$(env_value SLIPWAY_BASE_URL)"
