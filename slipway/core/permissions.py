@@ -42,6 +42,7 @@ class Perm(StrEnum):
     PROVIDERS_WRITE = "providers:write"
     PROVIDERS_SPEND = "providers:spend"
     MACHINES_WRITE = "machines:write"
+    UPDATES_RUN = "updates:run"
 
 
 PERMISSION_DESCRIPTIONS: dict[str, str] = {
@@ -107,6 +108,11 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
     Perm.MACHINES_WRITE: (
         "Make VMs on Proxmox and ESXi for environments, resize them, take and delete VM snapshots, forget a lost VM "
         "(privileged: VMs use the hypervisor's CPU, memory and storage)"
+    ),
+    Perm.UPDATES_RUN: (
+        "See Slipway's version and upgrade it (privileged: runs the upgrade on Slipway's own server as that "
+        "host's SSH user. Slipway's own server is then a host: anyone who can create or deploy instances on it "
+        "is root on Slipway itself)"
     ),
 }
 

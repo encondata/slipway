@@ -29,6 +29,7 @@ from slipway.db.base import Base
 from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
 from slipway.services import backup_store, renewals, snapshots
 from slipway.services import do_lb as _do_lb  # noqa: F401  (importing it registers the do_lb traffic backend)
+from slipway.services import updates
 from slipway.services.deployer import runner
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
@@ -107,13 +108,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     sweeper = asyncio.create_task(snapshots.sweep_forever(), name="snapshot-sweeper")  # expired locked imports
     # Load balancer certificates due within 30 days (phase 4 §15.12); off when SLIPWAY_CERT_RENEW_INTERVAL is 0.
     renewer = asyncio.create_task(renewals.run_forever(), name="certificate-renewals")
+    update_checker = asyncio.create_task(updates.check_forever(), name="update-checker")
+    update_runs = asyncio.create_task(updates.reconcile_forever(), name="update-runs")
     log.info("Slipway %s started (%s)", __version__, get_settings().env)
     try:
         yield
     finally:
-        for task in (poller, sweeper, renewer):
+        for task in (poller, sweeper, renewer, update_checker, update_runs):
             task.cancel()
-        for task in (poller, sweeper, renewer):
+        for task in (poller, sweeper, renewer, update_checker, update_runs):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await runner.shutdown()

@@ -25,7 +25,13 @@ services:
       retries: 20
 
   slipway:
-    build: .
+    build:
+      context: .
+      # The build stamp (see the Dockerfile). install.sh and the upgrade script set these; empty means unknown.
+      args:
+        SLIPWAY_COMMIT: ${SLIPWAY_COMMIT:-}
+        SLIPWAY_BRANCH: ${SLIPWAY_BRANCH:-}
+        SLIPWAY_BUILT_AT: ${SLIPWAY_BUILT_AT:-}
     image: slipway:latest
     restart: unless-stopped
     # Time to stop cleanly: a running Terraform gets 30 s to save its state after being asked to
@@ -48,7 +54,8 @@ services:
     # from (as seen inside this container). Otherwise every client shares the proxy's IP, so failed logins
     # from anyone rate-limit everyone. Never use "*" (any client could forge its IP). If the proxy runs on
     # this machine, publish the port on loopback only, "127.0.0.1:${SLIPWAY_PORT:-8000}:8000", so clients
-    # cannot bypass it.
+    # cannot bypass it. Make changes like that in docker-compose.override.yml (Docker Compose reads it on its
+    # own), not here: an upgrade from the Updates page refuses to run while this file has local edits.
     ports:
       - "0.0.0.0:${SLIPWAY_PORT:-8000}:8000"
 

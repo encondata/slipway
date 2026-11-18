@@ -15,6 +15,8 @@ os.environ.update(
     SLIPWAY_SECRET_KEY="test-secret-key-that-is-long-enough-1234567890",
     SLIPWAY_HOST_POLL_INTERVAL="0",
     SLIPWAY_CERT_RENEW_INTERVAL="0",  # no certificate renewal loop in tests
+    SLIPWAY_UPDATE_CHECK_INTERVAL="0",
+    SLIPWAY_UPDATE_RECONCILE_INTERVAL="0",
     SLIPWAY_GITHUB_CLIENT_ID="test-client",
     SLIPWAY_GITHUB_CLIENT_SECRET="test-secret",
     SLIPWAY_BASE_URL="http://testserver",

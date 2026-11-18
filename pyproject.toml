@@ -45,7 +45,7 @@ include = ["slipway*"]
 
 [tool.setuptools.package-data]
 # setuptools' `*` skips dotfiles, so the Terraform module's lock file is named on its own.
-slipway = ["web/templates/**/*", "web/static/**/*", "terraform/**/*", "terraform/**/.terraform.lock.hcl"]
+slipway = ["web/templates/**/*", "web/static/**/*", "updates/*.sh", "terraform/**/*", "terraform/**/.terraform.lock.hcl"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

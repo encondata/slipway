@@ -10,3 +10,4 @@ Sample Images
 .pytest_cache
 .DS_Store
 .claude
+.slipway-updates/
