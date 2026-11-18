@@ -38,6 +38,7 @@ class Perm(StrEnum):
     ENVIRONMENTS_WRITE = "environments:write"
     ENVIRONMENTS_DELETE = "environments:delete"
     TRAFFIC_SWITCH = "traffic:switch"
+    UPDATES_RUN = "updates:run"
 
 
 PERMISSION_DESCRIPTIONS: dict[str, str] = {
@@ -91,6 +92,11 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
     Perm.TRAFFIC_SWITCH: (
         "Move an environment's traffic to a slot (activate, switch back), publish its names (Switchyard and DNS), "
         "claim records, resolve a stuck switch and discard a failed idle slot"
+    ),
+    Perm.UPDATES_RUN: (
+        "See Slipway's version and upgrade it (privileged: runs the upgrade on Slipway's own server as that "
+        "host's SSH user. Slipway's own server is then a host: anyone who can create or deploy instances on it "
+        "is root on Slipway itself)"
     ),
 }
 

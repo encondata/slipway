@@ -342,6 +342,11 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
         if instance.slot in environments.APP_SLOTS and "go_live" not in opts_in:
             opts_in["go_live"] = (_retry_go_live(env, instance, retry_of, mem) if retry_of is not None
                                   else environments.goes_live(env, str(instance.slot), mem))
+    from slipway.services import updates  # updates imports the models and services this module does
+
+    if await updates.upgrade_running(db):
+        # The upgrade stops Slipway for its backup and switch, which would cut a job off half done.
+        raise JobRefused(409, updates.MSG_UPGRADING)
     refused = await job_refusal(db, instance=instance, environment=env, user=user, kind=kind, options=opts_in,
                                 retry_of=retry_of, members=mem, needs=needs)
     if refused is not None:

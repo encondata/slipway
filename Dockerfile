@@ -24,6 +24,16 @@ RUN chmod +x /usr/local/bin/slipway-entrypoint
 ENV SLIPWAY_STORAGE_DIR=/var/lib/slipway
 RUN mkdir -p /var/lib/slipway && chown 10001:10001 /var/lib/slipway && chmod 700 /var/lib/slipway
 
+# Which commit this image was built from, so the Updates page can say what runs. install.sh and the
+# upgrade script pass these; an image built without them reports the commit as unknown. They come after
+# the pip install layers so a new commit doesn't rebuild the dependencies.
+ARG SLIPWAY_COMMIT=
+ARG SLIPWAY_BRANCH=
+ARG SLIPWAY_BUILT_AT=
+ENV SLIPWAY_COMMIT=$SLIPWAY_COMMIT \
+    SLIPWAY_BRANCH=$SLIPWAY_BRANCH \
+    SLIPWAY_BUILT_AT=$SLIPWAY_BUILT_AT
+
 USER slipway
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \

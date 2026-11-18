@@ -14,10 +14,11 @@ from slipway.api.v1 import (
     system,
     tokens,
     unmanaged,
+    updates,
     users,
 )
 
 api_router = APIRouter()
 for module in (system, auth, users, roles, tokens, hosts, unmanaged, repositories, instances, environments, deployments,
-               snapshots, audit, settings):
+               snapshots, audit, settings, updates):
     api_router.include_router(module.router)
