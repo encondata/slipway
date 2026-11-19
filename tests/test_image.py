@@ -24,7 +24,6 @@ PYPROJECT = REPO / "pyproject.toml"
 LOCK_FILE = terraform.MODULE_DIR / terraform.LOCK_FILE
 
 ARCHITECTURES = ("linux_amd64", "linux_arm64")
-PLACEHOLDER = "PLACEHOLDER-not-recorded-yet"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 MIRROR = "/opt/terraform/providers"
 
@@ -76,8 +75,7 @@ def test_the_dockerfile_pins_the_module_versions():
 def test_each_architecture_has_a_sha256_line(kind):
     for arch, value in sha_args(kind).items():
         assert value, f"no {kind}_SHA256_{arch.upper()} line"
-        # A recorded sum, or the marked placeholder that fails `sha256sum -c` (so the build stops).
-        assert SHA256.fullmatch(value) or value == PLACEHOLDER, (arch, value)
+        assert SHA256.fullmatch(value), (arch, value)
 
 
 def test_every_download_is_checked_before_it_is_used():
@@ -110,7 +108,6 @@ def test_terraformrc_allows_only_the_mirror():
     assert "credentials" not in body
 
 
-@pytest.mark.skipif(not LOCK_FILE.exists(), reason="the lock file needs a networked session (plan Decision 36)")
 def test_the_lock_file_hashes_equal_the_dockerfile_provider_sums():
     text = LOCK_FILE.read_text()
     block = re.search(r'provider "' + re.escape(terraform.PROVIDER_ADDRESS) + r'"\s*{(.*?)\n}', text, re.S)
@@ -118,10 +115,7 @@ def test_the_lock_file_hashes_equal_the_dockerfile_provider_sums():
     assert re.search(r'^\s*version\s*=\s*"' + re.escape(terraform.PROVIDER_VERSION) + '"', block.group(1), re.M)
     zh = set(re.findall(r'"zh:([0-9a-f]{64})"', block.group(1)))
     for arch, value in sha_args("PROXMOX_PROVIDER").items():
-        assert value != PLACEHOLDER, f"record PROXMOX_PROVIDER_SHA256_{arch.upper()} with the lock file"
         assert value in zh, arch
-    for arch, value in sha_args("TERRAFORM").items():
-        assert value != PLACEHOLDER, f"record TERRAFORM_SHA256_{arch.upper()} with the lock file"
 
 
 def test_the_package_ships_the_module_and_its_lock_file():

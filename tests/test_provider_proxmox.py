@@ -2,7 +2,8 @@
 
 Proxmox is ``tests/fake_proxmox.py``; Terraform is ``tests/bin/fake-terraform`` (through a wrapper named
 ``fake-terraform``, against a copy of the bundled module with a lock file in the fake mirror's format, as test 13
-does: the real lock file waits for the networked session, Decision 36); the VMs are ``tests/fake_vm_hosts.py``.
+does, since the real lock file's hashes are for the registry's zips, not the fake mirror's); the VMs are
+``tests/fake_vm_hosts.py``.
 Every run goes through the machines core (``machines.prepare``, ``resize_step``, ``remove``), so the stage
 transactions, the pin and the bootstrap are the real ones. Also the audit actions the provider writes
 (machine.create, machine.rebuild, and host.key_pinned with ``how: read through the Proxmox guest agent``), none of

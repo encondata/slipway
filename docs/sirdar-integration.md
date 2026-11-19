@@ -310,9 +310,8 @@ Each phase merges on its own and leaves Slipway working.
 5. **Proxmox and ESXi (built; real-host checks to do).** Creating, resizing, snapshotting
    and destroying VMs, Forget a lost VM, and VM snapshots with revert. The design is
    [phase5-machines.md](phase5-machines.md); how to use it is [machines.md](machines.md). The
-   Proxmox path needs one networked session before it can run outside the tests: the
-   Terraform lock file and the image's checksums (phase5-machines.md §16.3 item 18, which
-   lists the real-host checks).
+   Terraform lock file and the image's checksums are recorded, so the image builds and the
+   Proxmox path can run; the real-host checks are phase5-machines.md §16.3.
 6. **Retiring Sirdar.** Delete its environments with Sirdar itself, so it removes
    the cloud resources it recorded, then shut it down. Nothing is imported.
 

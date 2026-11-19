@@ -212,11 +212,16 @@ Then retry the job.
 ### The Terraform lock file
 
 Terraform needs `slipway/terraform/proxmox-vm/.terraform.lock.hcl`, which pins the provider's hashes. It
-has to be generated once with network access, together with the Dockerfile's SHA-256 lines for the two
-downloads ([phase5-machines.md](phase5-machines.md) §16.3 item 18). **Until that is done, this build has no
-lock file, the image doesn't build (its checksum lines are placeholders), and every Proxmox `prepare` fails
-with `Slipway's bundled Terraform module has no .terraform.lock.hcl, so this build of Slipway can't run
-Terraform`.** ESXi doesn't use Terraform and isn't affected.
+ships with Slipway, for `linux_amd64` and `linux_arm64`, next to the Dockerfile's SHA-256 lines for the
+Terraform and provider downloads; `tests/test_image.py` checks that the two agree. When the Terraform or
+provider version changes, record the new sums from the releases' `SHA256SUMS` files and regenerate the lock
+file in that folder with `terraform providers lock -platform=linux_amd64 -platform=linux_arm64`. A build
+without the lock file fails every Proxmox `prepare` with `Slipway's bundled Terraform module has no
+.terraform.lock.hcl, so this build of Slipway can't run Terraform`. ESXi doesn't use Terraform.
+
+The module leaves cloud-init's first-boot package upgrade (`ciupgrade`) to the template, so it works on
+Proxmox versions before 8.1, which don't have the option: a clone keeps the template's setting. Make the
+template with `--ciupgrade 0` (Test warns when it is on).
 
 `SLIPWAY_TERRAFORM_BINARY` may name OpenTofu's `tofu`, which reads the same module; that isn't tested.
 
@@ -224,7 +229,7 @@ Terraform`.** ESXi doesn't use Terraform and isn't affected.
 
 ESXi support uses pyvmomi 8.0.3.0.1, pinned with its hash. It is published only as a source package, so the
 image builds it during `pip install`, and the build backend pip uses for that isn't hash-checked. The
-Dockerfile says so. Pre-building a pinned wheel needs the same networked session.
+Dockerfile says so; that gap is accepted, and no pinned wheel is pre-built.
 
 ## Resizing
 

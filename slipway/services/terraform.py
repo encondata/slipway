@@ -60,10 +60,11 @@ MODULE_FILES = ("versions.tf", "variables.tf", "main.tf", "outputs.tf")
 LOCK_FILE = ".terraform.lock.hcl"
 VM_ADDRESS = "proxmox_virtual_environment_vm.vm"
 
-# Whether bpg/proxmox 0.115.0's ``initialization`` block has an ``upgrade`` attribute, read from
-# ``terraform providers schema -json``. None: not checked yet (that needs the provider, so network
-# access), and main.tf leaves the attribute out; Test's ciupgrade warning covers the template.
-INIT_UPGRADE_IN_SCHEMA: bool | None = None
+# Whether main.tf sets the first-boot package upgrade (``initialization.upgrade``, Proxmox's ``ciupgrade``).
+# bpg/proxmox 0.115.0 has the attribute and a non-root token with VM.Config.Cloudinit may set it, but
+# Proxmox before 8.1 has no ciupgrade option, so sending it would fail there. main.tf leaves it out: a clone
+# keeps the template's own setting, and Test warns when the template has it on (phase5-machines.md §19.14).
+INIT_UPGRADE_SET_BY_MODULE = False
 
 # Storage types whose disks are files: the module writes qcow2 there so they can take snapshots.
 FILE_STORAGES = frozenset({"dir", "nfs", "cifs", "glusterfs"})

@@ -8,15 +8,15 @@ FROM python:3.13-slim AS terraform
 ARG TARGETARCH
 ARG TERRAFORM_VERSION=1.16.5
 ARG PROXMOX_PROVIDER_VERSION=0.115.0
-# SHA-256 of each zip, one line per architecture.
-# PLACEHOLDER: these are not recorded yet. A networked session records them from HashiCorp's
-# SHA256SUMS and the provider release's SHA256SUMS, together with slipway/terraform/proxmox-vm/
-# .terraform.lock.hcl, whose zh: hashes must equal the provider lines. Until then `sha256sum -c`
-# fails and the image doesn't build, rather than installing an unchecked binary.
-ARG TERRAFORM_SHA256_LINUX_AMD64=PLACEHOLDER-not-recorded-yet
-ARG TERRAFORM_SHA256_LINUX_ARM64=PLACEHOLDER-not-recorded-yet
-ARG PROXMOX_PROVIDER_SHA256_LINUX_AMD64=PLACEHOLDER-not-recorded-yet
-ARG PROXMOX_PROVIDER_SHA256_LINUX_ARM64=PLACEHOLDER-not-recorded-yet
+# SHA-256 of each zip, one line per architecture, from HashiCorp's terraform_1.16.5_SHA256SUMS and the
+# provider release's terraform-provider-proxmox_0.115.0_SHA256SUMS. The provider lines equal zh: hashes
+# in slipway/terraform/proxmox-vm/.terraform.lock.hcl (tests/test_image.py checks it). When a version
+# changes, record its sums here and regenerate the lock file with `terraform providers lock
+# -platform=linux_amd64 -platform=linux_arm64` in that folder.
+ARG TERRAFORM_SHA256_LINUX_AMD64=2bc2fcfff033265c9e02ca0351f01794eb122f62a9b2a49a3294b9e49eaab5e4
+ARG TERRAFORM_SHA256_LINUX_ARM64=61a50b00485ee4810cf20581ef080fc54d34d666e175c58d9a10501c65c1ccde
+ARG PROXMOX_PROVIDER_SHA256_LINUX_AMD64=36c1c6bdcb9c74456ecab30beac94d7984b50deedd236cda8708e5aac924469e
+ARG PROXMOX_PROVIDER_SHA256_LINUX_ARM64=7e73903b42fc17078233a6c32fa0b79640c8a2890ed80f69d3fdefba4d0ad085
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip \
@@ -58,8 +58,8 @@ COPY docker/terraformrc /etc/slipway/terraformrc
 
 # ESXi support (pyvmomi), pinned with hashes, before Slipway itself.
 # pyvmomi 8.0.3.0.1 is published only as an sdist, so pip builds it here, and the build backend pip
-# fetches for that build isn't hash-checked. Pre-building a wheel and pinning its hash needs a
-# networked session; until then this is a known gap.
+# fetches for that build isn't hash-checked. That gap is accepted (docs/phase5-machines.md §19.14); no
+# pinned wheel is pre-built.
 COPY requirements-esxi.txt ./
 RUN pip install --require-hashes --no-deps -r requirements-esxi.txt
 

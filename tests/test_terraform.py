@@ -470,10 +470,7 @@ def test_versions_are_pinned_as_the_constants():
 
 
 def test_the_shipped_lock_file_names_the_provider_version():
-    path = terraform.MODULE_DIR / terraform.LOCK_FILE
-    if not path.exists():
-        pytest.skip("The lock file has to be generated with network access (later-A4.md)")
-    text = path.read_text()
+    text = (terraform.MODULE_DIR / terraform.LOCK_FILE).read_text()
     assert f'provider "{terraform.PROVIDER_ADDRESS}"' in text
     assert re.search(r'version\s*=\s*"' + re.escape(terraform.PROVIDER_VERSION) + '"', text)
     assert "zh:" in text and "h1:" in text
@@ -490,8 +487,8 @@ def test_main_tf_settings():
     assert re.search(r"started\s*=\s*true", code) and re.search(r"on_boot\s*=\s*true", code)
     assert re.search(r"file_format\s*=\s*var\.file_format", code)
     assert "api_token" not in code and "password" not in code  # the token is only in the environment
-    has_upgrade = re.search(r"^\s*upgrade\s*=\s*false", code, re.M) is not None
-    assert has_upgrade == bool(terraform.INIT_UPGRADE_IN_SCHEMA)
+    has_upgrade = re.search(r"^\s*upgrade\s*=", code, re.M) is not None
+    assert has_upgrade == terraform.INIT_UPGRADE_SET_BY_MODULE
     assert re.search(r'value\s*=\s*proxmox_virtual_environment_vm\.vm\.vm_id', _module_text("outputs.tf"))
     # The VM's Linux user is the one Slipway logs in as everywhere (plan Decision 10).
     assert re.findall(r'^\s*username\s*=\s*"([^"]*)"', code, re.M) == [cloudinit.GUEST_USER]
