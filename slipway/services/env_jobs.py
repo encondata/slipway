@@ -1,4 +1,5 @@
-"""Jobs of a whole environment (phase 3 §9.5-9.14): activate, publish, discard, remove_slot and teardown.
+"""Jobs of a whole environment (phase 3 §9.5-9.14): activate, publish, discard, remove_slot and teardown; phase 4
+adds the certificate renewal and Deactivate (§13, §14.1).
 
 They are ``Deployment`` rows with ``environment_id`` set and no instance (D9); ``deployer.run_deployment`` hands
 them to ``run`` and calls the chain hook afterwards. Each job checks its refusals again in its first step,
@@ -9,6 +10,12 @@ command holds that host's lock as any other job's does.
 Also here, because they belong with these jobs: what recovery after a restart does to an interrupted one
 (``recover``, §9.13), Resolve of an unresolved switch (``resolve``, §9.12) and the rule a retry of an activate
 must meet (``retry_refusal``, §9.5 Retry).
+
+Phase 4 (§14.3): a DigitalOcean environment's load balancer is a traffic backend like Switchyard (``do_lb``), so
+Activate, Publish and Resolve go through ``traffic.backend_for``; its Remove slot deletes the droplet
+(``do_provision.remove_droplet``), its teardown deletes every DigitalOcean object in ``cloud``. A host an
+environment made (a droplet, a VM) is removed without SSH: its instance rows are deleted and the machine goes with
+the environment (``hosts.owned_by``, Decision 15).
 """
 
 from __future__ import annotations
@@ -35,20 +42,50 @@ from slipway.models import (
     DeploymentStatus,
     Environment,
     EnvironmentStatus,
+    Host,
+    HostStatus,
     Instance,
     InstanceStatus,
+    Machine,
+    MachineSnapshot,
+    MachineStage,
+    ProviderAccount,
     Resource,
+    TerraformState,
     User,
 )
 from slipway.models.environment import SECRETS_LOST
-from slipway.services import audit, cloudflare, data, deployer, environments, jobs, ssh, switchyard, traffic
+from slipway.services import (
+    audit,
+    backup_store,
+    cloudflare,
+    data,
+    deployer,
+    do_lb,  # registers the do_lb backend
+    do_provision,
+    do_rules,
+    environments,
+    hosts,
+    jobs,
+    machines,
+    provider_accounts,
+    resources,
+    ssh,
+    switchyard,
+    traffic,
+)
 from slipway.services.deployer import DeployError
+from slipway.services.digitalocean import DigitalOceanClient, DigitalOceanError
+from slipway.services.vmtypes import MachineError
 
 log = logging.getLogger(__name__)
 
 APP_SLOTS = environments.APP_SLOTS
 DATA_SLOT = environments.DATA_SLOT
 RESTARTED = "Slipway restarted during the switch"
+DO = do_provision.PROVIDER
+# A blocker of do_lb's plan that Activate's own ⟨certificate⟩ step fixes before the switch (phase 4 §14.3).
+CERT_NOT_COVERING = "The certificate doesn't cover "
 # Every slot's folder goes in this order (green first, so blue, the one most likely to serve, goes last).
 REMOVE_ORDER = ("green", "blue")
 
@@ -296,9 +333,10 @@ async def _fence(db: AsyncSession, er: _EnvRun, env: Environment, mem: dict[str,
     busy = await jobs.busy_job(db, env, data.env_keys(env.id, kind, er.options), exclude=er.dep_id)
     if busy is not None:
         return environments.busy_text(env, busy)
-    if target is not None and kind in (DeploymentKind.ACTIVATE, DeploymentKind.DISCARD, DeploymentKind.REMOVE_SLOT) \
-            and not target.host.is_pinned:
-        return jobs.UNPINNED.format(host=target.host.name)
+    if target is not None and kind in (DeploymentKind.ACTIVATE, DeploymentKind.DISCARD, DeploymentKind.REMOVE_SLOT):
+        problem = _host_problem(env, target, kind)
+        if problem:
+            return problem
     owner = environments.owner_in(env, mem)
     dirty = (owner.data_dirty if owner is not None else None) or {}
     if dirty.get("hold") and kind in jobs.HOLD_REFUSES and owner is not None:
@@ -310,9 +348,32 @@ async def _fence(db: AsyncSession, er: _EnvRun, env: Environment, mem: dict[str,
         recorded = target is not None and env.active_slot_id == target.id
         if not (unresolved and recorded):
             return environments.dirty_activate_text(env, owner, str(er.slot))
-    if unresolved and kind in (DeploymentKind.REMOVE_SLOT, DeploymentKind.DISCARD):
+    if unresolved and kind in (DeploymentKind.REMOVE_SLOT, DeploymentKind.DISCARD, DeploymentKind.CERTIFICATE):
         return unresolved
     return None
+
+
+def _host_problem(env: Environment, target: Instance, kind: str) -> str | None:
+    """The target's host must be one Slipway can reach: a host added by hand is pinned (P3); a host a provider
+    makes is built, except for Remove slot, which removes an owned host in any phase (Decision 28)."""
+    host = target.host
+    if host is None:  # a managed environment's data owner has no host
+        return None
+    if (host.provider or "ssh") == "ssh":
+        return None if host.is_pinned else jobs.UNPINNED.format(host=host.name)
+    if kind in jobs.REMOVING_KINDS and hosts.owned_by(env, host):
+        return None
+    if ssh.host_is_built(host):
+        return None
+    if kind == DeploymentKind.ACTIVATE and environments.is_vm_host(host):
+        return environments.VM_NOT_MADE.format(slot=target.slot or target.name)  # phase 5 §10.4
+    return jobs.NOT_BUILT.format(slot=target.slot or target.name)
+
+
+def _blocked(blockers: list[str]) -> str:
+    """A plan's blockers as the step's failure: ``<blockers>; Slipway changed nothing``, said once."""
+    text = "; ".join(blockers)
+    return text if text.endswith("Slipway changed nothing") else f"{text}; Slipway changed nothing"
 
 
 def _stays(from_slot: str | None) -> str:
@@ -359,6 +420,10 @@ async def _activate(er: _EnvRun) -> None:
             if problem is None and er.retry_of is not None:
                 parent = await db.get(Deployment, er.retry_of)
                 problem = await retry_refusal(db, parent) if parent is not None else None
+            if problem is None:
+                # P4 §13 at run time too: Retire may have landed after this activate was queued.
+                fenced = await jobs.production_problem(db, env, DeploymentKind.ACTIVATE, er.options, mem)
+                problem = fenced.text if fenced is not None else None
             problem = problem or await environments.activate_problem(db, env, slot, mem)
             ctx = None
             if problem is None and traffic.backend_for(env) is not None:
@@ -369,12 +434,16 @@ async def _activate(er: _EnvRun) -> None:
         target = er.members[slot]
         if ctx is not None:
             # The switch's plan, read only: a blocker refuses before the slot is started or a record written.
+            backend = traffic.backend_for(er.env)
             try:
-                plan = await traffic.backend_for(er.env).plan(ctx)
-            except (switchyard.SwitchyardError, traffic.TrafficError) as exc:
-                raise DeployError(f"Switchyard: {exc}; Slipway changed nothing") from None
-            if plan.blockers:
-                raise DeployError("; ".join(plan.blockers) + "; Slipway changed nothing")
+                plan = await backend.plan(ctx)
+            except (*backend.errors, traffic.TrafficError) as exc:
+                raise DeployError(f"{backend.label}: {exc}; Slipway changed nothing") from None
+            blockers = list(plan.blockers)
+            if er.steps.listed("certificate"):  # renewed before the switch, so it needn't cover the names yet
+                blockers = [b for b in blockers if not b.startswith(CERT_NOT_COVERING)]
+            if blockers:
+                raise DeployError(_blocked(blockers))
         if target.status == InstanceStatus.STOPPED and not er.steps.listed("start_slot"):
             at = next(i for i, r in enumerate(er.steps.rows) if r["key"] == "smoke")
             er.steps.rows.insert(at, {"key": "start_slot", "name": f"Start {slot}", "status": "pending"})
@@ -398,6 +467,11 @@ async def _activate(er: _EnvRun) -> None:
         if not check_result.ok:
             raise DeployError(f"{check_result.message}. Nothing has changed")
         return "succeeded", None
+
+    async def certificate() -> tuple[str, str | None]:
+        # The served certificate doesn't cover the slot's names or is due (§14.3): renewed for every slot's live
+        # names, so the slot giving up traffic keeps its names for a Switch back.
+        return "succeeded", await _renew(er)
 
     async def dns() -> tuple[str, str | None]:
         env, mem = await _env_now(er)
@@ -456,6 +530,7 @@ async def _activate(er: _EnvRun) -> None:
     await _step(er, "check", check)
     await _step(er, "start_slot", start_slot)
     await _step(er, "smoke", smoke)
+    await _step(er, "certificate", certificate)
     await _step(er, "dns", dns)
     await _step(er, "switch", switch)
     await _step(er, "seed", seed, never_fail=True)
@@ -487,8 +562,13 @@ async def _seed_skip(db: AsyncSession, env: Environment | None, owner: Instance 
         return "The environment has no data owner"
     if not owner.seed_content:
         return f"Starter content is off for {env.name}"
+    # A managed environment's owner is never deployed (Decision 21): its data starts on the app slots' deploys,
+    # whose backup step records that it started empty, or seeds it from the owner's snapshot (P4 §10.4).
+    ids = [owner.id]
+    if data.hostless(owner):
+        ids += [m.id for m in environments.app_members(await environments.members(db, env))]
     deploys = (await db.scalars(select(Deployment).options(defer(Deployment.log)).where(
-        Deployment.instance_id == owner.id, Deployment.kind == DeploymentKind.DEPLOY))).all()
+        Deployment.instance_id.in_(ids), Deployment.kind == DeploymentKind.DEPLOY))).all()
     if any(d.snapshot_id is not None for d in deploys):
         return f"{env.name}'s data came from a snapshot: starter content is only added after an empty start"
     if not any((d.options or {}).get("started_empty") for d in deploys):
@@ -516,6 +596,21 @@ async def _record_switched(er: _EnvRun, target: Instance, from_slot: str | None,
     er.live = True
 
 
+async def _refresh_owner_mirror(db: AsyncSession, env: Environment) -> None:
+    """A managed environment's host-less data owner mirrors its data runner's live release (``data.runner_live``,
+    P4 §10.4). The runner can change when the lead slot does (Activate, Deactivate, Resolve) or when a slot goes
+    (Remove slot), so those writes refresh the mirror in their own transaction. Other environments: nothing."""
+    if env.data_mode != DataMode.MANAGED:
+        return
+    mem = await environments.members(db, env)
+    owner = mem.get(environments.DATA_SLOT)
+    if owner is None or not data.hostless(owner):
+        return
+    state = data.runner_live(owner, data.runner_choice(env, mem).instance)
+    if state != (owner.app_state or {}):
+        owner.app_state = state
+
+
 async def _record_active(er: _EnvRun, target: Instance, from_slot: str | None, back: bool) -> None:
     """§9.5 step 6, after the switch's check passed, in one transaction: the active slot, the last switch, no
     unresolved switch, status ``live``, and the audit row."""
@@ -530,6 +625,7 @@ async def _record_active(er: _EnvRun, target: Instance, from_slot: str | None, b
         env.traffic_state = state
         if env.status == EnvironmentStatus.NEW:
             env.status = EnvironmentStatus.LIVE
+        await _refresh_owner_mirror(db, env)
         audit.record(db, "environment.activate", actor=er.user, target=env,
                      summary=f"{er.label}: {env.name}'s traffic moved to {target.slot}"
                              + (f" from {from_slot}" if from_slot else ""),
@@ -564,7 +660,7 @@ async def _publish(er: _EnvRun) -> None:
                                         connect=er.connect)
         plan = await backend.plan(ctx)  # reads only: a blocker fails the step before any write
         if plan.blockers:
-            raise DeployError("; ".join(plan.blockers) + "; Slipway changed nothing")
+            raise DeployError(_blocked(plan.blockers))
         result = await traffic.sync(ctx)
         notes = list(ctx.notes)
         if result.skipped:
@@ -701,7 +797,11 @@ async def _discard(er: _EnvRun) -> None:
 async def _remove_instance(er: _EnvRun, instance_id: uuid.UUID, *, action: str) -> tuple[bool, str | None]:
     """``deployer.destroy`` of a member (its containers and folder; volumes stay, backups move to
     ``.slipway-kept``), then its row in a transaction of its own; its deployments go with it. ``(removed,
-    warning)``; ``removed`` is False when the row was already gone. Leftover containers raise and keep the row."""
+    warning)``; ``removed`` is False when the row was already gone. Leftover containers raise and keep the row.
+
+    A member on a host the environment made (a droplet, a VM) is removed without SSH: only its row goes, and the
+    machine goes with the environment (Decision 15). A member with no host (a managed environment's data owner)
+    has nothing on any host; the backups Slipway stored for it are moved aside (phase 4 §10.5)."""
     async with session_scope() as db:
         inst = await db.get(Instance, instance_id)
         if inst is None:
@@ -709,10 +809,20 @@ async def _remove_instance(er: _EnvRun, instance_id: uuid.UUID, *, action: str) 
         started = inst.status != InstanceStatus.CREATED or await db.scalar(
             select(Deployment.id).where(Deployment.instance_id == inst.id, Deployment.started_at.is_not(None))
             .limit(1)) is not None
+    host = inst.host
+    owned = hosts.owned_by(er.env.id, host)
     warning: str | None = None
     report: dict[str, Any] = {}
-    if started:
-        await er.say(f"Removing {inst.name}'s containers and folder from {inst.host.name}; its volumes stay")
+    if host is None:
+        kept = backup_store.keep(inst, env_name=er.env.name, env_id=er.env.id)
+        if kept is not None:
+            report.update(backups=True, kept_backups=str(kept))
+            await er.say(f"The backups Slipway stored for {inst.name} were moved to {kept}")
+    elif owned:
+        await er.say(f"Removing {inst.name}: {host.name} is a {hosts.kind_of(host)} Slipway made for "
+                     f"{er.env.name}, so nothing is run on it")
+    elif started:
+        await er.say(f"Removing {inst.name}'s containers and folder from {host.name}; its volumes stay")
         warning = await deployer.destroy(inst, connect=er.connect, report=report)
         if warning:
             await er.say(warning)
@@ -724,49 +834,313 @@ async def _remove_instance(er: _EnvRun, instance_id: uuid.UUID, *, action: str) 
             if (state.get("last_slot_deploy") or {}).get("slot") == inst.slot:
                 state["last_slot_deploy"] = None
                 env.traffic_state = state
-        details: dict[str, Any] = {"slot": inst.slot, "host": inst.host.name}
+            await _refresh_owner_mirror(db, env)
+        details: dict[str, Any] = {"slot": inst.slot, "host": host.name if host is not None else None}
+        if owned:
+            details["owned"] = True
         if warning:
             details["warning"] = warning
         if report.get("backups"):
             details.update(kept_backups=report["backups"], kept_backups_folder=report.get("kept_backups"))
+        where = f" from {host.name}" if host is not None else ""
         audit.record(db, action, actor=er.user, target=env if action.startswith("environment.") else inst,
-                     summary=f"Removed {inst.name} from {inst.host.name}" + (f". {warning}" if warning else ""),
+                     summary=f"Removed {inst.name}{where}" + (f". {warning}" if warning else ""),
                      details=details)
     await er.say(f"Removed {inst.name}")
     return True, warning
 
 
+async def _provision(er: _EnvRun) -> do_provision.ProvisionContext:
+    """The DigitalOcean steps' context for an environment-level job: no instance, the job's log, its redactor
+    (with the account's token in it) and its SSH factory."""
+    async with session_scope() as db:
+        env = await db.get(Environment, er.env.id)
+        account = await db.get(ProviderAccount, env.provider_account_id) \
+            if env is not None and env.provider_account_id else None
+    await deployer._hide_account(er.job, account)
+    return do_provision.ProvisionContext(environment_id=er.env.id, instance_id=None, deployment_id=er.dep_id,
+                                         say=er.say, redactor=er.job.hide, connect=er.connect, actor=er.user)
+
+
+async def _do_check(er: _EnvRun, env: Environment, *, objects: bool = False) -> None:
+    """The reads a DigitalOcean job's ``check`` makes before it changes anything: the token still answers for
+    the team the environment was built in (D3), and with ``objects`` every recorded object still carries
+    Slipway's marks (J5, ``do_provision.check_all``). Writes nothing; raises DeployError."""
+    ctx = await _provision(er)
+    async with session_scope() as db:
+        account = await db.get(ProviderAccount, env.provider_account_id) if env.provider_account_id else None
+    if account is None or account.is_removed:
+        raise DeployError(f"{env.name}'s DigitalOcean account is gone, so Slipway can't reach its objects")
+    if not account.secret:
+        raise DeployError(f"{account.name} has no API token: set it in Settings → Integrations, then retry")
+    try:
+        async with DigitalOceanClient(account.secret, redactor=ctx.redactor) as client:
+            if env.provider_team:
+                team = provider_accounts.team_of(await client.account())
+                if team["id"] != env.provider_team:
+                    raise DeployError(f"{account.name}'s token answers for team {team['name']}, not the team "
+                                      f"{env.name} was built in: Slipway changed nothing")
+            if objects:
+                await do_provision.check_all(do_provision._Teardown(ctx, env, account, client))
+    except DigitalOceanError as exc:
+        raise DeployError(str(do_provision.step_error(account.name, exc))) from None
+    except do_provision.ProvisionError as exc:
+        raise DeployError(str(exc)) from None
+
+
+async def _droplet_left(env: Environment, slot: str) -> bool:
+    """Whether Remove slot has more to do for ``slot`` on DigitalOcean: a ``droplet`` row (a pending one too) or
+    the slot's owned host row is still there (§14.3's narrowed retry rule)."""
+    name = do_rules.droplet_name(env.name, slot)
+    async with session_scope() as db:
+        rows = [r for r in await resources.owned(db, env.id, DO, "droplet", include_pending=True) if r.name == name]
+        host = await db.scalar(select(Host.id).where(Host.owner_environment_id == env.id, Host.name == name))
+    return bool(rows) or host is not None
+
+
 async def _remove_slot(er: _EnvRun) -> None:
-    """Remove a slot (§9.9): ``check, slot``. The data server and its data aren't touched."""
+    """Remove a slot (§9.9): ``check, slot``. The data server and its data aren't touched. On DigitalOcean the
+    ``slot`` step deletes the slot's droplet, its row, the cluster's trusted source, the instance row and the
+    host row, in that order, then drops the plan to one droplet (phase 4 §9.3, §14.3).
+
+    A slot on a VM (phase 5 §9.5): ``check, slot, machine``. ``check`` also reads that the VM can go
+    (``machines.blockers``, D26) before anything changes; ``slot`` deletes the instance row without SSH;
+    ``machine`` removes the VM and its rows (``machines.remove``), or forgets it on a retry with ``forget_vms``
+    when its only blockers are forgettable."""
     slot = str(er.slot or "")
+    forget_vms = bool(er.options.get("forget_vms"))
 
     async def check() -> tuple[str, str | None]:
         async with session_scope() as db:
             env = await db.get(Environment, er.env.id)
             assert env is not None
             mem = await environments.members(db, env)
-            if slot in APP_SLOTS and slot not in mem and er.retry_of is not None:
-                return "succeeded", f"{slot} was already removed"
+            left = await environments.env_machines(db, env, [slot]) if slot in APP_SLOTS else []
+        if slot in APP_SLOTS and slot not in mem and er.retry_of is not None:
+            if environments.is_digitalocean(env) and await _droplet_left(env, slot):
+                return "succeeded", f"{slot}'s droplet isn't removed yet; Slipway goes on from where it stopped"
+            if left:
+                await _vm_check(er, env, [slot], forget_vms=forget_vms)
+                await _list_step(er, "machine", vm=left[0].name)
+                return "succeeded", (f"{slot}'s VM {left[0].name} isn't removed yet; Slipway goes on from where it "
+                                     "stopped")
+            return "succeeded", f"{slot} was already removed"
+        async with session_scope() as db:
+            env = await db.get(Environment, er.env.id)
+            assert env is not None
+            mem = await environments.members(db, env)
             problem = await _fence(db, er, env, mem, mem.get(slot)) \
-                or await environments.remove_slot_problem(db, env, slot, mem)
+                or await environments.remove_slot_problem(db, env, slot, mem, read_vms=False)
         if problem:
             raise DeployError(problem)
+        if left:
+            await _vm_check(er, env, [slot], forget_vms=forget_vms)
+            await _list_step(er, "machine", vm=left[0].name)
         return "succeeded", None
 
     async def remove() -> tuple[str, str | None]:
         env, mem = await _env_now(er)
         target = mem.get(slot)
+        if environments.is_digitalocean(env):
+            return "succeeded", await _remove_droplet(er, env, slot, target)
         if target is None:
             return "succeeded", "Already removed"
-        host = target.host.name
+        host = target.host.name if target.host is not None else None
+        on_vm = environments.is_vm_host(target.host) and hosts.owned_by(env, target.host)
         _, warning = await _remove_instance(er, target.id, action="environment.slot_remove")
         notes = [warning] if warning else []
-        if env.data_mode == DataMode.SERVER:
+        if on_vm and er.steps.listed("machine"):
+            notes.append(f"{host} goes in the next step")
+        if env.data_mode == DataMode.SERVER and host is not None:
             notes.append(f"{env.name}'s data server still lets {host} in: update it to stop that")
-        return "succeeded", " ".join(notes) or None
+        return "succeeded", ("; " if on_vm else " ").join(notes) or None
+
+    async def machine() -> tuple[str, str | None]:
+        env, _ = await _env_now(er)
+        return await _remove_vms(er, env, [slot], forget=forget_vms)
 
     await _step(er, "check", check)
     await _step(er, "slot", remove)
+    await _step(er, "machine", machine)
+
+
+async def _remove_droplet(er: _EnvRun, env: Environment, slot: str, target: Instance | None) -> str | None:
+    """Remove slot's ``slot`` step on DigitalOcean: ``do_provision.remove_droplet`` (no SSH; the droplet goes),
+    then the ``environment.slot_remove`` audit when the slot's instance was still there."""
+    name = target.host.name if target is not None and target.host is not None else do_rules.droplet_name(env.name, slot)
+    note = await do_provision.remove_droplet(await _provision(er), slot)
+    if target is not None:
+        async with session_scope() as db:
+            row = await db.get(Environment, env.id)
+            audit.record(db, "environment.slot_remove", actor=er.user, target=row,
+                         summary=f"Removed {target.name} and its droplet {name}",
+                         details={"slot": slot, "host": name, "owned": True})
+        await er.say(f"Removed {target.name}")
+    return note
+
+
+# ------------------------------------------------------------------------------- VMs (phase 5)
+
+
+async def _list_step(er: _EnvRun, key: str, *, vm: str = "") -> None:
+    """List ``key`` (``machine`` or ``machines``) when the job's steps don't have it yet: a retry queued after its
+    slot instance went, or a teardown queued before the environment's VMs were known. ``machines`` goes before
+    ``forget``; ``machine`` last."""
+    if er.steps.listed(key):
+        return
+    name = environments.ENV_STEP_NAMES[key].format(vm=vm)
+    at = next((i for i, r in enumerate(er.steps.rows) if r["key"] == "forget"), len(er.steps.rows)) \
+        if key == "machines" else len(er.steps.rows)
+    er.steps.rows.insert(at, {"key": key, "name": name, "status": "pending"})
+    await er.steps._save()
+
+
+async def _vm_context(er: _EnvRun, machine_id: uuid.UUID) -> machines.MachineContext | None:
+    """A VM's context for this job: its log, its redactor (the account's secret added) and its SSH factory."""
+    async with session_scope() as db:
+        ctx = await machines.load_context(
+            db, machine_id=machine_id, deployment_id=er.dep_id, user_id=er.user.id if er.user is not None else None,
+            say=er.say, hide=er.job.hide, connect=er.connect)
+    if ctx is not None:
+        await deployer._hide_account(er.job, ctx.account)
+    return ctx
+
+
+async def _vm_check(er: _EnvRun, env: Environment, slots: list[str] | None, *, forget_vms: bool) -> None:
+    """``check``'s reads of the VMs a Remove slot or a teardown removes (phase 5 D26): any blocker fails the step
+    with its text before anything changes; with ``forget_vms``, forgettable ones pass."""
+    async with session_scope() as db:
+        rows = await environments.env_machines(db, env, slots)
+        account_ids = {m.account_id for m in rows}
+        for account_id in account_ids:
+            await deployer._hide_account(er.job, await db.get(ProviderAccount, account_id))
+        found = await environments.vm_blockers(
+            db, env, slots, say=er.say, hide=er.job.hide, deployment_id=er.dep_id,
+            user_id=er.user.id if er.user is not None else None, connect=er.connect)
+    for machine, blocker in found:
+        await er.say(f"{machine.name} can't be removed now: {blocker.text}"
+                     + (" (forgettable)" if blocker.forgettable else ""))
+    stop = environments.stopping_blocker(found, forget_vms=forget_vms)
+    if stop:
+        raise DeployError(stop)
+    if found:
+        await er.say("Slipway forgets the VMs it can't remove, as the retry asked")
+
+
+def _vm_goes_later(er: _EnvRun, inst: Instance) -> bool:
+    """A member whose host is one of the environment's VMs, which the job's ``machines`` step removes."""
+    return environments.is_vm_host(inst.host) and hosts.owned_by(er.env.id, inst.host) and er.steps.listed("machines")
+
+
+def _vm_step_name(er: _EnvRun) -> str:
+    return next((r["name"] for r in er.steps.rows if r["key"] == "machines"), environments.ENV_STEP_NAMES["machines"])
+
+
+def _vm_status(done: list[str]) -> str:
+    """A removal that forgot a VM, or left files on the hypervisor, ends as a warning."""
+    return "warning" if any(line.startswith(("Forgot ", "ESXi left ")) for line in done) else "succeeded"
+
+
+async def _remove_vms(er: _EnvRun, env: Environment, slots: list[str] | None, *,
+                      forget: bool) -> tuple[str, str | None]:
+    """Remove the VMs of ``slots`` (every VM when None) with ``machines.remove``, green, then blue, then data
+    (phase 5 §9.5, §9.9). When an app VM can't be removed, the data VM is kept and the step fails naming both."""
+    async with session_scope() as db:
+        rows = await environments.env_machines(db, env, slots)
+    if not rows:
+        return "succeeded", "Already removed"
+    data_vm = next((m for m in rows if m.slot == DATA_SLOT), None)
+    done: list[str] = []
+    for machine in rows:
+        ctx = await _vm_context(er, machine.id)
+        if ctx is None:
+            continue
+        try:
+            lines = await machines.remove(ctx, forget=forget)
+        except MachineError as exc:
+            if data_vm is not None and machine.slot != DATA_SLOT:
+                raise DeployError(f"Slipway couldn't remove {machine.name}: {exc.text}. {data_vm.name} was kept; "
+                                  "retry once that is fixed") from None
+            raise DeployError(exc.text) from None
+        for line in lines:
+            await er.say(line)
+        done.extend(lines)
+    return _vm_status(done), "; ".join(done) or None
+
+
+async def forget_vm(env_id: uuid.UUID, slot: str, *, actor: User | None, request: Any = None) -> str:
+    """Forget a lost VM (phase 5 §9.10) for S22's ``POST /environments/{id}/machines/{slot}/forget``: its refusals
+    (``environments.forget_vm_problem``), then under both environment keys and in one transaction the ``vm``
+    resource rows forgotten, the Terraform state and VM snapshots deleted, the machine back to ``planned`` (an
+    ESXi VM gets a new host key pair), the host unpinned, and the slot ``created`` and stale; audit
+    ``machine.forget`` (``why: lost``). The working folder goes after the commit. Returns the text for the user.
+
+    Raises ``jobs.JobRefused`` (409; 502 when the account can't be checked) and ``deployer.RunnerBusy`` while a
+    job holds the environment's keys. The typed name and the permissions are the caller's."""
+    async with deployer.runner.exclusive(data.env_keys(env_id, None)):
+        async with session_scope() as db:
+            env = await db.get(Environment, env_id)
+            if env is None or env.is_deleted:
+                raise jobs.JobRefused(404, "No such environment")
+            problem = await environments.forget_vm_problem(db, env, slot)
+            if problem is not None:
+                raise problem
+            (machine,) = await environments.env_machines(db, env, [slot])
+            machine_id = machine.id
+        async with session_scope() as db:
+            env = await db.get(Environment, env_id)
+            machine = await db.get(Machine, machine_id, with_for_update=True)
+            assert env is not None and machine is not None
+            host = await db.get(Host, machine.host_id, with_for_update=True)
+            account = await db.get(ProviderAccount, machine.account_id)
+            inst = await db.scalar(select(Instance).where(Instance.environment_id == env.id, Instance.slot == slot))
+            old_ids = dict(machine.ids or {})
+            name, provider, ids_label = machine.name, machine.provider, machines.ids_text(machine)
+            address = (machine.network or {}).get("address")
+            for row in await db.scalars(select(Resource).where(
+                    Resource.provider == provider, Resource.kind == machines.VM_KIND)):
+                if str((row.details or {}).get("machine_id") or "") != str(machine.id):
+                    continue
+                audit.record(db, "resource.forget", actor=actor, target=row, request=request,
+                             summary=f"Forgot {provider} vm {row.provider_id} ({row.name})",
+                             details={"provider": row.provider, "kind": row.kind, "name": row.name,
+                                      "provider_id": row.provider_id, "environment_id": str(row.environment_id)})
+                await db.delete(row)
+            await db.execute(delete(TerraformState).where(TerraformState.machine_id == machine.id))
+            await db.execute(delete(MachineSnapshot).where(MachineSnapshot.machine_id == machine.id))
+            machine.stage = MachineStage.PLANNED.value
+            machine.ids = {}
+            machine.applied = None
+            machine.ready_at = None
+            machine.host_key_public = None
+            machine.last_task = None
+            machine.last_error = None
+            machine.snapshot_mode = None
+            if provider == "esxi":
+                machine.host_key_private, machine.host_key_public = machines._host_key_pair(name)
+            if host is not None:
+                host.host_key = None
+                host.host_key_fingerprint = None
+                host.status = HostStatus.UNKNOWN
+                hosts.set_phase(host, hosts.PHASE_PLANNED, stage=MachineStage.PLANNED.value, from_stage=None)
+            if inst is not None:
+                state = dict(inst.slot_state or {})
+                state["stale"] = {"reason": "Its VM was lost; the next deploy makes a new one",
+                                  "at": utcnow().isoformat(), "deployment_id": None}
+                inst.slot_state = state
+                inst.status = InstanceStatus.CREATED
+                inst.app_state = None
+            audit.record(db, "machine.forget", actor=actor, target=machine, request=request,
+                         summary=f"Forgot {name} ({ids_label} on "
+                                 f"{account.name if account is not None else 'its account'}): it was lost",
+                         details={"name": name, "ids": old_ids, "why": "lost", "environment": env.name, "slot": slot})
+    if provider == "proxmox":
+        from slipway.core.config import get_settings
+        from slipway.services import terraform
+
+        with contextlib.suppress(Exception):
+            terraform.Workdir(terraform.TerraformSettings.from_config(get_settings()).dir, machine_id).remove()
+    return f"Slipway forgot {name}; the next deploy to {slot} makes a new VM at {address}"
 
 
 # ----------------------------------------------------------------------------- teardown
@@ -783,8 +1157,18 @@ async def _rows(db: AsyncSession, env_id: uuid.UUID, provider: str | None = None
 async def _teardown(er: _EnvRun) -> None:
     """Delete the environment (§9.10): ``check, unroute, undns, slots, data_server, forget``. Every step can run
     again: a retry skips what is already gone. Volumes and backups stay on the data host; claimed DNS records and
-    whatever Slipway didn't make stay where they are."""
+    whatever Slipway didn't make stay where they are.
+
+    On DigitalOcean (phase 4 §14.3): ``check, undns, slots, data_server, cloud, forget``. ``check`` also reads
+    every recorded object's marks before anything changes; ``slots`` and ``data_server`` delete the instance
+    rows without SSH (the droplets go in ``cloud``); ``cloud`` deletes every DigitalOcean object
+    (``do_provision.destroy``).
+
+    With VMs (phase 5 §9.9): ``check`` also reads that every VM can go (D26) before ``unroute``; ``slots`` and
+    ``data_server`` delete the rows of members on the environment's VMs without SSH; ``machines`` removes the
+    VMs, green, then blue, then data, keeping the data VM when an app VM can't go."""
     forget_traffic = bool(er.options.get("forget_traffic"))
+    forget_vms = bool(er.options.get("forget_vms"))
 
     async def check() -> tuple[str, str | None]:
         async with session_scope() as db:
@@ -794,8 +1178,18 @@ async def _teardown(er: _EnvRun) -> None:
             problem = await _fence(db, er, env, mem, None)
             if problem is None and env.status != EnvironmentStatus.DELETING:
                 problem = f"{env.name} isn't being deleted: use Delete on the environment page"
+            if problem is None:
+                # P4 §13: a production teardown reads the retiring, off-the-air and snapshot rules again.
+                fenced = await jobs.production_problem(db, env, DeploymentKind.TEARDOWN, er.options, mem)
+                problem = fenced.text if fenced is not None else None
+            vms = [] if environments.is_digitalocean(env) else await environments.env_machines(db, env)
         if problem:
             raise DeployError(problem)
+        if environments.is_digitalocean(env):
+            await _do_check(er, env, objects=True)
+        if vms:
+            await _vm_check(er, env, None, forget_vms=forget_vms)
+            await _list_step(er, "machines")
         return "succeeded", None
 
     async def unroute() -> tuple[str, str | None]:
@@ -839,6 +1233,7 @@ async def _teardown(er: _EnvRun) -> None:
     async def slots() -> tuple[str, str | None]:
         _, mem = await _env_now(er)
         notes: list[str] = []
+        later: list[str] = []
         removed = 0
         for slot in REMOVE_ORDER:
             inst = mem.get(slot)
@@ -848,8 +1243,12 @@ async def _teardown(er: _EnvRun) -> None:
             removed += int(done)
             if warning:
                 notes.append(warning)
+            if done and _vm_goes_later(er, inst):
+                later.append(inst.host.name)
         if not removed:
             return "succeeded", "Already removed"
+        if later:  # phase 5 §9.9: their VMs go in the machines step
+            notes.append(f"{' and '.join(later)} {'go' if len(later) > 1 else 'goes'} in {_vm_step_name(er)}")
         return "succeeded", " ".join(notes) or None
 
     async def data_server() -> tuple[str, str | None]:
@@ -858,8 +1257,18 @@ async def _teardown(er: _EnvRun) -> None:
         if inst is None:
             return ("skipped", f"{env.name} keeps its data in its slot") if env.data_mode == DataMode.SLOT \
                 else ("succeeded", "Already removed")
-        _, warning = await _remove_instance(er, inst.id, action="instance.delete")
+        done, warning = await _remove_instance(er, inst.id, action="instance.delete")
+        if done and _vm_goes_later(er, inst):
+            return "succeeded", "; ".join([*([warning] if warning else []),
+                                           f"{inst.host.name} goes in {_vm_step_name(er)}"])
         return "succeeded", warning
+
+    async def cloud() -> tuple[str, str | None]:
+        return "succeeded", await do_provision.destroy(await _provision(er))
+
+    async def vms() -> tuple[str, str | None]:
+        env, _ = await _env_now(er)
+        return await _remove_vms(er, env, None, forget=forget_vms)
 
     async def forget() -> tuple[str, str | None]:
         async with session_scope() as db:
@@ -877,7 +1286,10 @@ async def _teardown(er: _EnvRun) -> None:
             env.deleted_at = utcnow()
             env.deleted_by_id = er.user.id if er.user is not None else None
             env.active_slot_id = None
-            env.notice = None
+            # A VM this job forgot (forget_vms) left its notice, naming it for removal by hand (phase 5 §9.9): it
+            # stays. Any other notice goes.
+            if not (isinstance(env.notice, dict) and env.notice.get("deployment_id") == er.dep_id.hex):
+                env.notice = None
             audit.record(db, "environment.delete", actor=er.user, target=env, summary=f"Deleted environment {env.name}",
                          details={"snapshot": er.options.get("snapshot"), "forget_traffic": forget_traffic})
         return "succeeded", None
@@ -887,7 +1299,122 @@ async def _teardown(er: _EnvRun) -> None:
     await _step(er, "undns", undns)
     await _step(er, "slots", slots)
     await _step(er, "data_server", data_server)
+    await _step(er, "cloud", cloud)
+    await _step(er, "machines", vms)
     await _step(er, "forget", forget)
+
+
+# ------------------------------------------------------------------- the certificate (phase 4 §14.3, §15.8)
+
+
+async def _renew(er: _EnvRun) -> str:
+    """``do_provision.renew`` under do_lb's lock, which every write of the load balancer holds (§11.6)."""
+    ctx = await _provision(er)
+    async with do_lb.lock_for(er.env.id):
+        return await do_provision.renew(ctx, hold_lock=False)
+
+
+async def _certificate(er: _EnvRun) -> None:
+    """Renew the certificate: ``check, certificate``. ``check`` reads the fences (an unresolved switch among
+    them), that a load balancer is recorded and that the token still answers for the environment's team;
+    ``certificate`` orders a new certificate when one is due, swaps it into the load balancer's HTTPS rule and
+    deletes the old ones. A failure leaves the old certificate serving."""
+
+    async def check() -> tuple[str, str | None]:
+        async with session_scope() as db:
+            env = await db.get(Environment, er.env.id)
+            assert env is not None
+            mem = await environments.members(db, env)
+            problem = await _fence(db, er, env, mem, None)
+            if problem is None and (env.traffic or {}).get("switch") != environments.DO_LB:
+                problem = f"{env.name} has no load balancer: only a DigitalOcean environment renews a certificate"
+            if problem is None and not await resources.owned(db, env.id, DO, do_lb.LB_KIND):
+                problem = f"{env.name} has no load balancer yet: deploy it first"
+        if problem:
+            raise DeployError(problem)
+        await _do_check(er, env)
+        return "succeeded", None
+
+    async def certificate() -> tuple[str, str | None]:
+        return "succeeded", await _renew(er)
+
+    await _step(er, "check", check)
+    await _step(er, "certificate", certificate)
+
+
+# --------------------------------------------------------------------------- Deactivate (phase 4 §13)
+
+
+async def _deactivate(er: _EnvRun) -> None:
+    """Take a retiring production environment off the air: ``check, switch``. The switch empties the load
+    balancer's targets and proves it (``traffic.switch`` in mode ``deactivate``, no public check: the names
+    answer 503 by design); only then is ``active_slot_id`` cleared. A failure puts the targets back."""
+
+    async def check() -> tuple[str, str | None]:
+        async with session_scope() as db:
+            env = await db.get(Environment, er.env.id)
+            assert env is not None
+            mem = await environments.members(db, env)
+            problem = await _fence(db, er, env, mem, None) or environments.deactivate_problem(env, mem)
+            ctx = await traffic.context(db, env, "deactivate") if problem is None else None
+        if problem:
+            raise DeployError(problem)
+        await _env_now(er)
+        backend = traffic.backend_for(er.env)
+        try:
+            plan = await backend.plan(ctx)
+        except (*backend.errors, traffic.TrafficError) as exc:
+            raise DeployError(f"{backend.label}: {exc}; Slipway changed nothing") from None
+        if plan.blockers:
+            raise DeployError(_blocked(plan.blockers))
+        return "succeeded", None
+
+    async def switch() -> tuple[str, str | None]:
+        env, _ = await _env_now(er)
+        async with session_scope() as db:
+            ctx = await traffic.context(db, env, "deactivate", deployment_id=er.dep_id, say=er.say,
+                                        connect=er.connect)
+        er.switch_ctx = ctx
+        result = await traffic.switch(ctx)  # SwitchRefused / SwitchFailed carry the text the step fails with
+        await _record_deactivated(er, ctx)
+        if result.warnings:
+            return "warning", "; ".join(result.warnings)
+        return "succeeded", f"{env.name}'s names now answer 503: no slot takes its traffic"
+
+    await _step(er, "check", check)
+    await _step(er, "switch", switch)
+
+
+async def _record_deactivated(er: _EnvRun, ctx: traffic.SwitchContext) -> None:
+    """Record that no slot takes the traffic, even when the job is cancelled meanwhile: the targets are empty.
+    When it can't be recorded, the switch is unresolved."""
+    task = asyncio.ensure_future(_write_deactivated(er, ctx.from_slot))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task})
+        er.live = not task.cancelled() and task.exception() is None
+        raise
+    except Exception as exc:
+        await traffic._mark_unresolved(ctx, f"Traffic was taken off {ctx.from_slot or 'every slot'}, but Slipway "
+                                            f"couldn't record it ({exc})")
+        raise
+    er.live = True
+
+
+async def _write_deactivated(er: _EnvRun, from_slot: str | None) -> None:
+    """In one transaction: no active slot, no unresolved switch, and when it happened (``traffic_state``'s
+    ``deactivated``, which recovery reads). The queue's caller audits the job (Decision 42)."""
+    async with session_scope() as db:
+        env = await db.get(Environment, er.env.id, with_for_update=True)
+        assert env is not None
+        env.active_slot_id = None
+        state = dict(env.traffic_state or {})
+        state["unresolved"] = None
+        state["deactivated"] = {"deployment_id": str(er.dep_id), "from_slot": from_slot, "at": utcnow().isoformat()}
+        env.traffic_state = state
+        await _refresh_owner_mirror(db, env)
+    await er.say(f"No slot takes {er.env.name}'s traffic now" + (f"; {from_slot} stays as it is" if from_slot else ""))
 
 
 _HANDLERS: dict[str, Callable[[_EnvRun], Awaitable[None]]] = {
@@ -896,6 +1423,8 @@ _HANDLERS: dict[str, Callable[[_EnvRun], Awaitable[None]]] = {
     DeploymentKind.DISCARD: _discard,
     DeploymentKind.REMOVE_SLOT: _remove_slot,
     DeploymentKind.TEARDOWN: _teardown,
+    DeploymentKind.CERTIFICATE: _certificate,
+    DeploymentKind.DEACTIVATE: _deactivate,
 }
 
 
@@ -918,16 +1447,32 @@ async def recover(db: AsyncSession, dep: Deployment) -> None:
     * An activate that was switching: traffic may be split, so the switch is unresolved (Resolve or another
       activate settles it). One whose switch was already recorded as the active slot did move traffic and
       succeeded; starter content it didn't add is left pending.
+    * A Deactivate that was switching (phase 4 §15.13): the same rule. One whose empty targets were recorded
+      succeeded; otherwise the switch is unresolved.
     * A teardown: the environment stays ``deleting``; only its retry runs.
-    * Publish, discard, remove_slot: nothing beyond the failed status (discard writes the owner's dirty state
-      last, in ``settle``).
+    * Publish, discard, remove_slot, a certificate renewal: nothing beyond the failed status (discard writes the
+      owner's dirty state last, in ``settle``; a renewal's pending certificate row is picked up by its next run).
+
+    Only a Switchyard switch holds Slipway's staged edits in Switchyard (``switchyard.hold_in``); the record's
+    ``backend`` says which one wrote, and a record from before it named one is Switchyard's (Decision 17).
     """
-    if dep.instance_id is not None or dep.environment_id is None or dep.kind != DeploymentKind.ACTIVATE:
+    if dep.instance_id is not None or dep.environment_id is None \
+            or dep.kind not in (DeploymentKind.ACTIVATE, DeploymentKind.DEACTIVATE):
         return
     env = await db.get(Environment, dep.environment_id, with_for_update=True)
     if env is None or not _switch_began(dep):
         return
     state = dict(env.traffic_state or {})
+    record = (dep.options or {}).get("switch") or {}
+    if dep.kind == DeploymentKind.DEACTIVATE:
+        if data._uuid((state.get("deactivated") or {}).get("deployment_id")) == dep.id:
+            # The empty targets were proved and recorded: Deactivate stands.
+            dep.steps = [dict(r, status="succeeded", note=None) if r.get("key") == "switch"
+                         and r.get("status") == "failed" else dict(r) for r in dep.steps or []]
+            dep.status, dep.error = DeploymentStatus.SUCCEEDED, None
+            return
+        await _recover_unresolved(db, env, dep, state, record, to_slot=None)
+        return
     last = state.get("last") or {}
     if data._uuid(last.get("deployment_id")) == dep.id:
         # The switch passed its check and was recorded: the activation stands.
@@ -948,15 +1493,21 @@ async def recover(db: AsyncSession, dep: Deployment) -> None:
             if owner is not None:
                 owner.content_pending = True
         return
-    record = (dep.options or {}).get("switch") or {}
+    await _recover_unresolved(db, env, dep, state, record,
+                              to_slot=record.get("to_slot") or (dep.options or {}).get("slot"))
+
+
+async def _recover_unresolved(db: AsyncSession, env: Environment, dep: Deployment, state: dict[str, Any],
+                              record: dict[str, Any], *, to_slot: str | None) -> None:
     state["unresolved"] = {"deployment_id": str(dep.id), "from_slot": record.get("from_slot"),
-                           "to_slot": record.get("to_slot") or (dep.options or {}).get("slot"),
-                           "message": RESTARTED, "at": utcnow().isoformat()}
+                           "to_slot": to_slot, "message": RESTARTED, "at": utcnow().isoformat()}
     env.traffic_state = state
-    # What the cut-off switch wrote may still be staged in Switchyard: no other apply may take it live (I6).
-    await switchyard.hold_in(db, str(env.id))
+    backend = record.get("backend") or (env.traffic or {}).get("switch")
+    if backend in (None, "none", "switchyard"):
+        # What the cut-off switch wrote may still be staged in Switchyard: no other apply may take it live (I6).
+        await switchyard.hold_in(db, str(env.id))
     audit.record(db, "environment.unresolved", target=env, summary=f"Traffic of {env.name} may be split",
-                 details={"slot": state["unresolved"]["to_slot"], "message": RESTARTED})
+                 details={"slot": to_slot, "message": RESTARTED})
 
 
 # ------------------------------------------------------------------------------- Resolve (§9.12)
@@ -970,12 +1521,18 @@ class ResolveRefused(Exception):
         self.status, self.text = status, text
 
 
-async def resolve(env_id: uuid.UUID, *, actor: User | None = None, request: Any = None) -> str:
+async def resolve(env_id: uuid.UUID, *, actor: User | None = None, request: Any = None) -> str | None:
     """Settle an unresolved switch by reading Switchyard (§9.12): when every active-following host the
     environment owns sends traffic to one app slot, that slot becomes the active one and the switch is
     resolved (audit ``environment.resolve``). Returns the slot. Raises ResolveRefused (409) otherwise,
     ``deployer.RunnerBusy`` while a job holds the environment's keys, and SwitchyardError when Switchyard
-    can't be read. The typed confirmation is the caller's."""
+    can't be read. The typed confirmation is the caller's.
+
+    Another backend (``do_lb``, phase 4 §11.6) is asked through ``who_is_live`` under its own lock: the slot
+    whose droplet is the load balancer's only target becomes the active one, and no target after a cut-off
+    Deactivate records the environment taken off the air (returns None). It raises DigitalOceanError when
+    DigitalOcean can't be read (the API answers 502), and ResolveRefused when the targets aren't exactly one
+    slot's droplet (Decision 17)."""
     async with deployer.runner.exclusive(data.env_keys(env_id, None)):
         async with session_scope() as db:
             env = await db.get(Environment, env_id)
@@ -985,8 +1542,14 @@ async def resolve(env_id: uuid.UUID, *, actor: User | None = None, request: Any 
                 raise ResolveRefused(409, f"Traffic of {env.name} isn't split: there is nothing to resolve")
             mem = await environments.members(db, env)
             owner = environments.owner_in(env, mem)
+            backend = traffic.backend_for(env)
+            ctx = None
+            if backend is not None and backend.name != "switchyard":
+                ctx = await traffic.context(db, env, "sync")
             config = await switchyard.load_config(db)
             rows = await _rows(db, env.id, traffic.PROVIDER, traffic.KIND)
+        if backend is not None and ctx is not None:
+            return await _resolve_by(backend, ctx, env, mem, actor=actor, request=request)
         if config is None:
             raise ResolveRefused(409, environments.SET_UP_SWITCHYARD)
         async with switchyard.SwitchyardClient(config) as sy:
@@ -1039,19 +1602,90 @@ async def resolve(env_id: uuid.UUID, *, actor: User | None = None, request: Any 
             raise ResolveRefused(409, f"Switchyard has no host of {env.name}'s sending {', '.join(missing)} to "
                                       f"{chosen}: activate {chosen} to put {'them' if len(missing) > 1 else 'it'} "
                                       "back")
-        async with session_scope() as db:
-            env = await db.get(Environment, env_id, with_for_update=True)
-            assert env is not None
-            state = dict(env.traffic_state or {})
-            message = (state.get("unresolved") or {}).get("message")
-            state["unresolved"] = None
-            env.traffic_state = state
-            env.active_slot_id = mem[chosen].id
-            if env.status == EnvironmentStatus.NEW:
-                env.status = EnvironmentStatus.LIVE
-            audit.record(db, "environment.resolve", actor=actor, target=env, request=request,
-                         summary=f"Resolved {env.name}'s traffic: {chosen} takes it",
-                         details={"slot": chosen, "message": message})
+        await _resolved(env_id, mem[chosen], actor=actor, request=request)
         async with switchyard.lock:
             await switchyard.release_edits(str(env_id))
         return chosen
+
+
+async def _resolved(env_id: uuid.UUID, chosen: Instance, *, actor: User | None, request: Any) -> None:
+    """Resolve's write: ``chosen`` takes the traffic, the switch is resolved (audit ``environment.resolve``)."""
+    async with session_scope() as db:
+        env = await db.get(Environment, env_id, with_for_update=True)
+        assert env is not None
+        state = dict(env.traffic_state or {})
+        message = (state.get("unresolved") or {}).get("message")
+        state["unresolved"] = None
+        env.traffic_state = state
+        env.active_slot_id = chosen.id
+        if env.status == EnvironmentStatus.NEW:
+            env.status = EnvironmentStatus.LIVE
+        await _refresh_owner_mirror(db, env)
+        audit.record(db, "environment.resolve", actor=actor, target=env, request=request,
+                     summary=f"Resolved {env.name}'s traffic: {chosen.slot} takes it",
+                     details={"slot": chosen.slot, "message": message})
+
+
+async def _cut_deactivate(env: Environment) -> Deployment | None:
+    """The Deactivate whose cut-off switch left ``env``'s traffic unresolved, or None (an activate's, or none)."""
+    unresolved = (env.traffic_state or {}).get("unresolved") or {}
+    if not isinstance(unresolved, dict) or unresolved.get("to_slot"):
+        return None
+    dep_id = data._uuid(unresolved.get("deployment_id"))
+    if dep_id is None:
+        return None
+    async with session_scope() as db:
+        dep = await db.get(Deployment, dep_id, options=[defer(Deployment.log)])
+        if dep is None or dep.kind != DeploymentKind.DEACTIVATE or dep.environment_id != env.id:
+            return None
+        return dep
+
+
+async def _resolved_dark(env_id: uuid.UUID, *, actor: User | None, request: Any) -> None:
+    """Resolve's write after a cut-off Deactivate whose targets are empty: no slot takes the traffic, the switch
+    is resolved and ``traffic_state.deactivated`` names that Deactivate, as its own closing write would have
+    (audit ``environment.resolve``)."""
+    async with session_scope() as db:
+        env = await db.get(Environment, env_id, with_for_update=True)
+        assert env is not None
+        state = dict(env.traffic_state or {})
+        unresolved = state.get("unresolved") or {}
+        from_slot = unresolved.get("from_slot")
+        state["unresolved"] = None
+        state["deactivated"] = {"deployment_id": unresolved.get("deployment_id"), "from_slot": from_slot,
+                                "at": utcnow().isoformat()}
+        env.traffic_state = state
+        env.active_slot_id = None
+        await _refresh_owner_mirror(db, env)
+        audit.record(db, "environment.resolve", actor=actor, target=env, request=request,
+                     summary=f"Resolved {env.name}'s traffic: no slot takes it, as its Deactivate left it",
+                     details={"slot": None, "message": unresolved.get("message")})
+
+
+async def _resolve_by(backend: traffic.TrafficBackend, ctx: traffic.SwitchContext, env: Environment,
+                      mem: dict[str, Instance], *, actor: User | None, request: Any) -> str | None:
+    """Resolve through a backend's ``who_is_live``, read and written under ``backend.lock(ctx)`` (Decision 17).
+    Its own errors (DigitalOceanError) are the caller's to answer; a target that isn't the environment's, or
+    any number of slots but one, is a 409. No target after a cut-off Deactivate records it taken off the air
+    and returns None."""
+    via = backend.via[:1].upper() + backend.via[1:]
+    async with backend.lock(ctx):
+        try:
+            live = await backend.who_is_live(ctx)
+        except traffic.TrafficError as exc:
+            raise ResolveRefused(409, f"{backend.label}: {exc}") from None
+        if not live and await _cut_deactivate(env) is not None:
+            # A Deactivate cut off after its empty targets went out: they stand, so record it as taken off the
+            # air (a retiring production can't be activated, so "activate one of them" couldn't be followed).
+            await _resolved_dark(env.id, actor=actor, request=request)
+            return None
+        if not live:
+            raise ResolveRefused(409, f"{via} sends {env.name}'s traffic to no slot: activate one of them")
+        if len(live) > 1:
+            raise ResolveRefused(409, f"{via} sends traffic to {' and '.join(live)}: activate one of them")
+        chosen = mem.get(live[0])
+        if chosen is None or chosen.slot not in APP_SLOTS:
+            raise ResolveRefused(409, f"{via} sends traffic to {live[0]}, which {env.name} no longer has: activate "
+                                      "one of its slots")
+        await _resolved(env.id, chosen, actor=actor, request=request)
+    return str(chosen.slot)

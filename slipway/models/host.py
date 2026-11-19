@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import ForeignKey, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from slipway.core.crypto import EncryptedText
@@ -47,7 +47,7 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     # Who made the machine: ``ssh`` (added by hand); phase 4 ``digitalocean``, phase 5 ``proxmox``, ``esxi``.
     provider: Mapped[str] = mapped_column(String(16), default="ssh", server_default="ssh")
     provider_id: Mapped[str | None] = mapped_column(String(200))
-    # Phase 4: the environment that made this host and destroys it. Always None in phase 3.
+    # The environment that made this host and destroys it (a droplet or a VM). None for hosts added by hand.
     owner_environment_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("environments.id", ondelete="SET NULL")
     )
@@ -72,6 +72,15 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     metrics: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+
+    # A host a provider makes: {phase: planned | creating | ready | gone, ...} plus the provider's own keys
+    # (a droplet's {droplet_name, region, size, image, public_ip, private_ip, built_at}). Empty for ssh hosts.
+    provider_state: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+
+    @property
+    def is_built(self) -> bool:
+        """An ssh host always is; a provider's host only once its machine is ready."""
+        return self.provider == "ssh" or (self.provider_state or {}).get("phase") == "ready"
 
     @property
     def address(self) -> str:

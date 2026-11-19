@@ -38,6 +38,7 @@ from slipway.core.config import get_settings
 from slipway.db.base import utcnow
 from slipway.models import (
     Backup,
+    BackupLocation,
     BackupReason,
     BackupStatus,
     BuildSource,
@@ -50,7 +51,7 @@ from slipway.models import (
     InstanceStatus,
     Snapshot,
 )
-from slipway.services import ssh
+from slipway.services import backup_store, ssh
 
 q = shlex.quote
 
@@ -66,28 +67,32 @@ INCOMING_DIR = ".incoming"  # work area inside backups/, emptied by every job's 
 LOCK_FILE = ".slipway-lock"
 
 # Kinds (DeploymentKind values) grouped by what they do.
-CHANGING_KINDS = ("deploy", "restore", "rollback", "reset", "admin", "content")  # move "the latest job" (D10)
+# A VM revert (phase 5) replaces the data with the VM snapshot's, so it moves "the latest job" too: an older
+# failed deploy's retry backs up afresh after it.
+CHANGING_KINDS = ("deploy", "restore", "rollback", "reset", "admin", "content", "vm_revert")  # "the latest job" (D10)
 PIPELINE_KINDS = ("deploy", "restore", "rollback", "reset")
 RESTORE_KINDS = ("restore", "rollback", "reset")  # run the live release again with data steps
 DATA_ONLY_KINDS = ("backup", "snapshot", "admin", "content")
 # Phase 3: jobs of a whole environment (instance_id is None, environment_id is set). None of them changes the
-# data, so CHANGING_KINDS stays as it is.
-ENV_KINDS = ("activate", "publish", "discard", "remove_slot", "teardown")
+# data, so CHANGING_KINDS stays as it is. Phase 4 adds the certificate renewal and Deactivate.
+ENV_KINDS = ("activate", "publish", "discard", "remove_slot", "teardown", "certificate", "deactivate")
 KIND_LABELS = {
     "deploy": "Deploy", "restore": "Restore", "rollback": "Roll back", "reset": "Reset data", "backup": "Back up",
     "snapshot": "Take snapshot", "admin": "Create first admin", "content": "Add starter content",
     "activate": "Activate", "publish": "Publish names", "discard": "Discard", "remove_slot": "Remove slot",
-    "teardown": "Delete environment",
+    "teardown": "Delete environment", "certificate": "Renew the certificate", "deactivate": "Take off the air",
+    "vm_snapshot": "Take a VM snapshot", "vm_revert": "Revert to a VM snapshot", "vm_drop": "Delete a VM snapshot",
 }
 # How a job is named inside a sentence ("failed deployment 1a2b3c4d").
 KIND_NOUNS = {
     "deploy": "deployment", "restore": "restore", "rollback": "roll back", "reset": "reset", "backup": "backup",
     "snapshot": "snapshot", "admin": "first-admin job", "content": "starter-content job",
     "activate": "activation", "publish": "name publishing", "discard": "discard", "remove_slot": "slot removal",
-    "teardown": "teardown",
+    "teardown": "teardown", "certificate": "certificate renewal", "deactivate": "deactivation",
+    "vm_snapshot": "VM snapshot", "vm_revert": "VM revert", "vm_drop": "VM snapshot deletion",
 }
 # Steps that replace or delete data on a data job (I1); a job that failed in one of them leaves a hold.
-REPLACING_STEPS = ("reset", "restore", "files", "after_import")
+REPLACING_STEPS = ("reset", "wipe", "restore", "files", "after_import")  # wipe: managed data (P4 §10.6)
 NOT_BEGUN = ("pending", "skipped")
 
 CHECK_BATCH = 100  # backup names per host check (§4.4)
@@ -258,6 +263,7 @@ ENV_DATA, ENV_TRAFFIC = "data", "traffic"
 # alone) runs beside them (D8). A snapshot belongs here only when it doesn't stop the app, and neither does when
 # it runs on an app slot (mode slot) or stops the owner again at its end (``env_keys``).
 _DATA_ONLY_ENV = ("backup",)
+_TRAFFIC_ONLY_ENV = ("activate", "certificate")  # the traffic key alone (phase 4 Decision 22)
 
 
 def variables_of(instance: Instance) -> dict[str, str]:
@@ -281,8 +287,9 @@ def loaded_environment(instance: Instance) -> Any:
 def env_keys(environment_id: uuid.UUID, kind: str | None, options: dict[str, Any] | None = None, *,
              on_app_slot: bool = False) -> tuple[Any, ...]:
     """The runner keys of a job of an environment (D8): ``(env, "data")`` alone for a backup and for a snapshot
-    that doesn't stop the app, ``(env, "traffic")`` alone for an activate, and both for everything else.
-    Sorted, so two jobs never take them in opposite orders.
+    that doesn't stop the app, ``(env, "traffic")`` alone for an activate and a certificate renewal (phase 4,
+    which changes no data), and both for everything else (Deactivate and the VM kinds included). Sorted, so two
+    jobs never take them in opposite orders.
 
     A backup or snapshot takes both keys after all when it runs on an app slot (``on_app_slot``: in mode
     ``slot`` the data owner is the slot an activate starts, checks and switches to, and both jobs would write
@@ -292,7 +299,7 @@ def env_keys(environment_id: uuid.UUID, kind: str | None, options: dict[str, Any
     reads_only = kind in _DATA_ONLY_ENV or (kind == DeploymentKind.SNAPSHOT and not opts.get("stop_app"))
     if reads_only and not on_app_slot and not opts.get("restop"):
         return ((environment_id, ENV_DATA),)
-    if kind == DeploymentKind.ACTIVATE:
+    if kind in _TRAFFIC_ONLY_ENV:
         return ((environment_id, ENV_TRAFFIC),)
     return ((environment_id, ENV_DATA), (environment_id, ENV_TRAFFIC))
 
@@ -303,7 +310,10 @@ def runner_keys(instance: Instance, kind: str | None = None, options: dict[str, 
     that isn't a job (control, a backup delete, a check, the deploy-root move) takes both environment keys."""
     if instance.environment_id is None:
         return (instance.id,)
-    return env_keys(instance.environment_id, kind, options, on_app_slot=instance.slot in ("blue", "green"))
+    # A managed environment's host-less owner runs its commands on an app slot (the data runner, P4 §10.4),
+    # whose one-line lock an activate beside it would write too.
+    return env_keys(instance.environment_id, kind, options,
+                    on_app_slot=instance.slot in ("blue", "green") or hostless(instance))
 
 
 def job_keys(dep: Deployment, instance: Instance | None = None) -> tuple[Any, ...]:
@@ -364,6 +374,134 @@ def dep_label(dep: Deployment) -> str:
     return job_label(dep.kind, slot=slot, back=bool(opts.get("back")))
 
 
+MANAGED_DATA = "its managed database"  # where a host-less owner's data is, in a sentence (P4 §3.4)
+
+
+def host_label(instance: Instance) -> str:
+    """The name of ``instance``'s host in a sentence. Only a managed environment's data owner has no host (P4
+    §3.4): its data is in the managed database, so the sentence names that."""
+    host = instance.host
+    return host.name if host is not None else MANAGED_DATA
+
+
+def hostless(instance: Instance) -> bool:
+    """A managed environment's data owner: the one instance with no host (``ck_instances_host``)."""
+    return instance.host_id is None and instance.host is None
+
+
+def hostless_text(instance: Instance) -> str:
+    """Why something that needs the instance's own server can't be done on a host-less data owner (P4 §3.4)."""
+    env = loaded_environment(instance)
+    name = env.name if env is not None else instance.name
+    return (f"{name}'s data is in its managed database, so it has no server of its own: manage it from "
+            f"{name}'s page")
+
+
+def runner_slot(environment: Any, members: dict[str, Instance] | None = None) -> str:
+    """The slot P4 §10.4 rule 4 asks to deploy first: the active slot, else blue, else the first app slot."""
+    apps = {str(m.slot): m for m in (members or {}).values() if m.slot in ("blue", "green")}
+    active = next((s for s, m in apps.items() if environment is not None and m.id == environment.active_slot_id),
+                  None)
+    if active is not None:
+        return active
+    return "blue" if "blue" in apps or not apps else sorted(apps)[0]
+
+
+def no_runner_text(environment: Any, members: dict[str, Instance] | None = None) -> str:
+    """P4 §10.4 rule 4: no app slot can run a managed environment's data commands, so its owner's jobs (Start
+    over aside) are refused."""
+    name = environment.name if environment is not None else "This environment"
+    return (f"{name} has no slot that can run its data commands: deploy to {runner_slot(environment, members)} "
+            "first")
+
+
+def managed_elsewhere_text(env_name: str) -> str:
+    """``has_data`` exit 4 on a managed environment's runner (P4 §10.6): the managed database is the data."""
+    return (f"{env_name}'s data is managed; data.managed.commands.has_data must answer for the managed database "
+            '(exit 4 means "elsewhere")')
+
+
+def can_run_data(instance: Instance) -> bool:
+    """P4 §10.4: an app slot can run a managed environment's data commands when its host is built and it has a
+    live release (a droplet that is planned, being made or gone can't)."""
+    host = instance.host
+    return host is not None and ssh.host_is_built(host) and live_state(instance) is not None
+
+
+@dataclass(frozen=True)
+class RunnerChoice:
+    """Which app slot runs a managed owner's data commands (P4 §10.4), and the log line when it isn't the lead."""
+
+    instance: Instance | None
+    note: str | None = None
+    deploying: bool = False  # rule 3: the deploying slot, with its new release
+
+
+def runner_choice(environment: Any, members: dict[str, Instance], *,
+                  deploying: Instance | None = None) -> RunnerChoice:
+    """P4 §10.4's rules in order: the lead slot with its live release, else the other app slot with its live
+    release (each only when it can run), else in a slot deploy the deploying slot with its new release. No
+    instance: rule 4, nothing can run them (``no_runner_text``)."""
+    from slipway.services import environments  # it imports this module
+
+    apps = environments.app_members(members)
+    lead = environments.lead_slot(environment, members) if environment is not None else None
+    if lead is not None and lead.slot in ("blue", "green") and can_run_data(lead):
+        return RunnerChoice(lead)
+    other = next((m for m in apps if (lead is None or m.id != lead.id) and can_run_data(m)), None)
+    if other is not None:
+        note = None
+        if lead is not None and lead.slot in ("blue", "green"):
+            if lead.host is None or not ssh.host_is_built(lead.host):
+                note = f"{lead.slot}'s droplet isn't built; running the data commands on {other.slot}"
+            else:
+                note = f"{lead.slot} has no live release; running the data commands on {other.slot}"
+        return RunnerChoice(other, note)
+    if deploying is not None and deploying.host is not None and ssh.host_is_built(deploying.host):
+        return RunnerChoice(deploying, deploying=True)
+    return RunnerChoice(None)
+
+
+async def _app_slots(db: AsyncSession, instance: Instance) -> dict[str, Instance]:
+    if instance.environment_id is None:
+        return {}
+    rows = (await db.scalars(select(Instance).where(Instance.environment_id == instance.environment_id,
+                                                    Instance.slot.in_(("blue", "green"))))).all()
+    return {str(r.slot): r for r in rows}
+
+
+async def data_runner_of(db: AsyncSession, instance: Instance) -> Instance | None:
+    """The app slot that runs a host-less owner's data commands now (rules 1 and 2), or None."""
+    env = await _environment_of(db, instance)
+    return runner_choice(env, await _app_slots(db, instance)).instance
+
+
+async def hostless_refusal(db: AsyncSession, instance: Instance, *, start_over: bool = False) -> str | None:
+    """P4 §10.4 rule 4 for a job asked of a host-less owner: ``no_runner_text`` when no app slot can run its data
+    commands, else None (and None for an instance with a host). Start over needs only a built slot that holds a
+    release (it backs up with the newest one there)."""
+    if not hostless(instance):
+        return None
+    env = await _environment_of(db, instance)
+    members = await _app_slots(db, instance)
+    if runner_choice(env, members).instance is not None:
+        return None
+    if start_over and any(m.host is not None and ssh.host_is_built(m.host) for m in members.values()):
+        return None
+    return no_runner_text(env, members)
+
+
+def runner_live(owner: Instance, runner: Instance | None) -> dict[str, Any]:
+    """The host-less owner's ``app_state`` as the data runner's live release gives it (P4 §10.4): its ``live``
+    (naming the runner's slot) and ``manifest``, so the phase 2 rules that read the owner's live release
+    (capabilities, what can be restored, the commit a data job records) read the runner's."""
+    state = {k: v for k, v in (owner.app_state or {}).items() if k not in ("live", "manifest")}
+    live = live_state(runner) if runner is not None else None
+    if runner is None or live is None:
+        return state
+    return {**state, "live": {**live, "runner": str(runner.slot)}, "manifest": live_manifest(runner)}
+
+
 def confirm_name(instance: Instance) -> str:
     """The name a typed confirmation must equal (D20): the environment's for a member, so people type the name
     they see on the environment page; the instance's own otherwise."""
@@ -389,12 +527,15 @@ def data_shared_reason(instance: Instance, *, environment: Any = None, owner: In
     """
     env = environment if environment is not None else loaded_environment(instance)
     if is_shared_slot(instance, env):
-        where = owner.host.name if owner is not None else "its data server"
-        return (f"{env.name}'s data is shared by its slots and lives on {where}: back it up, restore or reset it "
+        if (owner is not None and owner.host is None) or (owner is None and env.data_mode == "managed"):
+            where = f"in {MANAGED_DATA}"  # a managed environment's (P4 §3.4)
+        else:
+            where = f"on {owner.host.name}" if owner is not None else "on its data server"
+        return (f"{env.name}'s data is shared by its slots and lives {where}: back it up, restore or reset it "
                 "from the environment page")
     live = live_state(instance)
     if live and live.get("data_elsewhere"):
-        return (f"{instance.name}'s data lives outside {instance.host.name} (an external or shared database); "
+        return (f"{instance.name}'s data lives outside {host_label(instance)} (an external or shared database); "
                 "Slipway backs it up but won't restore, reset or seed it yet")
     return None
 
@@ -942,13 +1083,15 @@ def restorable(instance: Instance, row: Backup, *, dirty_job: Deployment | None 
     def no(reason: str) -> Restorable:
         return Restorable(ok=False, reason=reason, dirty_note=note)
 
-    host = instance.host.name
+    host = "Slipway" if on_slipway(row) else host_label(instance)
     live = live_state(instance)
     if live is None:
         return no("Deploy the instance first")
     man, sha7 = live_manifest(instance), live_sha7(instance)
     if "restore" not in capabilities(instance):
         return no(f"{sha7}'s slipway.yml has no restore command")
+    if key_lost(row):
+        return no(str(backup_store.usable(row)))  # its key is gone: it can only be deleted (P4 §10.5)
     if row.status != BackupStatus.READY:
         return no({
             BackupStatus.PENDING: "Being taken",
@@ -1117,6 +1260,10 @@ async def hold_text(db: AsyncSession, instance: Instance) -> str | None:
     if not dirty.get("hold"):
         return None
     last = dirty.get("last") or {}
+    if last.get("text"):
+        # A VM revert's hold (P5 §9.12) carries its own text, which offers only reverting again: a P2 restore's
+        # release step would read a release that may no longer be on the disk.
+        return f"{str(last['text']).rstrip('.')}. Start, Restart and Deploy are off until then."
     backup = await _backup_of(db, owner, last.get("backup_id"))
     where = f" ({last['step_text']})" if last.get("step_text") else ""
     before = f"restore the backup taken just before it ({backup.name})" if backup else "restore an earlier backup"
@@ -1490,8 +1637,13 @@ RETRY_PERMISSION = {
     # Phase 3 §4.1: Discard needs deployments:create as well (RETRY_EXTRA).
     "activate": "traffic:switch", "publish": "traffic:switch", "discard": "traffic:switch",
     "remove_slot": "environments:delete", "teardown": "environments:delete",
+    # Phases 4 and 5 (Decision 37): a renewal and Deactivate move traffic; the VM kinds change VMs. Deactivate
+    # also needs environments:delete, and a VM revert data:reset, as when first started.
+    "certificate": "traffic:switch", "deactivate": "traffic:switch",
+    "vm_snapshot": "machines:write", "vm_drop": "machines:write", "vm_revert": "machines:write",
 }
-RETRY_EXTRA = {"discard": ("deployments:create",)}
+RETRY_EXTRA = {"discard": ("deployments:create",), "deactivate": ("environments:delete",),
+               "vm_revert": ("data:reset",)}
 
 
 SNAPSHOT_STEPS = ("restore", "files", "after_import")  # the steps of a chain that read the snapshot
@@ -1702,7 +1854,16 @@ async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, s
         raise ValueError(kind)
     if instance.build_source != BuildSource.APP:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only app instances (slipway.yml) can back up, restore or reset their data")
-    live = live_state(instance)
+    # A managed environment's host-less owner: its data commands run on the data runner (P4 §10.4), an app slot
+    # with its live release. Refused with rule 4's text when no slot can run them; the checks below read the
+    # runner's live release.
+    source = instance
+    if hostless(instance):
+        no_runner = await hostless_refusal(db, instance, start_over=start_over)
+        if no_runner:
+            raise HTTPException(status.HTTP_409_CONFLICT, no_runner)
+        source = await data_runner_of(db, instance) or instance
+    live = live_state(source)
     if start_over:
         refused = await start_over_refusal(db, instance)
         if refused:
@@ -1711,7 +1872,7 @@ async def require_data_job(db: AsyncSession, instance: Instance, kind: str, *, s
     elif live is None:
         raise HTTPException(status.HTTP_409_CONFLICT, not_live_text(instance))
     if not start_over:
-        caps, sha7 = capabilities(instance), live_sha7(instance)
+        caps, sha7 = capabilities(source), live_sha7(source)
         if kind in RESTORE_KINDS and "backup" not in caps:
             raise HTTPException(status.HTTP_409_CONFLICT,
                                 "The live release's slipway.yml has no dump command, so Slipway can't back up the data first")
@@ -1864,16 +2025,61 @@ class CheckResult:
 CHECKABLE = (BackupStatus.READY, BackupStatus.MISSING, BackupStatus.CHANGED, BackupStatus.UNVERIFIED)
 
 
-async def check_backups(remote: Remote, db: AsyncSession, rows: Iterable[Backup], backups: str, host: str, *,
-                        rehash: bool = False, parts: Iterable[str] | None = None) -> CheckResult:
+def on_slipway(row: Backup) -> bool:
+    """A backup kept on the Slipway server (P4 §10.5): a managed environment's owner has no host to keep it."""
+    return str(row.location or "") == BackupLocation.SLIPWAY.value
+
+
+def key_lost(row: Backup) -> bool:
+    """A Slipway-kept backup whose data key can't be read any more (P4 §10.5). A row still being taken, or one a
+    restart left unverified, may have no key only because it was never recorded: settle decides those."""
+    return (on_slipway(row) and row.status not in (BackupStatus.PENDING, BackupStatus.UNVERIFIED)
+            and backup_store.usable(row) is not None)
+
+
+STORED_STATUS = {"ok": BackupStatus.READY, "missing": BackupStatus.MISSING, "changed": BackupStatus.CHANGED}
+
+
+async def _check_stored(db: AsyncSession, rows: list[Backup], result: CheckResult) -> None:
+    """Slipway's own files of each backup: present, decrypting and hashing to the recorded values (P4 §10.5).
+    No SSH; a backup whose key can't be read any more counts as changed and can only be deleted.
+
+    A row a restart left ``unverified`` is not checked here: it may have been cut before its key was recorded,
+    which is not a changed key, and only ``settle_unverified`` (the owner's next job) may keep or forget it and
+    its files. It stays as it is."""
+    now = utcnow()
+    for row in rows:
+        if row.status == BackupStatus.UNVERIFIED:
+            result.statuses[row.id] = BackupStatus.UNVERIFIED
+            continue
+        found = await backup_store.check(row.instance_id, row)
+        new = STORED_STATUS.get(found.status, BackupStatus.CHANGED)
+        await _set_status(db, row, row.status, new, now)  # lost only to a concurrent change of the row
+        result.statuses[row.id] = new
+
+
+async def check_backups(remote: Remote | None, db: AsyncSession, rows: Iterable[Backup], backups: str | None,
+                        host: str | None, *, rehash: bool = False,
+                        parts: Iterable[str] | None = None) -> CheckResult:
     """Check backups' files on the host and record what was found (§4.4). The caller commits.
 
     Present with the recorded size (and sha, when ``rehash``) → ready; absent → missing; another size → changed.
     A missing folder or an SSH error changes no row and gives a ``warning``. ``parts`` limits which files are
     checked (``("dump",)`` when a restore doesn't put the files back).
+
+    Rows kept on Slipway (``location = slipway``, P4 §10.5) are checked in Slipway's storage with no SSH: their
+    whole files, decrypted and hashed. ``remote`` may be None when every row is one of them (a managed
+    environment's owner has no host).
     """
     todo = [r for r in rows if r.status in CHECKABLE and NAME_RE.match(r.name or "")]
     result = CheckResult()
+    stored = [r for r in todo if on_slipway(r)]
+    todo = [r for r in todo if not on_slipway(r)]
+    if stored:
+        await _check_stored(db, stored, result)
+    if todo and (remote is None or backups is None):
+        result.warning = f"Couldn't check the backups on {host or 'the host'}; showing what Slipway recorded"
+        return result
     parts = tuple(parts) if parts is not None else None
     for start in range(0, len(todo), CHECK_BATCH):
         batch = todo[start:start + CHECK_BATCH]
@@ -1903,11 +2109,16 @@ async def check_backups(remote: Remote, db: AsyncSession, rows: Iterable[Backup]
     return result
 
 
-async def confirm_backup(remote: Remote, db: AsyncSession, row: Backup, backups: str, host: str, *,
-                         files: bool = False) -> str | None:
-    """Before restoring ``row``: its files present, with the recorded size and sha. None, or the refusal."""
+async def confirm_backup(remote: Remote | None, db: AsyncSession, row: Backup, backups: str | None,
+                         host: str | None, *, files: bool = False) -> str | None:
+    """Before restoring ``row``: its files present, with the recorded size and sha. None, or the refusal. A
+    backup kept on Slipway is checked in Slipway's storage (``remote`` may then be None)."""
+    if key_lost(row):
+        return backup_store.usable(row)
     if row.status not in CHECKABLE:
         return f"The backup {row.name} isn't ready ({row.status})"
+    if on_slipway(row):
+        host = "Slipway"
     parts = ("dump", "files") if files else ("dump",)
     found = await check_backups(remote, db, [row], backups, host, rehash=True, parts=parts)
     if found.warning:
@@ -1922,14 +2133,40 @@ async def confirm_backup(remote: Remote, db: AsyncSession, row: Backup, backups:
     return None
 
 
-async def settle_unverified(remote: Remote, db: AsyncSession, instance: Instance, backups: str) -> list[str]:
+async def _settle_stored(db: AsyncSession, rows: list[Backup]) -> list[str]:
+    """Slipway-kept rows a restart left ``unverified`` (P4 §10.5): kept when their files are whole, decrypt and
+    hash to the recorded values under their key; otherwise their files go and the row is forgotten (a copy
+    cut off before its key was recorded can never be read)."""
+    lines: list[str] = []
+    for row in rows:
+        found = await backup_store.check(row.instance_id, row) if backup_store.key_of(row) is not None else None
+        if found is not None and found.status == "ok":
+            await db.execute(update(Backup).where(Backup.id == row.id, Backup.status == BackupStatus.UNVERIFIED)
+                             .values(status=BackupStatus.READY, checked_at=utcnow(),
+                                     finished_at=row.finished_at or utcnow())
+                             .execution_options(synchronize_session=False))
+            lines.append(f"Backup {row.name} was kept on Slipway before Slipway restarted; checked it and kept it")
+            continue
+        backup_store.delete(row.instance_id, row)
+        await db.execute(delete(Backup).where(Backup.id == row.id, Backup.status == BackupStatus.UNVERIFIED))
+        lines.append(f"Backup {row.name} never finished before Slipway restarted; forgot it")
+    return lines
+
+
+async def settle_unverified(remote: Remote | None, db: AsyncSession, instance: Instance,
+                            backups: str | None) -> list[str]:
     """Rows left ``unverified`` by a restart (§4.4): a present final file is complete (it was moved there only
-    after it was checked), so measure, hash and keep it; without one, forget the row. Returns log lines."""
-    host = instance.host.name
+    after it was checked), so measure, hash and keep it; without one, forget the row. Returns log lines. Rows
+    kept on Slipway are settled from Slipway's storage with no SSH (``remote`` may then be None)."""
+    host = host_label(instance)
     rows = (await db.scalars(select(Backup).where(Backup.instance_id == instance.id,
                                                   Backup.status == BackupStatus.UNVERIFIED))).all()
     rows = [r for r in rows if NAME_RE.match(r.name or "")]
-    lines: list[str] = []
+    lines: list[str] = await _settle_stored(db, [r for r in rows if on_slipway(r)])
+    rows = [r for r in rows if not on_slipway(r)]
+    if rows and (remote is None or backups is None):
+        lines.append(f"Warning: couldn't check the backups on {host} left unfinished by a restart")
+        return lines
     for start in range(0, len(rows), CHECK_BATCH):
         batch = rows[start:start + CHECK_BATCH]
         files = [f"{r.name}.{part}" for r in batch for part in (("dump", "files") if r.has_files else ("dump",))]
@@ -1964,45 +2201,59 @@ async def settle_unverified(remote: Remote, db: AsyncSession, instance: Instance
     return lines
 
 
-async def apply_retention(remote: Remote, db: AsyncSession, instance: Instance, backups: str, *,
+async def apply_retention(remote: Remote | None, db: AsyncSession, instance: Instance, backups: str | None, *,
                           just_taken: uuid.UUID | None, say: Say) -> list[str]:
     """Remove the automatic backups beyond what the instance keeps (§4.3), right after one became ready.
 
     Files are removed only when the same session has just confirmed them with their recorded sizes, and their
     rows only after that. A failure logs a warning and never fails the job. Returns the names removed; the
-    caller commits.
+    caller commits. Backups kept on Slipway (P4 §10.5) have their Slipway files deleted, with no SSH: ``remote``
+    may be None when every row is one of them.
     """
-    host = instance.host.name
+    host = host_label(instance)
     rows = (await db.scalars(select(Backup).where(Backup.instance_id == instance.id))).all()
     pinned = set(await pinned_backups(db, instance))
     if just_taken is not None:
         pinned.add(just_taken)
     keep = min(max(instance.keep_backups or 5, 1), 100)
     doomed = [r for r in choose_doomed(rows, pinned, keep) if NAME_RE.match(r.name or "")]
+    stored = [r for r in doomed if on_slipway(r)]
+    doomed = [r for r in doomed if not on_slipway(r)]
+    names: list[str] = []
+    if stored:
+        for row in stored:
+            backup_store.delete(row.instance_id, row)
+        await db.execute(delete(Backup).where(Backup.id.in_([r.id for r in stored]))
+                         .execution_options(synchronize_session=False))
+        names = [r.name for r in stored]
+        await say(f"Removed old backups from Slipway: {', '.join(names)} (keeping the newest {keep})")
     if not doomed:
-        return []
+        return names
+    if remote is None or backups is None:
+        await say(f"Warning: couldn't remove old backups on {host}: Slipway has no session to it")
+        return names
     try:
         found = await check_backups(remote, db, doomed, backups, host)
         if found.warning:
             await say(f"Warning: couldn't remove old backups: {found.warning}")
-            return []
+            return names
         confirmed = [r for r in doomed if found.statuses.get(r.id) == BackupStatus.READY]
         if not confirmed:
-            return []
+            return names
         code, output = await remote.run(remove_backup_command(backups, [r.name for r in confirmed]),
                                         check=False, timeout=PROBE_TIMEOUT)
     except (ssh.SSHError, DataError) as exc:
         await say(f"Warning: couldn't remove old backups: {exc}")
-        return []
+        return names
     if code != 0:
         last = next((ln for ln in reversed(output.splitlines()) if ln.strip()), f"exit {code}")
         await say(f"Warning: couldn't remove old backups: {last}")
-        return []
+        return names
     await db.execute(delete(Backup).where(Backup.id.in_([r.id for r in confirmed]))
                      .execution_options(synchronize_session=False))
-    names = [r.name for r in confirmed]
-    await say(f"Removed old backups: {', '.join(names)} (keeping the newest {keep})")
-    return names
+    removed = [r.name for r in confirmed]
+    await say(f"Removed old backups: {', '.join(removed)} (keeping the newest {keep})")
+    return [*names, *removed]
 
 
 # ------------------------------------------------------------------ the Backups card

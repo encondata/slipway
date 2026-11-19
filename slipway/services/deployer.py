@@ -64,6 +64,8 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, func, null, select, update
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.orm.attributes import set_committed_value
 
 from slipway import __version__
 from slipway.core.config import get_settings
@@ -72,6 +74,7 @@ from slipway.db.base import Base, utcnow
 from slipway.db.session import session_scope
 from slipway.models import (
     Backup,
+    BackupLocation,
     BackupReason,
     BackupStatus,
     BuildSource,
@@ -86,6 +89,8 @@ from slipway.models import (
     Host,
     Instance,
     InstanceStatus,
+    Machine,
+    ProviderAccount,
     Repository,
     Snapshot,
     SnapshotStatus,
@@ -93,7 +98,9 @@ from slipway.models import (
 )
 from slipway.models.data import REVISION_MAX_BYTES
 from slipway.models.environment import SECRETS_LOST
-from slipway.services import audit, data, environments, manifest, ports, snapfile, snapshots, ssh, switchyard, traffic
+from slipway.services import (audit, backup_store, cloudflare, data, do_provision, environments, machines, manifest,
+                              ports, provider_accounts, resources, snapfile, snapshots, ssh, switchyard, traffic,
+                              vm_jobs, vmnet)
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 from slipway.services.snapfile import SnapshotError
@@ -192,8 +199,11 @@ def clean_instance_dir(value: str) -> str:
     return norm
 
 
-def ram_backed(host: Host, path: str) -> bool:
-    """On Unraid only /boot and /mnt survive a restart; the rest of the filesystem lives in RAM."""
+def ram_backed(host: Host | None, path: str) -> bool:
+    """On Unraid only /boot and /mnt survive a restart; the rest of the filesystem lives in RAM. No host (a
+    managed environment's data owner): nothing of it is on a disk Slipway knows."""
+    if host is None:
+        return False
     return (host.os_info or "").startswith("Unraid") and not (_inside(path, "/mnt") or _inside(path, "/boot"))
 
 
@@ -312,14 +322,22 @@ class InstancePaths:
         return f"{self.releases}/{sha[:12]}-{deployment_id.hex[:8]}"
 
 
+def host_of(instance: Instance) -> Host:
+    """``instance.host``, or DeployError for a managed environment's data owner, which has none (P4 §3.4)."""
+    if instance.host is None:
+        raise DeployError(data.hostless_text(instance))
+    return instance.host
+
+
 def instance_dir(instance: Instance, host: Host | None = None) -> str:
-    """The instance's folder on its host: ``deploy_dir``, or ``<host deploy root>/<slug>``."""
+    """The instance's folder on its host: ``deploy_dir``, or ``<host deploy root>/<slug>``. DeployError for the
+    host-less data owner of a managed environment (it has no folder anywhere)."""
     if not SLUG_RE.match(instance.slug):
         raise DeployError(f"Invalid instance slug {instance.slug!r}")
     try:
         if instance.deploy_dir:
             return clean_instance_dir(instance.deploy_dir)
-        return f"{clean_deploy_root((host or instance.host).deploy_root)}/{instance.slug}"
+        return f"{clean_deploy_root((host if host is not None else host_of(instance)).deploy_root)}/{instance.slug}"
     except ValueError as exc:
         raise DeployError(str(exc)) from exc
 
@@ -832,9 +850,9 @@ async def keep_identity_files(instance: Instance, *, connect: ConnectFactory = s
     if not others:
         return None
     paths = paths_for(instance)
-    host = instance.host.name
+    host = data.host_label(instance)
     try:
-        async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+        async with connect(ssh.SSHTarget.from_host(host_of(instance))) as remote:
             _, listing = await remote.run(_dumps_listing(paths.backups), check=False, timeout=60)
             dumps = [ln.strip()[:-5] for ln in listing.splitlines() if data.FILE_RE.match(ln.strip())]
             if dumps:
@@ -856,10 +874,10 @@ async def destroy(instance: Instance, *, connect: ConnectFactory = ssh.open_sess
     (for the audit record), and ``kept_backups``: their folder.
     """
     paths = paths_for(instance)
-    host = instance.host.name
+    host = data.host_label(instance)
     kept: str | None = None  # where the app's .env was copied
     kept_backups: tuple[int, str] | None = None  # (dumps, folder) the app's backups were moved to
-    async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+    async with connect(ssh.SSHTarget.from_host(host_of(instance))) as remote:
         # Teardown and the leftovers check come first: nothing has been moved when containers stay (data-loss 2).
         await remote.run(teardown_command(instance), timeout=600)
         _, left = await remote.run(leftovers_command(instance), timeout=60)
@@ -1104,7 +1122,7 @@ async def move_instance_dir(
         raise DeployError(str(exc)) from exc
     moves: list[Move] = [(instance, paths_for(instance), new)]
     _check_moves(moves, new.base)
-    return await _move_dirs(instance.host, moves, new.base, save=save, connect=connect)
+    return await _move_dirs(host_of(instance), moves, new.base, save=save, connect=connect)
 
 
 async def _move_dirs(
@@ -1431,17 +1449,121 @@ STEP_NAMES = {
     "dns": "Update DNS records",
     "stop_slots": "Stop Blue and Green",
     "start_slots": "Start the slots again",
+    # Phases 4 and 5 (P4 §14.2, P5 §10.2): a deploy on a host a provider makes. One key each for droplets and
+    # VMs, named per provider by ``steps_for`` (``provider_steps``).
+    "prepare": "Prepare the server",
+    "resize": "Resize the server",
+    "database": "Set up the database",
+    "edge": "Set up the load balancer",
+    "wipe": "Empty the database and the bucket",
+    # The VM kinds' steps (P5 §10.1); their jobs name them after the VM and the snapshot.
+    "vm_snapshot": "Take a VM snapshot",
+    "prune": "Delete old VM snapshots",
+    "vm_revert": "Revert the VM",
+    "wait": "Wait for the VM to answer",
+    "vm_settle": "Bring Slipway's records back",
+    "vm_drop": "Delete the VM snapshot",
 }
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped", "warning")
 # The header line each step starts with in the log; the deployment page splits the log on it.
 STEP_MARK = "── Step "
-# The steps of a deploy that run between build and start, in this order when listed (§7.3).
-PRE_START_STEPS = ("check", "backup", "stop_slots", "stop", "reset", "restore", "files", "after_import")
+# The steps of a deploy that run between build and start, in this order when listed (§7.3). ``resize`` (phases 4
+# and 5) comes right after ``backup``, so every refusal of the deploy is behind it (Decision 14).
+PRE_START_STEPS = ("check", "backup", "resize", "stop_slots", "stop", "reset", "wipe", "restore", "files",
+                   "after_import")
 # Between start and finish (phase 3 §8.4): a change step, so its failure fails the job before anything is live.
 PRE_FINISH_STEPS = ("start_slots",)
 # The steps that run after finish, inside the same SSH session; they never fail the job (D12). An environment
 # member's job also checks its slot (smoke), publishes DNS records and updates Switchyard (traffic) there.
 POST_FINISH_STEPS = ("first_admin", "seed", "smoke", "dns", "traffic")
+# The steps a deploy on a provider's host runs right after ``resolve``, before ``source`` (Decision 12): the
+# droplet or VM, then a DigitalOcean environment's database and load balancer (P4 §14.3).
+PROVIDER_STEPS = ("prepare", "database", "edge")
+DO_LB_TRAFFIC = "Update the load balancer"  # the traffic step's name on a do_lb environment (Decision 13)
+
+# Member-step timeouts (Decision 13; P4 §14.2, §18; P5 §10.2, §14), in seconds: each is the sum of the waits
+# inside the step plus a margin. A timeout cancels the step; what it shields (a create's send and record,
+# power_on after a power_off, Terraform's SIGINT grace) still finishes. ``prepare`` and ``resize`` take each
+# provider's own limit; the VM kinds' steps have one limit for both hypervisors.
+STEP_TIMEOUTS: dict[str, float] = {
+    "database": 65 * 60, "edge": 40 * 60, "wipe": 45 * 60,
+    # The VM kinds' steps (P5 §10.2, §14). ``vm_snapshot`` holds ESXi's worst case: the wait for another task
+    # (10 min), the quiesced snapshot and the crash-consistent retry (10 min each), the 15 s grace and a margin.
+    # A delete is a 10-minute wait for another task and a 10-minute consolidating delete: ``vm_drop`` holds one
+    # and ``prune`` two, each with a margin.
+    "vm_snapshot": 35 * 60, "prune": 45 * 60, "vm_revert": 30 * 60, "wait": 10 * 60, "vm_settle": 2 * 60,
+    "vm_drop": 25 * 60,
+}
+PROVIDER_STEP_TIMEOUTS: dict[str, dict[str, float]] = {
+    "digitalocean": {"prepare": 50 * 60, "resize": 60 * 60},
+    "proxmox": {"prepare": 120 * 60, "resize": 90 * 60},
+    "esxi": {"prepare": 120 * 60, "resize": 90 * 60},
+}
+
+
+def step_timeout(key: str, provider: str | None = None) -> float | None:
+    """A member step's time limit in seconds (None: none, as phase 3's steps have)."""
+    own = PROVIDER_STEP_TIMEOUTS.get(provider or "", {})
+    return own.get(key, STEP_TIMEOUTS.get(key))
+
+
+def _minutes(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        n = int(seconds // 60)
+        return f"{n} minute{'s' if n != 1 else ''}"
+    return f"{seconds:g} seconds"
+
+
+@dataclass(frozen=True)
+class ProviderSteps:
+    """What a deploy on a host a provider makes lists besides phase 3's steps (P4 §14.3, P5 §10.3), worked out
+    when it is queued: the provider, the ``prepare`` step's name and the ``resize`` step's when it is listed."""
+
+    provider: str  # digitalocean, proxmox or esxi
+    prepare: str
+    resize: str | None = None
+
+
+def host_provider(instance: Instance) -> str | None:
+    """The provider of ``instance``'s host when a provider makes it (None: an SSH host, or no host)."""
+    host = instance.host
+    if host is None:
+        return None
+    provider = getattr(host, "provider", None) or "ssh"
+    return None if provider == "ssh" else str(provider)
+
+
+async def provider_steps(db: Any, instance: Instance, environment: Any, members: dict[str, Instance] | None = None,
+                         *, resize: bool | None = None) -> ProviderSteps | None:
+    """``prepare`` and ``resize`` for a deploy of ``instance`` (None when its host isn't a provider's). The
+    ``resize`` step is listed when the applied size differs from the wanted one now and the slot isn't the
+    active one of two (never the data server; Decision 14). ``resize`` given: listed or not as the queued job
+    said (the job keeps what was decided when it was queued)."""
+    provider = host_provider(instance)
+    if provider is None or environment is None:
+        return None
+    host = instance.host
+    slot = str(instance.slot or "")
+    apps = environments.app_members(members or {})
+    active_of_two = len(apps) == 2 and environment.active_slot_id == instance.id
+    if provider == "digitalocean":
+        cloud = environment.cloud or {}
+        wanted, applied = cloud.get("droplet_size"), (host.provider_state or {}).get("size")
+        due = bool(wanted and applied and wanted != applied) and not active_of_two
+        prepare, resize_name = "Prepare DigitalOcean", f"Resize {host.name} to {wanted}"
+    else:
+        machine = await db.scalar(select(Machine).where(Machine.host_id == host.id)) if host.id else None
+        if machine is None:
+            return ProviderSteps(provider, f"Prepare the VM {host.name}")
+        account = await db.get(ProviderAccount, machine.account_id)
+        prepare = f"Prepare the VM {machine.name} on {account.name if account is not None else 'its account'}"
+        due = await machines.resize_due(db, machine)
+        resize_name = f"Resize {machine.name} to {vmnet.size_text(machine.size)}"
+    if resize is not None:
+        due = resize
+    if slot not in environments.APP_SLOTS:
+        due = False
+    return ProviderSteps(provider, prepare, resize_name if due else None)
 
 
 def step_keys(instance: Instance) -> list[str]:
@@ -1456,6 +1578,7 @@ def steps_for(
     instance: Instance, kind: str = DeploymentKind.DEPLOY, *, snapshot: bool = False, first_admin: bool = False,
     seed: bool = False, files: bool = False, stop_app: bool = False, stopped: bool = False, start_over: bool = False,
     rollback_of: uuid.UUID | None = None, environment: Any = None, members: dict[str, Instance] | None = None,
+    provider: ProviderSteps | None = None,
 ) -> list[dict[str, Any]]:
     """The numbered steps of a job, with the names its kind gives them (§7.2, §7.3).
 
@@ -1467,13 +1590,26 @@ def steps_for(
     deploy drops the step again when the release's slipway.yml has no seed command), ``files`` a restore
     puts the files back, ``stop_app`` a snapshot stops the running app, ``stopped`` the instance is stopped
     (data-only jobs stop its data services again at the end), ``start_over`` a reset of a never-live instance.
+
+    ``provider``: a deploy of a member whose host a provider makes (``provider_steps``) starts with ``resolve``
+    then ``prepare`` (and a DigitalOcean slot's ``database`` and ``edge``), and lists ``resize`` after ``backup``
+    when its rule held at queue time (phases 4 and 5). Members on SSH hosts keep phase 3's lists exactly.
     """
+    if kind in vm_jobs.KINDS:
+        # The VM kinds (P5 §10.1), named after the VM; the job names the snapshot when it starts (``job_steps``).
+        return vm_jobs.step_rows(str(kind), vm=data.host_label(instance), names=STEP_NAMES)
     if instance.build_source != BuildSource.APP:
         return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in step_keys(instance)]
     if environment is not None and instance.environment_id is not None:
-        return _member_steps(instance, environment, members or {}, kind, snapshot=snapshot, first_admin=first_admin,
+        rows = _member_steps(instance, environment, members or {}, kind, snapshot=snapshot, first_admin=first_admin,
                              seed=seed, files=files, stop_app=stop_app, stopped=stopped, start_over=start_over,
                              rollback_of=rollback_of)
+        if provider is not None and kind == DeploymentKind.DEPLOY:
+            rows = _with_provider_steps(rows, provider)
+        if (environment.traffic or {}).get("switch") == "do_lb":
+            # The member traffic step syncs through the backend: a load balancer, not Switchyard (P4 §14.3).
+            rows = [{**r, "name": DO_LB_TRAFFIC} if r["key"] == "traffic" else r for r in rows]
+        return rows
     after = ["first_admin"] if first_admin else []
     if kind == DeploymentKind.DEPLOY:
         keys = ["resolve", "source", "upload", "manifest", "ports", "settings", "build",
@@ -1509,7 +1645,7 @@ def steps_for(
     if kind == DeploymentKind.ROLLBACK and rollback_of is not None:
         names["restore"] = f"Restore the backup from before deployment {rollback_of.hex[:8]}"
     if kind == DeploymentKind.SNAPSHOT:
-        names["export"] = f"Export the data on {instance.host.name}"
+        names["export"] = f"Export the data on {data.host_label(instance)}"
     return [{"key": k, "name": names[k], "status": "pending"} for k in keys]
 
 
@@ -1539,14 +1675,24 @@ def _member_steps(
         keys = ["resolve", "source", "upload", "manifest", "ports", "settings", "build", *snap_check, "backup",
                 *snap_restore, "start", "finish", *dns, "traffic", *(["smoke"] if active is not None else [])]
         if active is not None:
-            names["smoke"] = f"Check {active.slot} on {active.host.name}"
+            names["smoke"] = f"Check {active.slot} on {data.host_label(active)}"
+    elif kind == DeploymentKind.DEPLOY and env.data_mode == DataMode.MANAGED:
+        # A DigitalOcean slot (P4 §14.3): its data is the managed cluster and bucket, so its list is mode slot's;
+        # ``provider_steps`` adds prepare, database, edge and resize.
+        keys = ["resolve", "source", "upload", "manifest", "ports", "settings", "build", *snap_check, "backup",
+                *snap_restore, "start", "finish", *after, "smoke", "traffic"]
+        names["smoke"] = f"Check {slot} on {data.host_label(instance)}" if instance.host is not None else f"Check {slot}"
     elif kind == DeploymentKind.DEPLOY:
         keys = ["resolve", "source", "upload", "manifest", "ports", "settings", "build",
                 *([] if server else snap_check), "backup", *([] if server else snap_restore),
                 "start", "finish", *after, "smoke", "traffic"]
-        names["smoke"] = f"Check {slot} on {instance.host.name}"
+        names["smoke"] = f"Check {slot} on {data.host_label(instance)}"
         if server and owner is not None:
-            names["backup"] = f"Back up the data on {owner.host.name}"
+            names["backup"] = f"Back up the data on {data.host_label(owner)}"
+    elif env.data_mode == DataMode.MANAGED and slot == environments.DATA_SLOT:
+        return _managed_owner_steps(env, members, kind, snapshot=snapshot, first_admin=first_admin, seed=seed,
+                                    files=files, stop_app=stop_app, start_over=start_over, rollback_of=rollback_of,
+                                    names=names)
     elif not server:
         rows = steps_for(instance, kind, snapshot=snapshot, first_admin=first_admin, seed=seed, files=files,
                          stop_app=stop_app, stopped=stopped, start_over=start_over, rollback_of=rollback_of)
@@ -1568,7 +1714,7 @@ def _member_steps(
                 "store", *(["restop"] if stopped else [])]
         if stop_app:
             names["start_slots"] = "Start Blue and Green again" if len(apps) > 1 else names["start_slots"]
-        names["export"] = f"Export the data on {instance.host.name}"
+        names["export"] = f"Export the data on {data.host_label(instance)}"
     else:
         return steps_for(instance, kind, snapshot=snapshot, first_admin=first_admin, seed=seed, files=files,
                          stop_app=stop_app, stopped=stopped, start_over=start_over, rollback_of=rollback_of)
@@ -1579,6 +1725,72 @@ def _member_steps(
     return [{"key": k, "name": names[k], "status": "pending"} for k in keys]
 
 
+def _managed_owner_steps(
+    env: Any, members: dict[str, Instance], kind: str, *, snapshot: bool, first_admin: bool, seed: bool, files: bool,
+    stop_app: bool, start_over: bool, rollback_of: uuid.UUID | None, names: dict[str, str],
+) -> list[dict[str, Any]]:
+    """The jobs of a managed environment's host-less data owner (P4 §10.6): P3's mode ``server`` lists with the
+    data runner in place of the data server. Restore, roll back and reset have no ``release``, ``manifest``,
+    ``settings`` or ``build`` (the runner's live release is built and its ``.env`` is its own) and no ``stop``
+    or ``start`` (the managed database is always up); reset's ``wipe`` empties the database and the bucket."""
+    after = ["first_admin"] if first_admin else []
+    if kind == DeploymentKind.RESTORE:
+        keys = ["check", "backup", "stop_slots", "restore", *(["files"] if files else []), "start_slots", "finish",
+                *after, "traffic"]
+    elif kind == DeploymentKind.ROLLBACK:
+        keys = ["check", "backup", "stop_slots", "restore", "start_slots", "finish", "traffic"]
+    elif kind == DeploymentKind.RESET and start_over:
+        keys = ["backup", "stop_slots", "wipe"]
+    elif kind == DeploymentKind.RESET:
+        keys = [*(["check"] if snapshot else []), "backup", "stop_slots", "wipe",
+                *(["restore", "files", "after_import"] if snapshot else []), "start_slots", "finish", *after,
+                *(["seed"] if seed else []), "traffic"]
+    elif kind == DeploymentKind.BACKUP:
+        keys = ["release", "backup"]
+    elif kind == DeploymentKind.SNAPSHOT:
+        keys = ["release", *(["stop_slots"] if stop_app else []), "export", *(["start_slots"] if stop_app else []),
+                "store"]
+    elif kind == DeploymentKind.ADMIN:
+        keys = ["release", "first_admin"]
+    elif kind == DeploymentKind.CONTENT:
+        keys = ["release", "seed"]
+    else:
+        raise ValueError(f"Unknown kind of job {kind!r}")
+    names = dict(names)
+    runner = data.runner_choice(env, members).instance
+    where = data.host_label(runner) if runner is not None else data.MANAGED_DATA
+    names["release"] = f"Check {runner.slot}'s live release" if runner is not None else STEP_NAMES["release"]
+    names["export"] = f"Export the data on {where}"
+    names["backup"] = f"Back up the data on {where}"
+    if stop_app and kind == DeploymentKind.SNAPSHOT:
+        apps = environments.app_members(members)
+        names["start_slots"] = "Start Blue and Green again" if len(apps) > 1 else names["start_slots"]
+    if snapshot:
+        names.update(check="Check the snapshot", restore="Restore the snapshot's database")
+    if kind == DeploymentKind.ROLLBACK and rollback_of is not None:
+        names["restore"] = f"Restore the backup from before deployment {rollback_of.hex[:8]}"
+    return [{"key": k, "name": names[k], "status": "pending"} for k in keys]
+
+
+def _with_provider_steps(rows: list[dict[str, Any]], provider: ProviderSteps) -> list[dict[str, Any]]:
+    """A member deploy's list on a provider's host (P4 §14.3, P5 §10.3): ``prepare`` right after ``resolve``
+    (a DigitalOcean slot's ``database`` and ``edge`` after it), and ``resize`` right after ``backup`` when
+    listed. Nothing else changes."""
+    first = ["prepare"]
+    if provider.provider == "digitalocean":
+        first += ["database", "edge"]
+    names = {"prepare": provider.prepare, "database": STEP_NAMES["database"], "edge": STEP_NAMES["edge"],
+             "resize": provider.resize or STEP_NAMES["resize"]}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(row)
+        if row["key"] == "resolve":
+            out += [{"key": k, "name": names[k], "status": "pending"} for k in first]
+        elif row["key"] == "backup" and provider.resize:
+            out.append({"key": "resize", "name": names["resize"], "status": "pending"})
+    return out
+
+
 def new_steps(instance: Instance) -> list[dict[str, Any]]:
     """A deploy's steps as queued (the job settles the conditional ones when it starts)."""
     return steps_for(instance)
@@ -1587,8 +1799,11 @@ def new_steps(instance: Instance) -> list[dict[str, Any]]:
 # Options a retry never copies: each needs its own typed confirmation, ``prev_status`` is what the instance
 # is when the retry starts (a half-restored app must not go back to "running"), and ``restop`` is whether the app
 # is stopped when the retry starts (an app started since must not be stopped by a Back up or a snapshot).
+# A VM job's own records of what it did are never a retry's (phase 5): ``settled`` (a revert's vm_settle committed)
+# and ``vm_snapshot_taken`` (the snapshot a Take a VM snapshot made); a revert's ``vm_snapshot_pre`` is carried, so
+# the retry keeps the first attempt's pre_revert snapshot (P5 §9.7).
 ONE_SHOT_OPTIONS = frozenset({"skip_backup", "take_over_lock", "override_hold", "skip_revision_check", "inherit",
-                              "confirm", "prev_status", "restop"})
+                              "confirm", "prev_status", "restop", "settled", "vm_snapshot_taken"})
 
 
 async def retry_values(db: Any, parent: Deployment) -> dict[str, Any]:
@@ -1665,6 +1880,14 @@ class Steps:
 
     def listed(self, key: str) -> bool:
         return any(r["key"] == key for r in self.rows)
+
+    async def insert_after(self, after: str, key: str, name: str) -> None:
+        """List ``key`` right after ``after`` (a step a provider's step found it needs), unless it is listed."""
+        if self.listed(key):
+            return
+        at = next((i + 1 for i, r in enumerate(self.rows) if r["key"] == after), len(self.rows))
+        self.rows.insert(at, {"key": key, "name": name, "status": "pending"})
+        await self._save()
 
     async def drop(self, key: str) -> None:
         """Take a step that hasn't begun off the list (one listed in case the release would need it)."""
@@ -1767,6 +1990,13 @@ class _Job:
     data_values: dict[str, dict[str, str]] | None = None  # what an app slot attaches to (§6), once worked out
     revision_before: str | None = None  # the data's revision the pre-deploy backup read (§8.4 smoke)
     lead_side: Any = None  # the lead slot's live render after start_slots (first_admin and seed run there)
+    # Phases 4 and 5: a member whose host a provider makes. ``provider`` is digitalocean, proxmox or esxi;
+    # ``provision`` the DigitalOcean steps' context (what prepare read stays on it for database and edge).
+    provider: str | None = None
+    provision: Any = None
+    status_before: str | None = None  # the instance's status when the job started (it is deploying from then on)
+    runner_said: bool = False  # the log said which slot runs the managed data's commands (P4 §10.4 rule 2)
+    stored: Any = None  # a managed owner job's copies of Slipway-kept backups on the runner (AsyncExitStack)
 
     @property
     def member(self) -> bool:
@@ -1822,13 +2052,14 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
         if environment is not None:
             members = await environments.members(db, environment)
             job.environment, job.members = environment, members
+            job.provider = host_provider(instance)
             job.owner = environments.owner_in(environment, members) or instance
             job.settings = {str(k): str(v) for k, v in (environment.app_settings or {}).items()}
             job.services = list(environment.app_services) if environment.app_services is not None else None
             job.secrets_version = int(environment.secrets_version or 0)
             if instance.slot == environments.DATA_SLOT:
                 job.role = "server"
-            elif environment.data_mode == DataMode.SERVER:
+            elif environment.data_mode in (DataMode.SERVER, DataMode.MANAGED):
                 job.role = "slot"
             # The environment's fences again, as they stand now and before anything changes (I2): two requests can
             # both pass queue_job's checks before either commits, e.g. an activate of green and a deploy to green.
@@ -1843,6 +2074,17 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
                 problem = jobs.identity_problem(environment, job.owner, instance, members)
             if problem:
                 raise DeployError(problem)
+            if instance.host is None:
+                # The host-less owner of a managed environment: its data jobs run on the data runner (P4 §10.4),
+                # refused here with rule 4's text when no slot can run them. It is never deployed (Decision 21).
+                if kind not in (*data.RESTORE_KINDS, *data.DATA_ONLY_KINDS):
+                    raise DeployError(_hostless_job_text(environment, members, kind))
+                start_over = kind == DeploymentKind.RESET and bool(options.get("start_over"))
+                refused = await data.hostless_refusal(db, instance, start_over=start_over)
+                if refused:
+                    raise DeployError(refused)
+        elif instance.host is None:
+            raise DeployError(data.hostless_text(instance))
         owner = job.data_owner
         data_only = kind in data.DATA_ONLY_KINDS
         if instance.build_source == BuildSource.APP:
@@ -1858,6 +2100,12 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
             if (kind == DeploymentKind.DEPLOY and never_live and dep.snapshot_id is None and dep.retry_of_id is None
                     and instance.seed_snapshot_id is not None and owner is instance):
                 dep.snapshot_id = instance.seed_snapshot_id
+            elif (kind == DeploymentKind.DEPLOY and _managed(job) and owner is not instance and never_live
+                  and dep.snapshot_id is None and dep.retry_of_id is None and owner.seed_snapshot_id is not None
+                  and not any(m.current_commit_sha for m in environments.app_members(members))):
+                # Managed data (P4 §10.6): the first app slot deploy is the seeding deploy, its data steps run as
+                # the owner's commands on the deploying slot.
+                dep.snapshot_id = owner.seed_snapshot_id
             job.snapshot_id, job.restore_backup_id = dep.snapshot_id, dep.restore_backup_id
             if kind == DeploymentKind.SNAPSHOT and dep.snapshot_id is not None and dep.retry_of_id is not None:
                 snap = await db.get(Snapshot, dep.snapshot_id)
@@ -1880,13 +2128,16 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
                         and data.snapshot_steps_left(first, job.done_by)):
                     raise DeployError("The snapshot this job restores was deleted; start a new reset instead")
             if kind in data.RESTORE_KINDS and not job.start_over:
-                live = data.live_state(instance)
+                # A managed owner's live release is its data runner's (P4 §10.4), on the runner's host.
+                runner = data.runner_choice(environment, members).instance if data.hostless(instance) else instance
+                live = data.live_state(runner) if runner is not None else None
                 if live is not None and _RELEASE_NAME.fullmatch(str(live.get("release") or "")) \
                         and _SHA_RE.match(str(live.get("sha") or "")):
                     # The live release is reused as it is on the host: no GitHub, no upload (D2).
+                    assert runner is not None
                     job.live_inputs = live
                     job.retry = _Retry(id=uuid.UUID(str(live["deployment"])), sha=str(live["sha"]),
-                                       release=f"{paths_for(instance).releases}/{live['release']}", reusable=True)
+                                       release=f"{paths_for(runner).releases}/{live['release']}", reusable=True)
                     if not dep.commit_sha:
                         source = await db.get(Deployment, job.retry.id)
                         dep.commit_sha = str(live["sha"])
@@ -1911,6 +2162,11 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
             stopped = instance.status == InstanceStatus.STOPPED
             if data_only:
                 options["restop"] = stopped
+            # A deploy on a provider's host: its resize step stays listed (or not) as it was queued (Decision 14).
+            provider = await provider_steps(
+                db, instance, environment, members,
+                resize=any(r.get("key") == "resize" for r in dep.steps or []),
+            ) if kind == DeploymentKind.DEPLOY and environment is not None else None
             dep.steps = steps_for(instance, kind, snapshot=snapshot and kind != DeploymentKind.SNAPSHOT,
                                   first_admin=pending_admin is not None,
                                   seed=bool(seed) if kind == DeploymentKind.DEPLOY else bool(options.get("seed")),
@@ -1918,8 +2174,13 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
                                   start_over=job.start_over,
                                   stop_app=bool(options.get("stop_app")) and (
                                       instance.status == InstanceStatus.RUNNING
-                                      or (environment is not None and environment.data_mode == DataMode.SERVER)),
-                                  stopped=stopped and data_only, environment=environment, members=members)
+                                      or (environment is not None and environment.data_mode in (
+                                          DataMode.SERVER, DataMode.MANAGED))),
+                                  stopped=stopped and data_only, environment=environment, members=members,
+                                  provider=provider)
+            if kind in vm_jobs.KINDS:
+                # Named after the VM and the snapshot, with a revert's pre_revert snapshot or not (P5 §10.1).
+                dep.steps = await vm_jobs.job_steps(db, instance, kind, options, STEP_NAMES)
             dep.options = dict(options)
             _hide_instance_values(job.hide, owner, env, secrets)
         else:
@@ -1927,9 +2188,23 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
         job.steps = dep.steps
         dep.status = DeploymentStatus.RUNNING
         dep.started_at = utcnow()
-        if not (data_only and instance.build_source == BuildSource.APP):
-            instance.status = InstanceStatus.DEPLOYING  # data-only jobs never change the status (§7.1)
+        job.status_before = str(instance.status) if instance.status is not None else None
+        if not (data_only and instance.build_source == BuildSource.APP) and not data.hostless(instance) \
+                and kind not in vm_jobs.KINDS:
+            # Data-only jobs never change the status (§7.1), nor does any job of a managed environment's host-less
+            # owner, which runs nothing of its own (P4 §3.4). A VM job sets it itself: a snapshot or a delete
+            # never changes it, a revert's restart says whether the app runs again (P5 §9.7).
+            instance.status = InstanceStatus.DEPLOYING
         return job
+
+
+def _hostless_job_text(environment: Any, members: dict[str, Instance], kind: str) -> str:
+    """Why a job of a managed environment's host-less data owner doesn't start (P4 §3.4): it is never deployed
+    (Decision 21), and a kind that isn't a data job has nothing to run on."""
+    if kind == DeploymentKind.DEPLOY:
+        return (f"{environment.name}'s data is in its managed database, so there is no data server to deploy: "
+                f"deploy to {data.runner_slot(environment, members)} instead")
+    return data.no_runner_text(environment, members)
 
 
 def _as_uuid(value: Any) -> uuid.UUID | None:
@@ -2063,7 +2338,8 @@ async def _plan_ports(
         for port, protocol, name in await _reserved_ports(instance):
             host_ports.reserve(port, protocol, f"Slipway instance {name}")
         try:
-            plan = ports.plan(declared, host_ports, overrides=overrides, auto=instance.auto_ports, host_name=instance.host.name)
+            plan = ports.plan(declared, host_ports, overrides=overrides, auto=instance.auto_ports,
+                              host_name=data.host_label(instance))
         except ports.PortError as exc:
             raise DeployError(str(exc)) from exc
         for wanted, given, why in plan.moved:
@@ -2153,7 +2429,7 @@ def _port_mismatch(instance: Instance, plan: ports.PortPlan, applied: list[ports
     want, got = set(_port_tuples(plan.bindings)), set(_port_tuples(applied))
     fmt = lambda items: ", ".join(f"{s} {h}->{c}/{p}" for s, c, p, _, h in sorted(items)) or "none"  # noqa: E731
     return DeployError(
-        f"Docker Compose on {instance.host.name} did not apply the new host ports "
+        f"Docker Compose on {data.host_label(instance)} did not apply the new host ports "
         f"(expected {fmt(want - got)}; got {fmt(got - want)}); nothing was started"
     )
 
@@ -2199,7 +2475,7 @@ async def _prepare_compose_ports(
     # Run this release from the resolved compose file with the planned ports instead.
     await remote.run(f"rm -f -- {q(paths.ports_override_file)}")
     await sink.line(
-        f"Docker Compose on {instance.host.name} does not support !override (it needs 2.24.4 or later); "
+        f"Docker Compose on {data.host_label(instance)} does not support !override (it needs 2.24.4 or later); "
         f"using the resolved compose file with the new ports, {paths.resolved_compose_file}"
     )
     current = await _compose_config(remote, instance, release)  # with any variables set above
@@ -2257,7 +2533,7 @@ async def _take_dir(remote: ssh.RemoteSession, instance: Instance, sink: LogSink
         raise take_dir_error(instance, output)
     if ram_backed(instance.host, paths.base):
         await sink.line(
-            f"Warning: {instance.host.name} runs Unraid, which clears {paths.base} when it restarts. Set the instance's "
+            f"Warning: {data.host_label(instance)} runs Unraid, which clears {paths.base} when it restarts. Set the instance's "
             "folder (or the host's deploy root) to a path under /mnt/user, such as /mnt/user/appdata; Slipway moves the files."
         )
 
@@ -2272,7 +2548,7 @@ async def _acquire_lock(remote: ssh.RemoteSession, instance: Instance, job: _Job
     paths = paths_for(instance)
     _, output = await remote.run(data.lock_read_command(paths.lock, job.deployment_id), check=False, timeout=60)
     try:
-        verdict = data.lock_verdict(data.parse_lock(output), host=instance.host.name,
+        verdict = data.lock_verdict(data.parse_lock(output), host=data.host_label(instance),
                                     take_over=bool(job.options.get("take_over_lock")))
     except data.DataError as exc:
         raise DeployError(str(exc)) from None
@@ -2302,7 +2578,7 @@ async def _release_lock(remote: ssh.RemoteSession, instance: Instance, job: _Job
         return
     if job.lock_left:
         await _read_left_pid(remote, instance, job)
-        await sink.line(data.lock_left_message(job.lock_left, job.lock_pid, instance.host.name))
+        await sink.line(data.lock_left_message(job.lock_left, job.lock_pid, data.host_label(instance)))
         return
     with contextlib.suppress(Exception):
         await remote.run(data.lock_release_command(paths_for(instance).lock, job.deployment_id), check=False, timeout=60)
@@ -2330,7 +2606,7 @@ async def _read_left_pid(remote: ssh.RemoteSession, instance: Instance, job: _Jo
 
 def _left_text(c: _AppRun) -> str:
     """``<key> (pid <pid>) may still be running on <host>`` for the command the job left running."""
-    return data.lock_left_text(str(c.job.lock_left), c.job.lock_pid, c.instance.host.name)
+    return data.lock_left_text(str(c.job.lock_left), c.job.lock_pid, data.host_label(c.instance))
 
 
 async def _record_release(deployment_id: uuid.UUID, release: str) -> None:
@@ -2403,7 +2679,8 @@ async def _install_locked(
             await _acquire_lock(remote, instance, job, sink)
         status, _ = await remote.run(f"[ -d {q(release)} ]", check=False, timeout=60)
         if status:
-            raise DeployError(f"The release {release} is no longer on {instance.host.name}; deploy again instead of retrying")
+            raise DeployError(f"The release {release} is no longer on {data.host_label(instance)}; deploy again "
+                              "instead of retrying")
         assert job.retry is not None
         await steps.skip("upload", f"Reusing {release} from deployment {job.retry.id.hex[:8]}", listed_only=True)
     else:
@@ -2671,7 +2948,8 @@ def app_builtins(instance: Instance, release: str, sha: str, deployment_id: uuid
 
 def _clients(job: _Job) -> list[str]:
     """``{server.clients}``: the app slots' hosts' client addresses, sorted and unique (§5.1)."""
-    return sorted({m.host.client_address for m in environments.app_members(job.members) if m.host.client_address})
+    return sorted({m.host.client_address for m in environments.app_members(job.members)
+                   if m.host is not None and m.host.client_address})
 
 
 def _server_values(job: _Job, instance: Instance) -> dict[str, Any] | None:
@@ -2679,6 +2957,88 @@ def _server_values(job: _Job, instance: Instance) -> dict[str, Any] | None:
     if job.role != "server":
         return None
     return {"host": instance.host.upstream_address, "clients": _clients(job)}
+
+
+def _member_secrets_lost(job: _Job, unset: list[str]) -> str:
+    name = job.environment.name
+    return (f"Slipway lost {name}'s secrets (SLIPWAY_ENCRYPTION_KEY changed): put the old key back first in "
+            f"the list and run slipway rotate-encryption-key, or set each of them as a variable of {name}: "
+            f"{', '.join(unset)} (their old values, or the app's existing data won't open)")
+
+
+async def _role_secrets(job: _Job, sink: LogSink, man: manifest.Manifest | None) -> dict[str, str] | None:
+    """The secrets a DigitalOcean slot's ``database`` step sets the role's password from (P4 §10.1 step 7):
+    the ones this release renders, as ``settings`` would choose them. A secret the stored ones lack is the
+    environment's variable when one sets it, else generated now; either is kept with the environment at once,
+    by compare-and-set on ``secrets_version`` (§6, I3), so ``settings`` renders the password the role was given.
+    When the stored secrets can't be decrypted, the variables must set every secret (as ``settings`` asks), and
+    nothing is kept here. None: no managed PostgreSQL."""
+    need = do_provision.postgres_need(man) if man is not None else None
+    if man is None or need is None:
+        return None
+    assert man.data.managed is not None
+    key = man.data.managed.password_secret(need)
+    variables = job.env or {}
+    live = await _role_kept_for(job, key)
+    if job.secrets is None:
+        unset = [s.key for s in man.secrets if not variables.get(s.key)]
+        if unset:
+            raise DeployError(_member_secrets_lost(job, unset))
+        value = variables.get(key)
+        if live is not None and variables.get(live[0]) and value != variables[live[0]]:
+            raise DeployError(_role_cut_off_text(job, need, key, *live))
+        if value:
+            sink.hide.add(value)
+        return {key: value} if value else {}
+    secrets = dict(job.secrets)
+    current = secrets.get(live[0]) if live is not None else None
+    chosen = secrets.get(key) or variables.get(key)
+    if live is not None and current and chosen and chosen != current:
+        raise DeployError(_role_cut_off_text(job, need, key, *live))
+    if secrets.get(key):
+        return secrets
+    if variables.get(key):
+        value, how = variables[key], f"Kept {key} from {job.environment.name}'s variables as the app's secret"
+    elif live is not None and current:
+        # The role keeps the password the live slot connects with (P4 §10.1 step 7): a rename keeps its value.
+        value = current
+        how = (f"Kept {key} with the value of {live[0]}, which the database role's password was set from, so "
+               f"{live[1]} (live) keeps connecting")
+    else:
+        value = manifest.new_secrets(man, secrets).get(key) or ""
+        how = f"Generated 1 secret(s) and kept them with environment {job.environment.name}: {key}"
+    if not value:
+        return secrets  # not one of the release's secrets: the database step names it
+    sink.hide.add(value)
+    secrets[key] = value
+    await _secrets_saved(job, secrets)
+    job.secrets = secrets
+    await sink.line(how)
+    return secrets
+
+
+async def _role_kept_for(job: _Job, key: str) -> tuple[str, str] | None:
+    """``(secret, slot)`` when another slot of the environment is live and the managed role's password was last
+    set from a secret other than ``key`` (the database row's ``role_secret``, P4 §10.1 step 7): the database step
+    then keeps the role's password as that secret's value, so the live slot isn't cut off. None otherwise."""
+    env = job.environment
+    if env.active_slot_id is None or env.active_slot_id == job.instance.id:
+        return None
+    live = next((m for m in job.members.values() if m.id == env.active_slot_id), None)
+    if live is None:
+        return None
+    async with session_scope() as db:
+        prev = await do_provision.role_secret(db, env)
+    if prev is None or prev == key:
+        return None
+    return prev, str(live.slot)
+
+
+def _role_cut_off_text(job: _Job, need: str, key: str, prev: str, slot: str) -> str:
+    return (f"{slot} is live and connects to {job.environment.name}'s database with the value of {prev}, but this "
+            f"release sets the role's password from {key}, which has another value: {slot} would be cut off. Keep "
+            f"data.managed.{need}.password at {{secret.{prev}}} while {slot} is live, or give {key} the same value. "
+            "The role's password was not changed")
 
 
 async def _secrets_saved(job: _Job, secrets: dict[str, str]) -> None:
@@ -2743,6 +3103,39 @@ async def _data_values(c: _AppRun) -> dict[str, dict[str, str]] | None:
             if need.get(key):
                 c.sink.hide.add(str(need[key]))
     return job.data_values
+
+
+async def _managed_values(c: _AppRun, man: manifest.Manifest) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    """A managed environment's app slot (P4 §5.3, §11.5): what the provider made for ``data.attach``
+    (``do_provision.slot_values``: the cluster's private connection, the bucket and its key) and the edge's
+    values (the load balancer's IP, the VPC's range), read now. The passwords and keys are hidden in the log."""
+    job = c.job
+    async with session_scope() as db:
+        env = await db.get(Environment, job.environment.id)
+        assert env is not None
+        try:
+            # The secrets this job renders (settings has chosen them by now): when the stored ones can't be
+            # decrypted, the variables set them, as the database step set the role's password from (F7).
+            secrets = job.secrets if job.secrets is not None else dict(job.env or {})
+            values, edge = await do_provision.slot_values(db, env, c.instance, man=man, secrets=secrets)
+        except do_provision.ProvisionError as exc:
+            raise DeployError(str(exc)) from None
+    for need in values.values():
+        for key in ("password", "secret_key"):
+            if need.get(key):
+                c.sink.hide.add(str(need[key]))
+    job.data_values = values
+    return values, edge
+
+
+async def _slot_role(c: _AppRun, man: manifest.Manifest) -> dict[str, Any]:
+    """``manifest.plan``'s role arguments for an app slot whose data isn't its own (§5.3): the data server's
+    provides in mode ``server``; on managed data the provider's values, ``managed`` and the edge (P4 §5.3)."""
+    if _managed(c.job):
+        values, edge = await _managed_values(c, man)
+        return {"role": "slot", "data_values": values, "managed": True,
+                "edge_values": edge if man.edge is not None else None}
+    return {"role": "slot", "data_values": await _data_values(c)}
 
 
 # slipway.yml's data commands, and first_admin: they run under ``umask 077`` (what they write stays the SSH
@@ -2861,6 +3254,9 @@ class _AppRun:
     stack: contextlib.AsyncExitStack | None = None  # closes the members' sessions when the job ends
     lock_held: bool = False  # a member: this job wrote its line to the member's host lock
     root: _AppRun | None = None  # a member: the job's own run, which holds the members
+    # Reset on managed data: what ``wipe`` runs as doadmin (``do_provision.reset_command``), read by the check
+    # before anything stops (``_wipe_precheck``).
+    wipe_command: tuple[str, str, str] | None = None
 
     @property
     def owner(self) -> Instance:
@@ -2878,9 +3274,13 @@ class _AppRun:
         instance = self.job.members.get(slot)
         if instance is None or self.job.connect is None:
             raise DeployError(f"{self.job.environment.name if self.job.member else self.instance.name} has no {slot}")
+        host = instance.host
+        if host is None:
+            # The host-less owner of a managed environment: its commands run on the data runner (P4 §10.4,
+            # ``data_runner``, ``_owner_run``), never on a member of its own.
+            raise DeployError(data.no_runner_text(self.job.environment, self.job.members))
         if self.stack is None:
             self.stack = contextlib.AsyncExitStack()
-        host = instance.host
         await self.sink.line(f"Connecting to {host.username}@{host.address} ({data.slot_text(slot)})")
         remote = await self.stack.enter_async_context(self.job.connect(ssh.SSHTarget.from_host(host)))
         m = _AppRun(remote=remote, instance=instance, job=self.job, sink=self.sink, steps=self.steps,
@@ -2904,12 +3304,41 @@ class _AppRun:
                 await stack.aclose()
 
 
+async def data_runner(env: Any, job: _Job) -> _AppRun:
+    """The run of the app slot that runs a managed environment's data commands (P4 §10.4, Decision 18), worked
+    out again now: the lead slot with its live release, else the other app slot with its live release (each only
+    when its droplet is built), else in a slot deploy the deploying slot with its new release. Refused with rule
+    4's text when none can. It is the job's own run when the job runs on that slot; otherwise a member, opened
+    on its host under its lock (§7.1)."""
+    root = (job.ctx.root or job.ctx) if isinstance(job.ctx, _AppRun) else None
+    if root is None:
+        raise DeployError(data.no_runner_text(env, job.members))
+    deploying = job.instance if job.kind == DeploymentKind.DEPLOY and job.instance.slot in environments.APP_SLOTS \
+        else None
+    choice = data.runner_choice(env, job.members, deploying=deploying)
+    if choice.instance is None:
+        raise DeployError(data.no_runner_text(env, job.members))
+    m = await root.member(str(choice.instance.slot))
+    if choice.note and not job.runner_said:
+        await root.sink.line(choice.note)
+        job.runner_said = True
+    return m
+
+
+async def _owner_run(c: _AppRun) -> _AppRun:
+    """Where the data owner's commands run for this job (§7.1): the data server's member in mode ``server``; on
+    managed data the data runner (P4 §10.4)."""
+    if _managed(c.job):
+        return await data_runner(c.job.environment, c.job)
+    return await c.member(environments.owner_slot(c.job.environment))
+
+
 async def _member_lock(m: _AppRun) -> None:
     """Before a job runs commands on another member's host (§7.1): that host's lock, as ``_acquire_lock`` takes
     a job's own (a live data command there refuses the job before anything runs)."""
     _, output = await m.remote.run(data.lock_read_command(m.paths.lock, m.job.deployment_id), check=False, timeout=60)
     try:
-        verdict = data.lock_verdict(data.parse_lock(output), host=m.instance.host.name,
+        verdict = data.lock_verdict(data.parse_lock(output), host=data.host_label(m.instance),
                                     take_over=bool(m.job.options.get("take_over_lock")))
     except data.DataError as exc:
         raise DeployError(str(exc)) from None
@@ -3013,6 +3442,10 @@ async def _install_app(
         if text is None:
             raise DeployError(f"{instance.manifest_file} was not found in {instance.repository.full_name} at {sha[:7]} "
                               "(or it is a link, or larger than 2 MB)")
+        if job.provider == "digitalocean" and live is None and \
+                hashlib.sha256(text.encode()).hexdigest() != job.options.get("manifest_sha256"):
+            # prepare, database and edge used the slipway.yml read at the resolved commit (P4 §14.3).
+            raise DeployError(f"The slipway.yml on {data.host_label(instance)} isn't the one Slipway provisioned from")
         try:
             man = manifest.parse(text)
         except manifest.ManifestError as exc:
@@ -3025,11 +3458,7 @@ async def _install_app(
         if job.secrets is None:
             unset = [s.key for s in man.secrets if not env.get(s.key)]
             if unset and job.member:
-                name = job.environment.name
-                raise DeployError(
-                    f"Slipway lost {name}'s secrets (SLIPWAY_ENCRYPTION_KEY changed): put the old key back first in "
-                    f"the list and run slipway rotate-encryption-key, or set each of them as a variable of {name}: "
-                    f"{', '.join(unset)} (their old values, or the app's existing data won't open)")
+                raise DeployError(_member_secrets_lost(job, unset))
             if unset:
                 raise DeployError(
                     "The app's stored secrets can't be decrypted with the configured SLIPWAY_ENCRYPTION_KEY. Restore "
@@ -3046,7 +3475,7 @@ async def _install_app(
         secrets = dict(job.secrets or {})
         if job.member:
             try:
-                manifest.check_instance_env(man, env, job.role)
+                manifest.check_instance_env(man, env, job.role, managed=_managed(job), edge=_managed(job))
             except manifest.ManifestError as exc:
                 raise DeployError(str(exc)) from exc
         fresh = manifest.new_secrets(man, secrets)
@@ -3059,7 +3488,7 @@ async def _install_app(
             sink.hide.add(value)
         job.secrets = secrets  # the live render of the backup step uses them too
         if job.role == "slot":
-            role_kw["data_values"] = await _data_values(c)
+            role_kw.update(await _slot_role(c, man))
         elif job.role == "server":
             role_kw["server_values"] = _server_values(job, instance)
         first = plan_with({})
@@ -3173,7 +3602,7 @@ async def _install_app(
     if reusable and live is not None and not _images_per_release(man):
         # Another release may have built images under the same names since (generality 6).
         await sink.line(f"Rebuilding release {sha[:7]}: its images aren't tagged per release (slipway.yml images), so "
-                        f"the ones on {instance.host.name} may be another release's")
+                        f"the ones on {data.host_label(instance)} may be another release's")
         reusable = False
     if reusable and await _images_exist(remote, final.images):
         assert job.retry is not None
@@ -3211,6 +3640,10 @@ async def _install_app(
     if job.role == "server":
         # The app slots' addresses its database lets in (§6): an app slot is refused until it is one of them.
         state["live"]["clients"] = _clients(job) if live is None else list((live.get("clients") or []))
+    if role_kw.get("edge_values") is not None:
+        # What the release went live with behind the load balancer (P4 §11.5): a slot whose recorded address
+        # differs from the load balancer's is stale.
+        state["live"]["edge"] = dict(role_kw["edge_values"])
     return state
 
 
@@ -3256,7 +3689,7 @@ async def _check_live_release(remote: ssh.RemoteSession, instance: Instance, pat
     lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
     target = next((ln for ln in lines if ln != LIVE_MARK), "")
     if LIVE_MARK not in lines or target.rstrip("/") not in (release, f"releases/{name}"):
-        raise DeployError(f"The live release on {instance.host.name} isn't the one Slipway recorded (current points at "
+        raise DeployError(f"The live release on {data.host_label(instance)} isn't the one Slipway recorded (current points at "
                           f"{target or 'nothing'}); deploy again first.")
     return release
 
@@ -3352,6 +3785,13 @@ async def _member_went_live(job: _Job, instance: Instance, state: dict[str, Any]
                     ts["last_slot_deploy"] = {"slot": instance.slot, "deployment_id": job.deployment_id.hex,
                                               "at": utcnow().isoformat()}
                     env.traffic_state = ts
+                if env.data_mode == DataMode.MANAGED and instance.slot in environments.APP_SLOTS:
+                    # The host-less owner's view of its data runner's live release (P4 §10.4), which this
+                    # release may now be.
+                    mem = await environments.members(db, env)
+                    found = mem.get(environments.DATA_SLOT)
+                    if found is not None and data.hostless(found):
+                        found.app_state = data.runner_live(found, data.runner_choice(env, mem).instance)
     except Exception as exc:  # the release is live: recording around it never fails the job
         log.warning("Could not record environment state after deployment %s: %s", job.deployment_id, exc)
 
@@ -3378,12 +3818,17 @@ async def _backed_up_secrets(instance: Instance, secrets: dict[str, str], keys: 
 
 def _role(job: _Job, instance: Instance) -> str:
     """How slipway.yml is planned for ``instance`` (§5.3): ``server`` for a data server, ``slot`` for an app slot
-    whose data is on one, ``app`` otherwise (standalone instances, mode ``slot``)."""
+    whose data is on one or managed (P4 §5.3), ``app`` otherwise (standalone instances, mode ``slot``)."""
     if instance.environment_id is None or not job.member:
         return "app"
     if instance.slot == environments.DATA_SLOT:
         return "server"
-    return "slot" if job.environment.data_mode == DataMode.SERVER else "app"
+    return "slot" if job.environment.data_mode in (DataMode.SERVER, DataMode.MANAGED) else "app"
+
+
+def _managed(job: _Job) -> bool:
+    """A job of a member of an environment whose data is managed (DigitalOcean, P4 §10)."""
+    return bool(job.member and job.environment is not None and job.environment.data_mode == DataMode.MANAGED)
 
 
 async def _live_plan(c: _AppRun, *, deploying: bool = False, write: bool = True) -> _Side:
@@ -3396,7 +3841,7 @@ async def _live_plan(c: _AppRun, *, deploying: bool = False, write: bool = True)
     release with keys its data wasn't made with.
     """
     instance, remote, job = c.instance, c.remote, c.job
-    host = instance.host.name
+    host = data.host_label(instance)
     live = data.live_state(instance)
     if live is None:
         raise DeployError(data.not_live_text(instance))
@@ -3424,12 +3869,12 @@ async def _live_plan(c: _AppRun, *, deploying: bool = False, write: bool = True)
     role = _role(job, instance)
     role_kw: dict[str, Any] = {}
     if role == "slot":
-        role_kw = {"role": role, "data_values": await _data_values(c)}
+        role_kw = await _slot_role(c, man)
     elif role == "server":
         role_kw = {"role": role, "server_values": {"host": instance.host.upstream_address,
                                                     "clients": list(live.get("clients") or [])}}
 
-    def render(env: dict[str, str]) -> manifest.AppPlan:
+    def render(env: dict[str, str], secrets: dict[str, str] | None = None) -> manifest.AppPlan:
         try:
             return manifest.plan(
                 man, template=template,
@@ -3437,7 +3882,7 @@ async def _live_plan(c: _AppRun, *, deploying: bool = False, write: bool = True)
                 settings={str(k): str(v) for k, v in (live.get("settings") or {}).items()},
                 chosen=live.get("services"),
                 host_ports={str(k): int(v) for k, v in (live.get("host_ports") or {}).items()},
-                secrets=dict(job.secrets or {}), env=env, **role_kw,
+                secrets=dict(job.secrets or {}) if secrets is None else secrets, env=env, **role_kw,
             )
         except manifest.ManifestError as exc:
             raise DeployError(f"Release {sha[:7]} can't be rendered again for {instance.name}: {exc}") from exc
@@ -3468,6 +3913,11 @@ async def _live_plan(c: _AppRun, *, deploying: bool = False, write: bool = True)
     if write:
         await remote.write_text(c.paths.env_file, content)
         await c.sink.line(f"Wrote the settings of the live release {sha[:7]} to {c.paths.env_file}")
+    if c.root is None and data.hostless(job.instance):
+        # A managed owner's restore runs this render (no settings step): a restore that puts identity keys
+        # back renders it again with them (_apply_override).
+        c.template = template
+        c.replan = lambda with_secrets: render(env, with_secrets)
     return _Side(man=man, plan=plan, release=release, sha=sha, content=content)
 
 
@@ -3550,6 +4000,8 @@ async def _backup(c: _AppRun) -> tuple[str, str | None]:
     reason = BACKUP_REASONS.get(job.kind, BackupReason.MANUAL)
     if c.steps.listed("reset") and not job.done_by.get("reset"):
         await _reset_precheck(c)  # a foreign volume refuses the reset before anything stops (I4)
+    elif c.steps.listed("wipe") and not job.done_by.get("wipe"):
+        await _wipe_precheck(c)
     no_new_backup = job.inherited_backup_id is not None or bool(job.options.get("skip_backup"))
     if no_new_backup:
         # The change steps that follow change the app's data: a failure in them leaves it dirty (§8.4, I6).
@@ -3562,7 +4014,7 @@ async def _backup(c: _AppRun) -> tuple[str, str | None]:
         checks = await _member_checks(c, await _owner_revision(c))
     if job.inherited_backup_id is not None:
         if job.role == "slot" and c.instance is job.instance:  # the backup is on the data host (§7.2)
-            status, note = await _inherited_backup(await c.member(environments.owner_slot(job.environment)))
+            status, note = await _inherited_backup(await _owner_run(c))
         else:
             status, note = await _inherited_backup(c)
         return _with_warning(status, note, checks)
@@ -3580,15 +4032,17 @@ async def _backup(c: _AppRun) -> tuple[str, str | None]:
 
 async def _inherited_backup(c: _AppRun) -> tuple[str, str | None]:
     """A retry of a job that began changing the data keeps that job's pre-change backup (§8.1, D11)."""
-    job, instance, host = c.job, c.instance, c.instance.host.name
+    job, instance, host = c.job, c.instance, data.host_label(c.instance)
     async with session_scope() as db:
         row = await db.get(Backup, job.inherited_backup_id)
-        if row is None or row.instance_id != instance.id:
+        if row is None or row.instance_id != c.owner.id:
             problem: str | None = "gone"
             name = "its backup"
         else:
             name = row.name
             problem = await data.confirm_backup(c.remote, db, row, c.paths.backups, host, files=row.has_files)
+            if data.on_slipway(row):
+                host = "Slipway"
             taken_at = _utc_text(row.taken_at)
     if problem is None:
         await _set_backup_id(job, job.inherited_backup_id)
@@ -3630,7 +4084,7 @@ def _has_declared_data(c: _AppRun) -> bool:
 
 
 def _elsewhere_text(instance: Instance) -> str:
-    return (f"{instance.name}'s data lives outside {instance.host.name} {data.ELSEWHERE_MARK}; Slipway backs it "
+    return (f"{instance.name}'s data lives outside {data.host_label(instance)} {data.ELSEWHERE_MARK}; Slipway backs it "
             "up but won't restore, reset or seed it yet. Nothing was changed.")
 
 
@@ -3683,8 +4137,8 @@ async def _probe_data(c: _AppRun, side: _Side, volumes: list[dict[str, str]]) ->
     _, output = await c.remote.run(data.volume_probe_command(v["name"] for v in volumes), check=False,
                                    timeout=data.PROBE_TIMEOUT)
     try:
-        return data.volumes_result(data.parse_volume_probe(output, host=c.instance.host.name), volumes,
-                                   host=c.instance.host.name)
+        return data.volumes_result(data.parse_volume_probe(output, host=data.host_label(c.instance)), volumes,
+                                   host=data.host_label(c.instance))
     except data.DataError as exc:
         raise DeployError(str(exc)) from None
 
@@ -3773,11 +4227,20 @@ async def _check_new_revision(c: _AppRun, new: _Side, revision: str) -> str | No
 async def _backup_with(
     c: _AppRun, side: _Side, reason: str, *, files: bool, sets_dep: bool, volumes: list[dict[str, str]],
 ) -> tuple[str, str | None, uuid.UUID | None, str | None]:
-    """Probe, then write and check the backup per §4.2. Returns (status, note, backup id, revision)."""
+    """Probe, then write and check the backup per §4.2. Returns (status, note, backup id, revision).
+
+    ``c`` runs the commands; the backup is the data owner's (``c.owner``: the instance itself, a mode ``server``
+    data server, or a managed environment's host-less owner, whose commands run on the data runner). On managed
+    data the backup is kept on Slipway (P4 §10.5): dumped on the runner, streamed into Slipway's store, and the
+    runner's copy removed."""
     job, instance, remote, sink = c.job, c.instance, c.remote, c.sink
-    host = instance.host.name
+    owner = c.owner
+    stored_here = data.hostless(owner)  # kept on Slipway (P4 §10.5)
+    host = data.host_label(instance)
     cmds = side.plan.commands
     probe = await _probe_data(c, side, volumes)
+    if probe.state == "elsewhere" and _managed(job):
+        raise DeployError(data.managed_elsewhere_text(job.environment.name))
     if probe.state == "elsewhere" and instance.slot == environments.DATA_SLOT and job.member:
         raise DeployError(f"{job.environment.name}'s data server says its data lives elsewhere (commands.has_data exit "
                           "4); data.server.commands.has_data must answer for the server's own database")
@@ -3786,12 +4249,12 @@ async def _backup_with(
     replacing = _replacing(job)
     if probe.state == "elsewhere" and replacing:
         raise DeployError(_elsewhere_text(instance))
-    if probe.state == "here" and job.snapshot_id is not None and job.never_live and instance.fresh_data is None:
+    if probe.state == "here" and job.snapshot_id is not None and job.never_live and owner.fresh_data is None:
         raise DeployError(await _seeding_over_data(c, probe))
     if probe.state == "empty":
         await _save_options(job, started_empty=True)
-        if job.never_live and instance.fresh_data != FreshData.SNAPSHOT:
-            await _save_instance(instance, fresh_data=FreshData.EMPTY)
+        if job.never_live and owner.fresh_data != FreshData.SNAPSHOT:
+            await _save_instance(owner, fresh_data=FreshData.EMPTY)
         return "skipped", f"No data yet: {probe.reason}", None, None
     if "dump" not in cmds:
         where = ", ".join(probe.present) or "its volumes"
@@ -3804,7 +4267,7 @@ async def _backup_with(
         return "warning", f"slipway.yml has no dump command, so the data in {where} was not backed up", None, None
     if probe.state == "elsewhere":
         await sink.line(f"{probe.reason}: Slipway backs it up, but won't restore, reset or seed it yet")
-    dirty = instance.data_dirty or {}
+    dirty = owner.data_dirty or {}
     dirty_first = dirty.get("first") or {}
     if dirty:
         await sink.line(f"The data was changed by failed {data.kind_noun(str(dirty_first.get('kind') or 'job'))} "
@@ -3816,7 +4279,7 @@ async def _backup_with(
 
     # Free space (§4.2 step 1): 1.25 × the last backup, or the volumes' sizes, plus the margin.
     async with session_scope() as db:
-        last_db, last_files = await data.last_ready_sizes(db, instance.id)
+        last_db, last_files = await data.last_ready_sizes(db, owner.id)
     sizes: dict[str, int] | None = None
     if last_db is None or (files and last_files is None):
         status, output = await remote.run(data.VOLUME_SIZES_COMMAND, check=False, timeout=data.PROBE_TIMEOUT)
@@ -3830,6 +4293,9 @@ async def _backup_with(
     _, output = await remote.run(data.free_space_command(backups), check=False, timeout=data.PROBE_TIMEOUT)
     problem = data.free_space_problem(free_kb=data.parse_free_kb(output), estimate=estimate.bytes,
                                       where=backups, host=host)
+    if problem is None and stored_here:
+        # Slipway's own storage too: its quota and its free space (P4 §10.5).
+        problem = await backup_store.space_problem(backup_store.stored_size(estimate.bytes))
     if problem:
         raise DeployError(problem)
     if ram_backed(instance.host, c.paths.base):
@@ -3841,11 +4307,11 @@ async def _backup_with(
     # The row first (pending), so a restart between here and the end leaves a trace (§4.4 unverified).
     keys = side.man.identity_keys()
     rendered = data.plan_identity(side.plan, keys)  # the environment's values, also on a data server (I3)
-    known = instance.live_identity or {}
+    known = owner.live_identity or {}
     identity = {k: known.get(k, rendered.get(k)) for k in keys if k in known or k in rendered}
-    if keys and instance.live_identity is None:
-        await _save_instance(instance, live_identity=dict(rendered))
-        await sink.line(f"Recorded {', '.join(keys)} as the {side.man.data.identity_label} {instance.name}'s data is made with")
+    if keys and owner.live_identity is None:
+        await _save_instance(owner, live_identity=dict(rendered))
+        await sink.line(f"Recorded {', '.join(keys)} as the {side.man.data.identity_label} {owner.name}'s data is made with")
     for value in identity.values():
         sink.hide.add(value)
     row_id = uuid.uuid4()
@@ -3853,7 +4319,8 @@ async def _backup_with(
     name = data.backup_name(row_id, taken_at)
     async with session_scope() as db:
         db.add(Backup(
-            id=row_id, instance_id=instance.id, deployment_id=job.deployment_id, name=name, reason=reason,
+            id=row_id, instance_id=owner.id, deployment_id=job.deployment_id, name=name, reason=reason,
+            location=BackupLocation.SLIPWAY.value if stored_here else BackupLocation.HOST.value,
             status=BackupStatus.PENDING, format=side.man.data.format or "", has_files=files,
             files_format=side.man.data.files.format if files and side.man.data.files else None,
             commit_sha=instance.current_commit_sha, release=posixpath.basename(side.release)[:64],
@@ -3896,20 +4363,26 @@ async def _backup_with(
                                       "changed nothing; the database is as it was. Fix the cause, then retry.")
             elif verify:
                 await sink.line("slipway.yml has no verify_dump: checked only that the dump isn't empty")
+        if no_hash and stored_here:
+            raise DeployError(f"{host} has none of sha256sum, shasum or openssl; a backup kept on Slipway needs one")
         if no_hash:
             await sink.line(data.no_hash_tool_message(host))
-        await remote.run(data.finalize_command({p: data.backup_file(backups, name, part) for part, p in partials.items()}),
-                         timeout=60)
         db_bytes, db_sha = measured["dump"]
         files_bytes, files_sha = measured.get("files", (None, None))
-        async with session_scope() as db:
-            row = await db.get(Backup, row_id)
-            assert row is not None
-            row.status, row.db_bytes, row.db_sha256 = BackupStatus.READY, db_bytes, db_sha
-            row.files_bytes, row.files_sha256 = files_bytes, files_sha
-            row.revision = revision
-            row.finished_at = row.checked_at = utcnow()
-            await remote.write_text(data.backup_file(backups, name, "json"), data.sidecar(row, app=side.man.data.app))
+        if stored_here:
+            await _keep_on_slipway(c, row_id, partials, measured, revision)
+        else:
+            await remote.run(data.finalize_command({p: data.backup_file(backups, name, part)
+                                                    for part, p in partials.items()}), timeout=60)
+            async with session_scope() as db:
+                row = await db.get(Backup, row_id)
+                assert row is not None
+                row.status, row.db_bytes, row.db_sha256 = BackupStatus.READY, db_bytes, db_sha
+                row.files_bytes, row.files_sha256 = files_bytes, files_sha
+                row.revision = revision
+                row.finished_at = row.checked_at = utcnow()
+                await remote.write_text(data.backup_file(backups, name, "json"),
+                                        data.sidecar(row, app=side.man.data.app))
     except _DumpFailed as exc:
         await _discard_backup(c, row_id, name)
         if dirty.get("hold"):
@@ -3932,10 +4405,44 @@ async def _backup_with(
     size_text = data.human_bytes(db_bytes + (files_bytes or 0))
     await sink.line(f"Backed up the data: {name} ({size_text})")
     async with session_scope() as db:
-        fresh = await db.get(Instance, instance.id)
+        fresh = await db.get(Instance, owner.id)
         if fresh is not None:
-            await data.apply_retention(remote, db, fresh, backups, just_taken=row_id, say=sink.line)
+            # Backups kept on Slipway are removed there, with no SSH (P4 §10.5).
+            await data.apply_retention(None if stored_here else remote, db, fresh, None if stored_here else backups,
+                                       just_taken=row_id, say=sink.line)
     return "succeeded", None, row_id, revision
+
+
+async def _keep_on_slipway(c: _AppRun, row_id: uuid.UUID, partials: dict[str, str],
+                           measured: dict[str, tuple[int, str | None]], revision: str | None) -> None:
+    """A managed owner's backup (P4 §10.5): the checked files on the runner streamed into Slipway's store under
+    a new key, the runner's copy removed once they are safe there, and the row ready with its key, in one
+    commit. Any failure leaves no stored file (``backup_store.pull``)."""
+    db_bytes, db_sha = measured["dump"]
+    files_bytes, files_sha = measured.get("files", (None, None))
+    async with session_scope() as db:
+        row = await db.get(Backup, row_id)
+        assert row is not None
+        row.db_bytes, row.db_sha256 = db_bytes, db_sha
+        row.files_bytes, row.files_sha256 = files_bytes, files_sha
+        row.revision = revision
+        # What the copy needs of the row, read now: no session stays open while the files stream.
+        view = Backup(id=row.id, name=row.name, has_files=row.has_files, db_bytes=db_bytes, db_sha256=db_sha,
+                      files_bytes=files_bytes, files_sha256=files_sha)
+    try:
+        stored = await backup_store.pull(c.remote, c.owner, view, sources=dict(partials), say=c.sink.line)
+    except backup_store.BackupStoreError as exc:
+        raise DeployError(str(exc)) from None
+    try:
+        async with session_scope() as db:
+            row = await db.get(Backup, row_id)
+            assert row is not None
+            backup_store.apply(row, stored)
+            row.status = BackupStatus.READY
+            row.finished_at = row.checked_at = utcnow()
+    except BaseException:
+        backup_store.delete(c.owner, view)  # no row names them: they could never be read
+        raise
 
 
 class _DumpFailed(Exception):
@@ -3945,9 +4452,13 @@ class _DumpFailed(Exception):
 
 
 async def _discard_backup(c: _AppRun, row_id: uuid.UUID, name: str) -> None:
-    """A failed backup leaves nothing: its partial files (by their exact names) and its row go."""
+    """A failed backup leaves nothing: its partial files (by their exact names) and its row go, and on managed
+    data anything of it in Slipway's store (P4 §10.5)."""
     with contextlib.suppress(Exception):
         await c.remote.run(data.discard_partials_command(c.paths.backups, name), check=False, timeout=60)
+    if data.hostless(c.owner):
+        with contextlib.suppress(Exception):
+            backup_store.delete(c.owner, Backup(name=name, has_files=True))
     async with session_scope() as db:
         await db.execute(delete(Backup).where(Backup.id == row_id))
 
@@ -4012,8 +4523,9 @@ def first_admin_problem(spec: manifest.FirstAdmin, fields: dict[str, Any], mode:
 
 
 def _runs_on_lead(c: _AppRun) -> bool:
-    """A data owner job in mode ``server``: the app runs on the lead slot, not on the data server (§7.1)."""
-    return c.job.member and c.instance.slot == environments.DATA_SLOT
+    """A data owner job in mode ``server``: the app runs on the lead slot, not on the data server (§7.1). On
+    managed data likewise: the owner's jobs run on the data runner, and the app on the lead slot."""
+    return c.job.member and (c.instance.slot == environments.DATA_SLOT or data.hostless(c.job.instance))
 
 
 async def _first_admin_step(c: _AppRun) -> None:
@@ -4144,7 +4656,7 @@ async def _seeding_over_data(c: _AppRun, probe: data.DataProbe) -> str:
     name = await _snapshot_name(c.job.snapshot_id)
     where = ", ".join(probe.present) or probe.reason
     volumes = " ".join(probe.present) or "<volume>"
-    return (f"{c.instance.host.name} already has data for this app ({where}). Seeding from snapshot {name} would "
+    return (f"{data.host_label(c.instance)} already has data for this app ({where}). Seeding from snapshot {name} would "
             f"replace it: deploy without the snapshot, then Reset data from it, or remove the volumes (docker volume "
             f"rm {volumes}) to start afresh.")
 
@@ -4198,17 +4710,18 @@ async def _check_backup(c: _AppRun) -> tuple[str, str | None]:
     """Restore and roll back: the backup passes §9.2, is on the host unchanged, and the live release can run it."""
     job, instance, side, sink = c.job, c.instance, c.new, c.sink
     assert side is not None
-    host, cmds, label = instance.host.name, side.plan.commands, side.man.data.identity_label
+    host, cmds, label = data.host_label(instance), side.plan.commands, side.man.data.identity_label
     files = bool(job.options.get("files"))
+    owner = c.owner  # the instance itself, or the data owner whose commands run here (a managed one's runner)
     async with session_scope() as db:
         row = None
         if job.restore_backup_id is not None:
             row = await db.scalar(select(Backup).where(Backup.id == job.restore_backup_id,
-                                                       Backup.instance_id == instance.id))
+                                                       Backup.instance_id == owner.id))
         if row is None:
             raise _refuse("The backup to restore was deleted")
         dirty_job = await db.get(Deployment, row.dirty_of) if row.dirty_of is not None else None
-        rule = data.restorable(instance, row, dirty_job=dirty_job, env=dict(job.env or {}))
+        rule = data.restorable(owner, row, dirty_job=dirty_job, env=dict(job.env or {}))
         if not rule.ok:
             raise _refuse(rule.reason or "The backup can't be restored")
         if files and not row.has_files:
@@ -4218,8 +4731,8 @@ async def _check_backup(c: _AppRun) -> tuple[str, str | None]:
         problem = await data.confirm_backup(c.remote, db, row, c.paths.backups, host, files=files)
         if problem:
             raise _refuse(problem)
-        name, revision = row.name, row.revision
-    await sink.line(f"The backup {name} is on {host}, unchanged since Slipway took it")
+        name, revision, stored = row.name, row.revision, data.on_slipway(row)
+    await sink.line(f"The backup {name} is on {'Slipway' if stored else host}, unchanged since Slipway took it")
     if rule.dirty_note:
         await sink.line(f"This backup: {rule.dirty_note}")
     if {"revision", "accepts"} <= set(cmds) and revision:
@@ -4250,22 +4763,58 @@ async def _check_backup(c: _AppRun) -> tuple[str, str | None]:
     for value in override.values():
         sink.hide.add(value)
     job.override = override
+    if stored:
+        # Kept on Slipway (P4 §10.5): copied onto the runner when the restore needs it, removed at the end.
+        incoming = f"{c.paths.backups}/{data.INCOMING_DIR}/{data.check_name(name)}"
+        job.restore_from = {"database": f"{incoming}.db", "files": f"{incoming}.files" if files else None,
+                            "name": name, "source": f"backup {name}", "stored": str(row.id)}
+        return "succeeded", None
     job.restore_from = {"database": data.backup_file(c.paths.backups, name, "dump"),
                         "files": data.backup_file(c.paths.backups, name, "files") if files else None,
                         "name": name, "source": f"backup {name}"}
     return "succeeded", None
 
 
+async def _push_stored(c: _AppRun) -> None:
+    """A restore of a backup kept on Slipway (P4 §10.5): decrypted into the runner's work area once, hash
+    checked there, for the restore and files steps to read; the copies are removed when the job ends, however
+    it ends (``backup_store.push``)."""
+    job, source = c.job, c.job.restore_from
+    if not source.get("stored") or source.get("pushed"):
+        return
+    async with session_scope() as db:
+        row = await db.get(Backup, uuid.UUID(str(source["stored"])))
+    if row is None:
+        raise DeployError(f"The backup {source.get('name')} was deleted")
+    view = Backup(id=row.id, name=row.name, has_files=bool(source.get("files")) and row.has_files,
+                  db_sha256=row.db_sha256, files_sha256=row.files_sha256, data_key=row.data_key)
+    targets = {"dump": str(source["database"])}
+    if view.has_files:
+        targets["files"] = str(source["files"])
+    if job.stored is None:
+        job.stored = contextlib.AsyncExitStack()
+    await c.remote.run(data.prepare_backups_command(c.paths.backups), timeout=60)
+    await c.remote.run(f"rm -f -- {' '.join(q(t) for t in targets.values())}", check=False, timeout=60)
+    try:
+        await job.stored.enter_async_context(backup_store.push(c.remote, c.owner, view, targets=targets,
+                                                               say=c.sink.line))
+    except backup_store.BackupStoreError as exc:
+        raise DeployError(str(exc)) from None
+    source["pushed"] = True
+
+
 async def _check_snapshot(c: _AppRun) -> tuple[str, str | None]:
     """A seeding deploy or a reset from a snapshot: every check before anything stops, then the staging (I4)."""
     job, instance, side, sink, remote = c.job, c.instance, c.new, c.sink, c.remote
     assert side is not None
-    host, man, cmds = instance.host.name, side.man, side.plan.commands
+    host, man, cmds = data.host_label(instance), side.man, side.plan.commands
     if job.kind == DeploymentKind.DEPLOY:
         probe = await _probe_data(c, side, side.plan.volumes)
         if probe.state == "elsewhere":
             raise _refuse(f"{instance.name}'s data lives outside {host} (commands.has_data says so); Slipway won't seed it")
-        if probe.state == "here" and instance.fresh_data is None:
+        if probe.state == "elsewhere" and _managed(job):
+            raise _refuse(data.managed_elsewhere_text(job.environment.name))
+        if probe.state == "here" and c.owner.fresh_data is None:
             raise DeployError(await _seeding_over_data(c, probe))
     async with session_scope() as db:
         snap = await db.get(Snapshot, job.snapshot_id) if job.snapshot_id is not None else None
@@ -4362,7 +4911,7 @@ async def _stage_snapshot(c: _AppRun, snapshot_id: uuid.UUID, key: bytes) -> tup
     """Decrypt the stored ``.sbx`` in a thread through the validator (§10.3) and upload its members as they come
     to ``.incoming/job-<d8>/{database,files}`` (0600). Each member's checksum is checked in transit by the
     validator and again on the host before it gets its final name."""
-    remote, host = c.remote, c.instance.host.name
+    remote, host = c.remote, data.host_label(c.instance)
     job_dir = data.job_dir(c.paths.base, c.job.deployment_id)
     await remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
     path = snapshots.bundle_path(snapshot_id)
@@ -4472,7 +5021,7 @@ async def _stop_app(c: _AppRun) -> None:
     """Stop the release with its own ``stop``, then what a failed release left running (§7.5 stop)."""
     side, instance, remote, sink = c.new, c.instance, c.remote, c.sink
     assert side is not None
-    host = instance.host.name
+    host = data.host_label(instance)
     c.data_up = False  # the release's stop may stop the data services too (ss-stack down does)
     if "stop" in side.plan.commands:
         await _app_run(c, side, "stop")
@@ -4518,7 +5067,7 @@ async def _probe_volumes(c: _AppRun) -> data.VolumeProbe:
         return data.VolumeProbe(present={}, absent=[])
     _, output = await c.remote.run(data.volume_probe_command(names), check=False, timeout=data.PROBE_TIMEOUT)
     try:
-        return data.parse_volume_probe(output, host=c.instance.host.name)
+        return data.parse_volume_probe(output, host=data.host_label(c.instance))
     except data.DataError as exc:
         raise DeployError(str(exc)) from None
 
@@ -4544,7 +5093,11 @@ async def _slot_local_volumes(c: _AppRun) -> list[tuple[_AppRun, list[str]]]:
     """A reset on the data server of a mode ``server`` environment also deletes each deployed app slot's own
     volumes (``data.volumes`` minus ``data.server.volumes``, as the slot's live release rendered them, §7.3)."""
     job = c.job
-    if not (job.member and job.environment.data_mode == DataMode.SERVER and c.instance.slot == environments.DATA_SLOT):
+    server_owner = job.member and job.environment.data_mode == DataMode.SERVER \
+        and c.instance.slot == environments.DATA_SLOT
+    # On managed data every app slot's volumes are its own (the database and files are managed).
+    owner_job = server_owner or (_managed(job) and data.hostless(job.instance))
+    if not owner_job:
         return []
     found = []
     for inst in _deployed_apps(job):
@@ -4560,7 +5113,7 @@ async def _slot_local_volumes(c: _AppRun) -> list[tuple[_AppRun, list[str]]]:
 async def _probe_named(m: _AppRun, names: list[str]) -> data.VolumeProbe:
     _, output = await m.remote.run(data.volume_probe_command(names), check=False, timeout=data.PROBE_TIMEOUT)
     try:
-        return data.parse_volume_probe(output, host=m.instance.host.name)
+        return data.parse_volume_probe(output, host=data.host_label(m.instance))
     except data.DataError as exc:
         raise DeployError(str(exc)) from None
 
@@ -4568,7 +5121,7 @@ async def _probe_named(m: _AppRun, names: list[str]) -> data.VolumeProbe:
 async def _reset_slot_volumes(c: _AppRun, m: _AppRun, names: list[str]) -> None:
     """Delete an app slot's own volumes on its host (stopped by ``stop_slots``): its projects are taken down
     first, since Docker keeps a volume a stopped container uses. Only its own labels (I5)."""
-    job, sink, slot, host = c.job, c.sink, str(m.instance.slot), m.instance.host.name
+    job, sink, slot, host = c.job, c.sink, str(m.instance.slot), data.host_label(m.instance)
     probe = await _probe_named(m, names)
     own = app_known_projects(m.instance)
     problem = data.foreign_volume(probe.present, own)
@@ -4610,7 +5163,7 @@ async def _reset(c: _AppRun) -> None:
     """Delete the app's data volumes: only names Slipway rendered, only with the app's own label (I5)."""
     job, instance, side, remote, sink = c.job, c.instance, c.new, c.remote, c.sink
     assert side is not None
-    host, cmds = instance.host.name, side.plan.commands
+    host, cmds = data.host_label(instance), side.plan.commands
     if "has_data" in cmds:
         code, _ = await _app_run(c, side, "has_data", check=False)
         if code == 4:
@@ -4654,11 +5207,111 @@ async def _reset(c: _AppRun) -> None:
             raise DeployError(f"Reset ran, but commands.has_data still finds data (it exited {code})")
     await _save_options(job, started_empty=True)
     if job.start_over:
-        # The instance starts again as new: its next deploy is an empty start, and the first admin is made again.
-        await _save_instance(instance, fresh_data=FreshData.EMPTY)
-        async with session_scope() as db:
-            await db.execute(update(FirstAdmin).where(FirstAdmin.instance_id == instance.id).values(
-                status=FirstAdminStatus.PENDING, done_at=None, existed=False, deployment_id=None))
+        await _started_over(c)
+
+
+async def _started_over(c: _AppRun) -> None:
+    """Start over deleted the data: the owner starts again as new, its next deploy an empty start, and the first
+    admin is made again."""
+    await _save_instance(c.owner, fresh_data=FreshData.EMPTY)
+    async with session_scope() as db:
+        await db.execute(update(FirstAdmin).where(FirstAdmin.instance_id == c.owner.id).values(
+            status=FirstAdminStatus.PENDING, done_at=None, existed=False, deployment_id=None))
+
+
+async def _wipe_precheck(c: _AppRun) -> None:
+    """Before anything stops (I4, I5; P4 §10.6): Reset on managed data deletes only each slot's own volumes, of
+    its own Compose projects; the database side has its cluster's address and a readable doadmin password
+    (kept for ``wipe``); the bucket side is recorded, on the token's team, and a temporary full-access key can
+    be made (``do_provision.wipe_check``). A refusal here fails ``backup``, so nothing is stopped or held."""
+    for m, names in await _slot_local_volumes(c):
+        problem = data.foreign_volume((await _probe_named(m, names)).present, app_known_projects(m.instance))
+        if problem:
+            raise DeployError(problem)
+    side = c.new
+    if side is None:
+        return
+    c.wipe_command = await _wipe_command(c)
+    try:
+        await do_provision.wipe_check(_wipe_context(c), side.man)
+    except do_provision.ProvisionError as exc:
+        raise DeployError(str(exc)) from None
+
+
+async def _wipe_command(c: _AppRun) -> tuple[str, str, str] | None:
+    assert c.new is not None
+    async with session_scope() as db:
+        fresh = await db.get(Environment, c.job.environment.id)
+        assert fresh is not None
+        try:
+            return await do_provision.reset_command(db, fresh, c.new.man, c.sink.hide)
+        except do_provision.ProvisionError as exc:
+            raise DeployError(str(exc)) from None
+
+
+def _wipe_context(c: _AppRun) -> do_provision.ProvisionContext:
+    job = c.job
+    return do_provision.ProvisionContext(
+        environment_id=job.environment.id, instance_id=c.instance.id, deployment_id=job.deployment_id,
+        say=c.sink.line, redactor=job.hide, connect=job.connect or ssh.open_session, actor=job.user)
+
+
+async def _wipe_step(c: _AppRun) -> None:
+    if await _done_by_first(c, "wipe"):
+        return
+    await _timed_step(c.steps, c.sink, "wipe", c.job.provider, lambda: _wipe(c))
+
+
+async def _wipe(c: _AppRun) -> tuple[str, str | None]:
+    """Reset's ``wipe`` on managed data (P4 §10.6): the bucket emptied with a temporary full-access key deleted
+    afterwards; then the app's database dropped and made again, empty and owned by its role, as doadmin on the
+    data runner; each slot's own volumes (``holds: other``) removed on its droplet. Its refusals were checked
+    before anything stopped (``_wipe_precheck``). The bucket goes first, so a failure there leaves the database
+    as it was, and nothing after the drop can say that Slipway changed nothing. Safe to retry: a run cut off
+    between the drop and the create leaves no database, and the next run makes the empty one."""
+    job, side, sink = c.job, c.new, c.sink
+    assert side is not None
+    env = job.environment
+    cmds = side.plan.commands
+    if "has_data" in cmds:
+        code, _ = await _app_run(c, side, "has_data", check=False)
+        if code == 4:
+            raise DeployError(data.managed_elsewhere_text(env.name))
+    c.data_up = False
+    found = c.wipe_command or await _wipe_command(c)
+    if found is not None:
+        await _refuse_while_left(c, "the database reset")
+    try:
+        emptied = await do_provision.empty_bucket(_wipe_context(c), side.man)
+    except do_provision.ProvisionError as exc:
+        # The slots are stopped, so "changed nothing" would mislead: the data is what it was.
+        text = str(exc).replace("Slipway changed nothing", "The database and the bucket are as they were")
+        raise DeployError(text) from None
+    if emptied is not None:
+        await sink.line(f"Emptied the bucket ({emptied} file{'s' if emptied != 1 else ''} deleted)")
+    if found is not None:
+        command, stdin, database = found
+        await sink.line(f"Emptying database {database} as doadmin, from {data.host_label(c.instance)}")
+        try:
+            code, output = await c.remote.run(_locked(c, "wipe", f"sh -c {q(command)}"), check=False, input=stdin,
+                                              on_line=sink.line, scrub=sink.scrub, timeout=do_provision.PSQL_TIMEOUT)
+        except (ssh.SSHError, asyncio.CancelledError):
+            job.lock_left = "wipe"
+            raise
+        if code:
+            raise DeployError(f"The managed database didn't take the reset (psql exited {code}); it may have no "
+                              f"database {database} now. Retry: the reset ends with an empty one either way.")
+        await sink.line(f"Database {database} is empty")
+    for m, names in await _slot_local_volumes(c):
+        await _reset_slot_volumes(c, m, names)
+    if "has_data" in cmds:
+        code, _ = await _app_run(c, side, "has_data", check=False)
+        if code != 3:
+            raise DeployError(f"Reset ran, but commands.has_data still finds data (it exited {code})")
+    await _save_options(job, started_empty=True)
+    if job.start_over:
+        await _started_over(c)
+    return "succeeded", None
 
 
 async def _restore_step(c: _AppRun) -> None:
@@ -4677,6 +5330,7 @@ async def _restore(c: _AppRun) -> None:
         raise DeployError("Slipway has nothing to restore (the check step found nothing)")
     if "restore" not in cmds:
         raise DeployError(f"Release {side.sha7}'s slipway.yml has no restore command")
+    await _push_stored(c)
     await _data_up_after_stop(c, side)
     code, _ = await _app_run(c, side, "restore", check=False, **_file_args(cmds["restore"], "in", source["database"]))
     if code:
@@ -4692,8 +5346,9 @@ async def _restore(c: _AppRun) -> None:
 
 async def _apply_override(c: _AppRun) -> None:
     """After a restore that succeeded, and only then (I3): the identity keys the data was made with come back,
-    in ``.env``, ``app_secrets`` and ``live_identity`` together."""
-    job, instance, side, sink = c.job, c.instance, c.new, c.sink
+    in ``.env``, ``app_secrets`` and ``live_identity`` together. ``live_identity`` is the data owner's (on
+    managed data the host-less owner, whose commands run here)."""
+    job, instance, side, sink = c.job, c.owner, c.new, c.sink
     assert side is not None
     source = job.restore_from
     override = {k: v for k, v in job.override.items() if (job.secrets or {}).get(k) != v
@@ -4767,6 +5422,7 @@ async def _files(c: _AppRun) -> tuple[str, str | None]:
     cmds = side.plan.commands
     if "import_files" not in cmds:
         raise DeployError(f"Release {side.sha7} can't import files (no commands.import_files)")
+    await _push_stored(c)
     await _data_up_after_stop(c, side)
     code, _ = await _app_run(c, side, "import_files", check=False, **_file_args(cmds["import_files"], "in", path))
     if code:
@@ -4805,7 +5461,7 @@ def _refuse_moved_ports(job: _Job, instance: Instance, host_ports: dict[str, int
     moved = [f"{k} {old[k]} → {host_ports[k]}" for k in sorted(old) if k in host_ports and host_ports[k] != old[k]]
     if moved:
         raise DeployError(f"The data server's ports would move ({', '.join(moved)}), and the slots' settings name "
-                          f"the old ones: free the port on {instance.host.name}, or recreate the slots")
+                          f"the old ones: free the port on {data.host_label(instance)}, or recreate the slots")
 
 
 async def _probe_data_server(c: _AppRun, man: manifest.Manifest) -> None:
@@ -4828,7 +5484,7 @@ async def _probe_data_server(c: _AppRun, man: manifest.Manifest) -> None:
         problem = await traffic.probe_database(
             c.remote, c.instance, env_name=job.environment.name, host=str(v.get("host")), port=port,
             database=str(v.get("database")), user=str(v.get("user")), password=str(v.get("password") or ""),
-            sslmode=str(v.get("tls") or "disable"), scrub=c.sink.scrub)
+            sslmode=str(v.get("tls") or "disable"), scrub=c.sink.scrub, managed=_managed(job))
         if problem:
             raise DeployError(problem)
         await c.sink.line("It signed in")
@@ -4841,7 +5497,10 @@ async def _owner_d_line(c: _AppRun) -> tuple[_AppRun, str] | None:
     """While an app slot's ``start`` migrates the shared database, the data owner's host lock carries a ``d`` line
     for this job (§7.1), so the owner's next job waits for it as for any data command left running. The line
     names a holder on the data host (a ``sleep`` as long as ``start`` may take), since the command itself runs
-    on another host; killing the holder lets the owner's jobs run again."""
+    on another host; killing the holder lets the owner's jobs run again. On managed data the slot's own lock
+    carries the line (P4 §10.4): the owner's jobs read every app slot's lock."""
+    if _managed(c.job):
+        return None
     owner = await c.member(environments.owner_slot(c.job.environment))
     assert c.new is not None
     seconds = max(60, int(c.new.man.timeout("start")))
@@ -4852,7 +5511,7 @@ async def _owner_d_line(c: _AppRun) -> tuple[_AppRun, str] | None:
                f"echo \"{HOLDER_MARK} $pid\"")
     _, output = await owner.remote.run(command, timeout=60)
     pid = next((ln.split()[-1] for ln in output.splitlines() if ln.startswith(HOLDER_MARK)), "")
-    await c.sink.line(f"Marked {owner.instance.host.name}'s lock while {c.instance.slot}'s start migrates the database")
+    await c.sink.line(f"Marked {data.host_label(owner.instance)}'s lock while {c.instance.slot}'s start migrates the database")
     return owner, pid
 
 
@@ -4861,7 +5520,7 @@ async def _owner_d_line_done(c: _AppRun, held: tuple[_AppRun, str]) -> None:
     (timed out, cut off) keeps the line."""
     owner, pid = held
     if c.job.lock_left:
-        await c.sink.line(f"{owner.instance.host.name}'s lock keeps the mark: {c.instance.slot}'s start may still run")
+        await c.sink.line(f"{data.host_label(owner.instance)}'s lock keeps the mark: {c.instance.slot}'s start may still run")
         return
     kill = f"kill {int(pid)} 2>/dev/null; " if pid.isdigit() else ""
     with contextlib.suppress(Exception):
@@ -4952,7 +5611,7 @@ async def _stop_slots(c: _AppRun) -> tuple[str, str | None]:
             finally:
                 stopped.append(m)  # also a stop that failed or was cut off part-way: some of it may be stopped
             await _save_instance(m.instance, status=InstanceStatus.STOPPED)
-            await c.sink.line(f"Stopped {m.instance.slot} on {m.instance.host.name}")
+            await c.sink.line(f"Stopped {m.instance.slot} on {data.host_label(m.instance)}")
     except Exception as exc:
         error = (str(exc) or type(exc).__name__).rstrip(".")
         back, left = await _start_again(c, stopped, before)
@@ -5198,9 +5857,12 @@ async def _migration_note(c: _AppRun, env: Any, active: Instance | None
     slot keeps running on it: say so and check it too (§7.4 smoke)."""
     job = c.job
     if (c.new is None or c.new.man.data.migrations != "expand_contract" or active is None
-            or active.id == c.instance.id or not job.revision_before or job.environment.data_mode != DataMode.SERVER):
+            or active.id == c.instance.id or not job.revision_before
+            or job.environment.data_mode not in (DataMode.SERVER, DataMode.MANAGED)):
         return None
-    owner = await c.member(environments.owner_slot(job.environment))
+    owner = await _owner_run(c)
+    if owner is c:
+        return None  # managed data read on this slot: nothing else runs on it to note
     side = owner.live or await _live_plan(owner, write=False)
     job_dir = data.job_dir(owner.paths.base, job.deployment_id)
     await owner.remote.run(f"umask 077 && mkdir -p -- {q(job_dir)}", timeout=60)
@@ -5242,8 +5904,9 @@ async def _traffic_step(c: _AppRun) -> None:
 async def _traffic(c: _AppRun) -> tuple[str, str | None]:
     """A member's ``traffic`` step (§7.4), in place of ``proxy``: a sync that never moves a name to another slot
     (I6). The data server and the data owner's jobs sync the names that follow the data server; an app slot
-    syncs every name only while it is the active one."""
-    job, instance = c.job, c.instance
+    syncs every name only while it is the active one. A managed owner's job, run on the data runner, syncs as
+    the data server's would."""
+    job, instance = c.job, c.job.instance
     async with session_scope() as db:
         env = await db.get(Environment, job.environment.id)
         assert env is not None
@@ -5279,13 +5942,19 @@ async def _member_backup(c: _AppRun) -> tuple[str, str | None]:
     data on its own host (D4); then this release's ``accepts`` runs on the revision here, and, with an active
     slot, the active slot's live ``accepts`` (the lag check, §7.6). Both refuse before ``start``."""
     job = c.job
-    owner = await c.member(environments.owner_slot(job.environment))
+    owner = await _owner_run(c)
     taken = await _take_backup(owner, BackupReason.PRE_DEPLOY, files=False)
     if taken is None:
         return "skipped", "slipway.yml declares no data"
     status, note, backup_id = taken
     if backup_id is not None:
         await _set_backup_id(job, backup_id)
+    if owner is c:
+        # Managed data whose runner is this slot (P4 §10.4 rules 2 and 3): the backup already checked this
+        # release against the revision; the active slot's lag check is left.
+        if job.revision_before:
+            await _lag_check(c, job.revision_before)
+        return status, note if status != "succeeded" else None
     status, note = _with_warning(status, note, await _member_checks(c, job.revision_before))
     return status, note if status != "succeeded" else None
 
@@ -5311,7 +5980,7 @@ async def _owner_revision(c: _AppRun) -> str | None:
     """The shared database's revision, read with the data server's live release on its host, without a dump
     (a slot deploy whose backup is skipped or kept from the first attempt)."""
     job = c.job
-    owner = await c.member(environments.owner_slot(job.environment))
+    owner = await _owner_run(c)
     if data.live_state(owner.instance) is None:
         return None
     side = owner.live or await _live_plan(owner, write=False)
@@ -5387,7 +6056,7 @@ _PRE_FINISH: dict[str, Callable[[_AppRun], Awaitable[None]]] = {"start_slots": _
 
 _PRE_START: dict[str, Callable[[_AppRun], Awaitable[None]]] = {
     "check": _check_step, "backup": _backup_step, "stop": _stop_step, "reset": _reset_step, "restore": _restore_step,
-    "files": _files_step, "after_import": _after_import_step, "stop_slots": _stop_slots_step,
+    "files": _files_step, "after_import": _after_import_step, "stop_slots": _stop_slots_step, "wipe": _wipe_step,
 }
 _POST_FINISH: dict[str, Callable[[_AppRun], Awaitable[None]]] = {
     "first_admin": _first_admin_step, "seed": _seed_step, "smoke": _smoke_step, "dns": _dns_step,
@@ -5489,7 +6158,7 @@ async def _export(c: _AppRun) -> None:
     """The snapshot's dump (and files) in the job's work folder on the host, checked and hashed (§7.5 export)."""
     job, side, remote, sink = c.job, c.new, c.remote, c.sink
     assert side is not None
-    host, cmds = c.instance.host.name, side.plan.commands
+    host, cmds = data.host_label(c.instance), side.plan.commands
     if "dump" not in cmds:
         raise DeployError(f"Release {side.sha7}'s slipway.yml has no dump command, so Slipway can't take a snapshot")
     job_dir = data.job_dir(c.paths.base, job.deployment_id)
@@ -5591,8 +6260,9 @@ class _GuardedWriter:
 
 async def _store(c: _AppRun) -> tuple[str, str | None]:
     """Copy the export into an encrypted ``.sbx`` on Slipway (§7.5 store). Plaintext never touches its disk:
-    the host's files stream through the encryptor, and each member is hashed again on the way."""
-    job, instance, side, sink = c.job, c.instance, c.new, c.sink
+    the host's files stream through the encryptor, and each member is hashed again on the way. The snapshot is
+    of the data owner (a managed environment's runs its commands on the data runner)."""
+    job, instance, side, sink = c.job, c.owner, c.new, c.sink
     assert side is not None
     exported, man = job.exported, side.man
     async with session_scope() as db:
@@ -5724,10 +6394,167 @@ async def _start_over(job: _Job, sink: LogSink, steps: Steps, connect: ConnectFa
             await _release_lock(remote, instance, job, sink)
 
 
+# ------------------------------------------------- a managed environment's data owner (P4 §10.4, §10.6)
+
+
+async def _start_over_runner(job: _Job) -> Instance | None:
+    """Start over on managed data, before any slot went live: the built app slot whose release is newest (its
+    backup step backs up with that release, as ``_newest_release`` does on any host)."""
+    built = [m for m in environments.app_members(job.members) if m.host is not None and ssh.host_is_built(m.host)]
+    if not built:
+        return None
+    async with session_scope() as db:
+        newest = await db.scalar(
+            select(Deployment.instance_id).where(Deployment.instance_id.in_([m.id for m in built]),
+                                                 Deployment.kind == DeploymentKind.DEPLOY,
+                                                 Deployment.release.is_not(None))
+            .order_by(Deployment.created_at.desc()).limit(1))
+    return next((m for m in built if m.id == newest), built[0])
+
+
+async def _mirror_runner(job: _Job, runner: Instance) -> None:
+    """The host-less owner's view of its data runner's live release (``data.runner_live``), kept up to date so
+    the rules that read the owner's live release read the runner's."""
+    owner = job.instance
+    state = data.runner_live(owner, runner)
+    if state != (owner.app_state or {}):
+        await _save_instance(owner, app_state=state)
+
+
+async def _open_runner(job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory,
+                       stack: contextlib.AsyncExitStack) -> _AppRun:
+    """The managed owner job's run on its data runner (P4 §10.4): connected, its host lock taken, every other
+    deployed app slot's lock read (a ``d`` line left there refuses as P2 does: the migration lock), the owner's
+    backups a restart left unfinished settled from Slipway's storage, and the runner's live release rendered
+    (Start over: the newest release on it)."""
+    env, owner = job.environment, job.instance
+    choice = data.runner_choice(env, job.members)
+    runner = choice.instance
+    if runner is None and job.start_over:
+        runner = await _start_over_runner(job)
+    if runner is None:
+        raise DeployError(data.no_runner_text(env, job.members))
+    if choice.note:
+        await sink.line(choice.note)
+        job.runner_said = True
+    host = runner.host
+    assert host is not None
+    await sink.line(f"{env.name}'s data commands run on {runner.slot} ({host.name})")
+    await sink.line(f"Connecting to {host.username}@{host.address}")
+    remote = await stack.enter_async_context(connect(ssh.SSHTarget.from_host(host)))
+    c = _AppRun(remote=remote, instance=runner, job=job, sink=sink, steps=steps, paths=paths_for(runner))
+    job.ctx = c
+    job.data_app = True
+    await _take_dir(remote, runner, sink)
+    await _acquire_lock(remote, runner, job, sink)
+    for m in environments.app_members(job.members):
+        if m.id != runner.id and m.host is not None and ssh.host_is_built(m.host) \
+                and (m.current_commit_sha or app_projects(m)):
+            await c.member(str(m.slot))
+    async with session_scope() as db:
+        for line in await data.settle_unverified(None, db, owner, None):
+            await sink.line(line)
+    if job.start_over:
+        c.new = await _newest_release(c)
+    else:
+        c.live = c.new = await _live_plan(c)
+        await _mirror_runner(job, runner)
+    return c
+
+
+async def _managed_finish(c: _AppRun) -> None:
+    """``finish`` of a managed owner's restore, roll back or reset: no release to switch (the runner's is live
+    and the slots are started). The data is now what this job made of it: its identity is the runner's live
+    render's, and nothing after this step fails the job (D12)."""
+    job, side = c.job, c.new
+    assert side is not None
+    job.identity = data.plan_identity(side.plan, side.man.identity_keys())
+    job.went_live = side.sha
+    await c.sink.line(f"{job.environment.name}'s data is ready after the {data.kind_noun(job.kind)}")
+
+
+async def _managed_owner_job(deployment_id: uuid.UUID, job: _Job, sink: LogSink, steps: Steps,
+                             connect: ConnectFactory) -> CommitInfo | None:
+    """A job of a managed environment's host-less data owner (P4 §10.4, §10.6), on its data runner: Back up now,
+    a snapshot, the first admin and starter content with the runner's live release; restore, roll back and
+    reset with the data steps between ``check`` and ``finish`` and no release, build, stop or start of their
+    own; Start over with the newest release. Backups are kept on Slipway (P4 §10.5)."""
+    owner, env = job.instance, job.environment
+    if job.env is None:
+        raise DeployError(_env_unreadable(job))
+    restore_kind = job.kind in data.RESTORE_KINDS and not job.start_over
+    if job.start_over:
+        async with session_scope() as db:
+            refused = await data.start_over_refusal(db, owner, environment=env)
+        if refused:
+            raise DeployError(refused)
+    elif restore_kind and (job.live_inputs is None or job.retry is None):
+        raise DeployError(data.not_live_text(owner))
+    commit: CommitInfo | None = None
+    if restore_kind:
+        assert job.retry is not None
+        async with session_scope() as db:
+            dep = await db.get(Deployment, deployment_id)
+            message = (dep.commit_message if dep is not None else None) or ""
+            author = (dep.commit_author if dep is not None else None) or ""
+        commit = CommitInfo(sha=job.retry.sha, message=message, author=author, date=None)
+        await sink.line(f"{data.kind_label(job.kind)} of {env.name}'s data: the live release {commit.sha[:7]} runs it")
+    c: _AppRun | None = None
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            if steps.listed("release"):
+                async with steps.step("release"):
+                    if job.kind == DeploymentKind.SNAPSHOT:
+                        # Taken before the app stops, so a stopped app never waits for a transfer slot.
+                        await stack.enter_async_context(snapshots.transfer(
+                            on_wait=lambda: sink.line("Waiting for another snapshot transfer to finish")))
+                    c = await _open_runner(job, sink, steps, connect, stack)
+                    job.identity = dict(owner.live_identity or {}) or None
+            else:
+                try:
+                    c = await _open_runner(job, sink, steps, connect, stack)
+                except Exception as exc:
+                    first = next((r["key"] for r in steps.rows if r.get("status") == "pending"), None)
+                    if first is not None:
+                        await steps.begin(first)
+                        await steps.end("failed", note=str(exc) or type(exc).__name__)
+                    raise
+            if job.kind == DeploymentKind.BACKUP:
+                await _backup_step(c)
+            elif job.kind == DeploymentKind.SNAPSHOT:
+                await _snapshot_steps(c)
+            elif job.kind == DeploymentKind.ADMIN:
+                await _first_admin_step(c)
+            elif job.kind == DeploymentKind.CONTENT:
+                await _seed_step(c)
+            else:
+                await _pre_start(c)
+                if not job.start_over:
+                    await _pre_finish(c)
+                    async with steps.step("finish"):
+                        await _managed_finish(c)
+                    await _post_finish(c)
+        except asyncio.CancelledError:
+            _mark_cut_off(job)
+            raise
+        finally:
+            if job.stored is not None:
+                stored, job.stored = job.stored, None
+                with contextlib.suppress(Exception):
+                    await stored.aclose()
+            if c is None and isinstance(job.ctx, _AppRun):
+                c = job.ctx  # opened, then refused (another slot's lock): its own lock is released all the same
+            if c is not None:
+                await _remove_job_dir(c.remote, c.instance, job)
+                await c.close_members()
+                await _release_lock(c.remote, c.instance, job, sink)
+    return commit
+
+
 async def _newest_release(c: _AppRun) -> _Side:
     """The newest release of the instance still on the host, planned with today's inputs (§7.4)."""
     instance, remote, job = c.instance, c.remote, c.job
-    host = instance.host.name
+    host = data.host_label(instance)
     async with session_scope() as db:
         rows = (await db.execute(
             select(Deployment.id, Deployment.release, Deployment.commit_sha).where(
@@ -5770,7 +6597,7 @@ async def _newest_release(c: _AppRun) -> _Side:
     if role == "server":
         role_kw = {"role": role, "server_values": {"host": instance.host.upstream_address, "clients": _clients(job)}}
     elif role == "slot":
-        role_kw = {"role": role, "data_values": await _data_values(c)}
+        role_kw = await _slot_role(c, man)
     try:
         plan = manifest.plan(man, template=template, builtins=app_builtins(instance, release, sha, dep_id),
                              settings=settings, chosen=chosen, host_ports=host_ports,
@@ -5844,7 +6671,7 @@ async def _check_projects_free(instance: Instance, projects: list[str]) -> None:
         clash = sorted(set(projects) & theirs)
         if clash:
             raise DeployError(f"slipway.yml: the Compose project {', '.join(clash)} is also instance {other.name}'s on "
-                              f"{instance.host.name}; make the project names in slipway.yml include {{slipway.slug}}")
+                              f"{data.host_label(instance)}; make the project names in slipway.yml include {{slipway.slug}}")
 
 
 HOST_MARK = "slipway-host:"
@@ -5894,7 +6721,7 @@ async def _check_projects_on_host(
     volumes = sorted({r[2] for r in rows if len(r) >= 3 and r[0] == "v"})
     kept_dir = f"{paths_for(instance).root}/.slipway-kept"
     kept = sorted({f"{kept_dir}/{r[1]}" for r in rows if len(r) >= 2 and r[0] == "k"})
-    host = instance.host.name
+    host = data.host_label(instance)
     if running:
         raise DeployError(
             f"{host} already runs containers in the Compose project{'s' if len(running) > 1 else ''} "
@@ -5961,11 +6788,18 @@ async def _pipeline(
                         .values(commit_sha=commit.sha, commit_message=message, commit_author=author or None)
                     )
                 await sink.line(f"Commit {commit.sha[:7]} — {message} ({author})")
+            if job.member and job.provider is not None:
+                # The droplet or VM first (Decision 12): built, continued or checked; then, on DigitalOcean, the
+                # database and the load balancer. The host is read again afterwards: it carries the new pin.
+                await _provider_prepare(job, sink, steps, connect, gh, repo, commit)
             if reuse:
                 assert job.retry is not None and job.retry.release
                 kept = posixpath.join(paths_for(instance).releases, posixpath.basename(job.retry.release))
-                async with connect(ssh.SSHTarget.from_host(host)) as probe:
-                    gone, _ = await probe.run(f"[ -d {q(kept)} ]", check=False, timeout=60)
+                if not ssh.host_is_built(host):
+                    gone = 1  # nothing to connect to: the release went with the host (P4 §14.3)
+                else:
+                    async with connect(ssh.SSHTarget.from_host(host)) as probe:
+                        gone, _ = await probe.run(f"[ -d {q(kept)} ]", check=False, timeout=60)
                 if gone:
                     await sink.line(f"The release {kept} is no longer on {host.name}: downloading the commit again")
                     job.retry.reusable = reuse = False
@@ -5979,9 +6813,303 @@ async def _pipeline(
                     await asyncio.to_thread(check_source_archive, tarball, guarded_paths(instance))
 
         await sink.line(f"Connecting to {host.username}@{host.address}")
-        async with connect(ssh.SSHTarget.from_host(host)) as remote:
-            await _install(remote, instance, deployment_id, commit.sha, tarball, job, sink, steps)
+        if job.provider is not None:
+            # A droplet or VM may restart in the resize step: its session can then be opened again.
+            async with _Reopenable(connect, host) as remote:
+                await _install(remote, instance, deployment_id, commit.sha, tarball, job, sink, steps)
+        else:
+            async with connect(ssh.SSHTarget.from_host(host)) as remote:
+                await _install(remote, instance, deployment_id, commit.sha, tarball, job, sink, steps)
     return commit
+
+
+# ------------------------------------------------------------ provider steps (phases 4 and 5)
+
+
+async def _timed_step(steps: Steps, sink: LogSink, key: str, provider: str | None,
+                      body: Callable[[], Awaitable[tuple[str, str | None]]]) -> None:
+    """Run a member step whose body says how it ended (``("succeeded" | "skipped" | "warning", note)``) inside
+    its time limit (``step_timeout``, Decision 13). A timeout cancels the body, whose shielded parts still
+    finish (a create's send and record, power_on after a power_off, Terraform's SIGINT grace), and fails the
+    step with a text naming it and the limit. Any other error fails the step and the job."""
+    limit = step_timeout(key, provider)
+    await steps.begin(key)
+    name = next((r["name"] for r in steps.rows if r["key"] == key), STEP_NAMES.get(key, key))
+    try:
+        if limit is None:
+            status, note = await body()
+        else:
+            timer = asyncio.timeout(limit)
+            try:
+                async with timer:
+                    status, note = await body()
+            except TimeoutError:
+                if not timer.expired():
+                    raise
+                raise DeployError(f"{name} timed out after {_minutes(limit)}") from None
+    except Exception as exc:
+        await steps.end("failed", note=str(exc) or type(exc).__name__)
+        raise
+    except BaseException:
+        await steps.end("failed", note="Interrupted")
+        raise
+    if note and status in ("skipped", "warning"):
+        await sink.line(f"Warning: {note}" if status == "warning" else note)
+    await steps.end(status, note=note)
+
+
+async def _refresh_host(host: Host) -> None:
+    """Read ``host`` again (populate_existing) into the job's own object, so ``SSHTarget.from_host`` carries what
+    the provider's step wrote: the pin, the address, the phase (P5 §10.3)."""
+    async with session_scope() as db:
+        fresh = await db.get(Host, host.id, populate_existing=True)
+        if fresh is None:
+            raise DeployError(f"Host {host.name} was removed while this job ran")
+        for attr in sa_inspect(Host).column_attrs:
+            set_committed_value(host, attr.key, getattr(fresh, attr.key))
+
+
+async def _refresh_after_prepare(job: _Job) -> None:
+    """What a DigitalOcean ``prepare`` may have written to other rows than the deploying slot's host (D28, P4
+    §10.4): another slot's host found ``gone``, and this slot's live release gone with its old droplet
+    (``app_state.gone_live``). The job's own objects take them, so the data runner is chosen on them."""
+    for member in (job.members or {}).values():
+        if member.host is not None and member is not job.instance:
+            await _refresh_host(member.host)
+    async with session_scope() as db:
+        state = await db.scalar(select(Instance.app_state).where(Instance.id == job.instance.id))
+    set_committed_value(job.instance, "app_state", state)
+
+
+async def _reload_options(job: _Job) -> None:
+    """The deployment's options as a provider's step left them (``manifest_sha256``, ``rebuild``, ``resize``):
+    the job's own copy takes them, so a later ``_save_options`` keeps them."""
+    async with session_scope() as db:
+        stored = await db.scalar(select(Deployment.options).where(Deployment.id == job.deployment_id))
+    job.options.update(stored or {})
+
+
+async def _hide_account(job: _Job, account: ProviderAccount | None) -> None:
+    for value in provider_accounts.redactions(account) if account is not None else []:
+        job.hide.add(value)
+
+
+def _provision_context(job: _Job, sink: LogSink, connect: ConnectFactory) -> do_provision.ProvisionContext:
+    """The DigitalOcean steps' context for this job's slot (P4 §9-§11; S09a and S09b)."""
+    return do_provision.ProvisionContext(
+        environment_id=job.environment.id, instance_id=job.instance.id, deployment_id=job.deployment_id,
+        say=sink.line, redactor=job.hide, connect=connect, actor=job.user)
+
+
+async def _machine_context(job: _Job, sink: LogSink, connect: ConnectFactory) -> machines.MachineContext:
+    async with session_scope() as db:
+        mctx = await machines.load_context(
+            db, host_id=job.instance.host.id, deployment_id=job.deployment_id,
+            user_id=job.user.id if job.user is not None else None, say=sink.line, hide=job.hide, connect=connect,
+        )
+    if mctx is None:
+        raise DeployError(f"Slipway has no record of the VM behind {data.host_label(job.instance)}")
+    await _hide_account(job, mctx.account)
+    return mctx
+
+
+def _notes(notes: Iterable[str]) -> str | None:
+    return " ".join(n for n in notes if n) or None
+
+
+async def _provider_prepare(job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory, gh: Any,
+                            repo: Repository, commit: CommitInfo) -> None:
+    """``prepare`` (and a DigitalOcean slot's ``database`` and ``edge``) right after ``resolve``, before
+    ``source`` (P4 §14.3, P5 §6.3, §10.3). Each is a change step: its failure fails the job and nothing after
+    it runs. DigitalOcean's ``prepare`` reads slipway.yml at the resolved commit (``options.manifest_sha256``);
+    ``database`` and ``edge`` use what it read. A VM's ``prepare`` makes, continues or checks the VM, and runs
+    the read-only resize checks when the job lists ``resize``."""
+    instance, provider = job.instance, job.provider
+    if provider == "digitalocean":
+        ctx = _provision_context(job, sink, connect)
+        job.provision = ctx
+        async with session_scope() as db:
+            account = await db.get(ProviderAccount, job.environment.provider_account_id) \
+                if job.environment.provider_account_id else None
+        await _hide_account(job, account)
+
+        async def read_manifest() -> str:
+            text = await gh.get_file(repo.github_id, instance.manifest_file, commit.sha)
+            if text is None:
+                raise do_provision.ProvisionError(
+                    f"{instance.manifest_file} was not found in {repo.full_name} at {commit.sha[:7]} (or it is "
+                    "larger than 256 KB). Slipway changed nothing")
+            return text
+
+        async def prepare() -> tuple[str, str | None]:
+            prepared = await do_provision.prepare(ctx, read_manifest=read_manifest)
+            return "succeeded", _notes(prepared.notes)
+
+        async def database() -> tuple[str, str | None]:
+            ctx.secrets = await _role_secrets(job, sink, ctx.manifest)
+            made = await do_provision.database(ctx)
+            if made is None:
+                return "skipped", "slipway.yml asks for no managed database"
+            return "succeeded", _notes(made.notes)
+
+        async def edge() -> tuple[str, str | None]:
+            made = await do_provision.edge(ctx)
+            return "succeeded", _notes(made.notes)
+
+        try:
+            await _timed_step(steps, sink, "prepare", provider, prepare)
+            await _reload_options(job)
+            await _refresh_host(instance.host)
+            await _refresh_after_prepare(job)
+            for key, body in (("database", database), ("edge", edge)):
+                if steps.listed(key):
+                    await _timed_step(steps, sink, key, provider, body)
+            if steps.listed("edge") and await _dns_behind(job):
+                # The load balancer was made again at a new address: its names move there in this deploy, so
+                # none keeps pointing at the address DigitalOcean released (P4 §11.3).
+                await steps.insert_after("edge", "dns", DNS_AFTER_EDGE)
+                await _timed_step(steps, sink, "dns", provider, lambda: _dns_after_edge(job, sink))
+        finally:
+            await _reload_options(job)
+    else:
+        mctx = await _machine_context(job, sink, connect)
+        job.provision = mctx
+        resize = steps.listed("resize")
+        await _timed_step(steps, sink, "prepare", provider, lambda: machines.prepare(mctx, resize=resize))
+    await _refresh_host(instance.host)
+
+
+DNS_AFTER_EDGE = "Move DNS to the load balancer's new address"
+
+
+async def _dns_behind(job: _Job) -> bool:
+    """Whether a record this environment published names another address than its load balancer's (P4 §11.3:
+    ``edge`` made the load balancer again, at a new IP). Read from Slipway's records only."""
+    async with session_scope() as db:
+        env = await db.get(Environment, job.environment.id)
+        if env is None or not (env.traffic or {}).get("dns"):
+            return False
+        address = str(((env.traffic or {}).get("dns") or {}).get("address") or "")
+        rows = await resources.owned(db, env.id, cloudflare.PROVIDER, cloudflare.KIND)
+    return bool(address) and any((r.details or {}).get("content") not in (None, "", address) for r in rows)
+
+
+async def _dns_after_edge(job: _Job, sink: LogSink) -> tuple[str, str | None]:
+    """The names published at the load balancer's new address. It never fails the deploy: a refusal or a
+    Cloudflare failure leaves a warning that a Publish moves them."""
+    env, _ = await _env_now(job)
+    address = ((env.traffic or {}).get("dns") or {}).get("address")
+    try:
+        await traffic.publish_dns(env, sink.line, actor=job.user)
+    except Exception as exc:
+        return "warning", f"The DNS records still name the old address: run Publish to move them to {address} ({exc})"
+    return "succeeded", f"The DNS records now name {address}"
+
+
+class _Reopenable:
+    """The SSH session of a deploy on a droplet or VM, opened again after the ``resize`` step restarted the
+    machine (the old connection went with it). Everything else is the session's own."""
+
+    def __init__(self, connect: ConnectFactory, host: Host) -> None:
+        self._connect, self._host = connect, host
+        self._stack: contextlib.AsyncExitStack | None = None
+        self._session: Any = None
+
+    async def __aenter__(self) -> _Reopenable:
+        await self._open()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            await stack.aclose()
+
+    async def _open(self) -> None:
+        stack = contextlib.AsyncExitStack()
+        try:
+            self._session = await stack.enter_async_context(self._connect(ssh.SSHTarget.from_host(self._host)))
+        except BaseException:
+            await stack.aclose()
+            raise
+        self._stack = stack
+
+    async def reopen(self) -> None:
+        """Close the old session (it may be dead already: its errors don't matter) and open a new one."""
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(30):
+                    await stack.aclose()
+        await self._open()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+
+async def _reopen(c: _AppRun) -> None:
+    await _refresh_host(c.instance.host)
+    if isinstance(c.remote, _Reopenable):
+        await c.remote.reopen()
+
+
+class _AsStarted:
+    """``instance`` as it was when the job started (the deploy has marked it deploying since): the resize step
+    starts its live release again only when it was running (P5 §6.7 step 4)."""
+
+    def __init__(self, instance: Instance, status: str | None) -> None:
+        self._instance, self.status = instance, status
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._instance, name)
+
+
+async def _resize_step(c: _AppRun) -> None:
+    """The shared ``resize`` step (Decision 14; P4 §9.4, P5 §6.7), after ``backup``: the stored size applied to
+    the slot's droplet or VM. The session is opened again once the machine is back."""
+    job = c.job
+    provider = job.provider
+
+    async def droplet() -> tuple[str, str | None]:
+        ctx = job.provision if isinstance(job.provision, do_provision.ProvisionContext) else \
+            _provision_context(job, c.sink, job.connect)
+        note = await do_provision.resize_droplet(ctx)
+        if note:
+            return "skipped", note
+        await _reopen(c)
+        async with session_scope() as db:
+            env = await db.get(Environment, job.environment.id)
+        return "succeeded", f"Resized to {((env.cloud if env is not None else None) or {}).get('droplet_size')}"
+
+    async def vm() -> tuple[str, str | None]:
+        mctx = job.provision if isinstance(job.provision, machines.MachineContext) else \
+            await _machine_context(job, c.sink, job.connect)
+        job.provision = mctx
+        reopened = False
+
+        async def start_release(_instance: Any) -> None:
+            nonlocal reopened
+            await _reopen(c)
+            reopened = True
+            await _control(c, "start")
+
+        status, note = await machines.resize_step(mctx, instance=_AsStarted(c.instance, job.status_before),
+                                                  start_release=start_release)
+        if status != "skipped" and not reopened:
+            await _reopen(c)
+        return status, note
+
+    if provider == "digitalocean":
+        body = droplet
+    elif provider in vmnet.PROVIDERS:
+        body = vm
+    else:
+        await c.steps.skip("resize", "Slipway made no machine for this slot")
+        return
+    await _timed_step(c.steps, c.sink, "resize", provider, body)
+    await _reload_options(job)
+
+
+_PRE_START["resize"] = _resize_step
 
 
 async def _live_pipeline(
@@ -6007,13 +7135,25 @@ async def _live_pipeline(
 
 
 async def _failure_fields(deployment_id: uuid.UUID, job: _Job) -> dict[str, Any]:
+    """The instance fields a failed job leaves (``_failed_fields``). A managed environment's host-less owner
+    keeps its status: it runs nothing of its own (P4 §3.4)."""
+    fields = await _failed_fields(deployment_id, job)
+    if data.hostless(job.instance):
+        fields.pop("status", None)
+    return fields
+
+
+async def _failed_fields(deployment_id: uuid.UUID, job: _Job) -> dict[str, Any]:
     """The instance fields a failed job leaves (§7.1, §8.4).
 
     A deploy: FAILED, and ``data_dirty`` when it began changing an app's data (its ``start`` began). A restore,
     roll back or reset: FAILED with ``data_dirty`` once its ``stop`` began, otherwise the status it had (the old
     app still runs). Start over keeps the status it had either way. Data-only jobs never change the instance,
-    except a snapshot that stopped the app and couldn't start it again: STOPPED, as the app is.
+    except a snapshot that stopped the app and couldn't start it again: STOPPED, as the app is. A VM job leaves
+    only a revert's hold (``vm_jobs.failed_fields``).
     """
+    if job.kind in vm_jobs.KINDS:
+        return await vm_jobs.failed_fields(deployment_id, job)
     if job.instance.build_source == BuildSource.APP and job.kind in data.DATA_ONLY_KINDS:
         return await _left_stopped_fields(deployment_id, job.instance)
     restore_kind = job.instance.build_source == BuildSource.APP and job.kind in data.RESTORE_KINDS
@@ -6159,6 +7299,9 @@ async def _success_record(job: _Job, commit: CommitInfo | None, steps: Steps) ->
     if not job.member:
         return fields
     instance, owner = job.instance, job.data_owner
+    if data.hostless(instance):
+        # A managed environment's owner: only its data fields (P4 §3.4); its live release is the runner's.
+        return {k: v for k, v in fields.items() if k not in _OWN_FIELDS}
     if owner is instance:
         if instance.slot == environments.DATA_SLOT and job.kind == DeploymentKind.DEPLOY:
             # It ran no app migration: it never settles a failed slot deploy, and fresh_data stays as its start
@@ -6195,6 +7338,8 @@ async def _success_record(job: _Job, commit: CommitInfo | None, steps: Steps) ->
 
 def _success_fields(job: _Job, commit: CommitInfo | None, steps: Steps) -> dict[str, Any]:
     instance = job.instance
+    if job.kind in vm_jobs.KINDS:
+        return {}  # a revert's vm_settle and restart wrote the instance's fields themselves (P5 §9.7)
     if instance.build_source == BuildSource.APP and job.kind in data.DATA_ONLY_KINDS:
         if job.kind == DeploymentKind.CONTENT and steps.status("seed") == "succeeded":
             return {"content_pending": False}
@@ -6257,7 +7402,13 @@ async def run_deployment(
             # Never generated again (§3.8). A deploy goes on when the environment's variables set every secret
             # of its release, and keeps them as the environment's (_install_app); nothing else can.
             raise DeployError(SECRETS_LOST.format(env=job.environment.name))
-        if data_only:
+        if job.member and data.hostless(job.instance):
+            # A managed environment's data owner: its jobs run on the data runner (P4 §10.4).
+            commit = await _managed_owner_job(deployment_id, job, sink, steps, connect)
+        elif job.kind in vm_jobs.KINDS:
+            # Take, revert to or delete a VM snapshot (P5 §9.6-§9.8).
+            await vm_jobs.run(job, sink, steps, connect)
+        elif data_only:
             await _data_job(job, sink, steps, connect)
         elif job.start_over:
             await _start_over(job, sink, steps, connect)
@@ -6437,7 +7588,15 @@ class DeployRunner:
         steps left (§7.6): pending backups become ``unverified`` (the next job checks them), pending snapshots
         fail, background checks start again, a job that had begun changing the data leaves ``data_dirty`` (a
         running change step counts as begun), and a restore-type job that changed nothing puts the status back.
-        The host lock stays: a command may still be running there (§4.5)."""
+        The host lock stays: a command may still be running there (§4.5).
+
+        A deploy cut off in a provider's step (P4 §15.13, P5 §9.12): in ``prepare``, a droplet host left building
+        stays so (the next prepare resolves it) and a VM keeps its stage, gets ``last_error`` and loses its
+        Terraform locks; in ``resize``, the environment's notice says the droplet may be powered off, or the VM
+        was left off (``machines.left_off``, which also audits it), never over a notice with a ``next``
+        (Decision 23). A VM job's pending VM snapshot rows fail, and a revert cut off between ``vm_revert`` and the
+        end of ``vm_settle`` holds the data with P5 §9.12's text (``vm_jobs.recover``)."""
+        resized: list[tuple[uuid.UUID, uuid.UUID]] = []  # (host, deployment): a resize cut off by the restart
         async with session_scope() as db:
             stale = (
                 await db.scalars(
@@ -6448,11 +7607,21 @@ class DeployRunner:
             ).all()
             recovered_live: list[uuid.UUID] = []
             for dep in stale:
+                cut = next((r.get("key") for r in dep.steps or [] if r.get("status") == "running"), None)
+                if dep.instance_id is not None and cut in ("prepare", "resize"):
+                    with contextlib.suppress(Exception):
+                        found = await _recover_provider_step(db, dep, cut)
+                        if found is not None:
+                            resized.append(found)
                 dep.status = DeploymentStatus.FAILED
                 dep.steps = [{**r, "status": "failed", "note": "Interrupted"} if r.get("status") == "running" else r
                              for r in dep.steps or []]
                 dep.error = "Interrupted by a Slipway restart"
                 dep.finished_at = utcnow()
+                if dep.kind in vm_jobs.KINDS:
+                    # Its pending VM snapshot rows fail, and a revert cut off in its disk's change holds the data
+                    # (P5 §9.12).
+                    await vm_jobs.recover(db, dep, cut)
                 owner = await _recovery_owner(db, dep)
                 _recover_instance(dep, owner=owner, settles=await _settles_owner(db, dep, owner))
                 if dep.instance_id is None and dep.environment_id is not None:
@@ -6468,6 +7637,9 @@ class DeployRunner:
                                      error="Slipway restarted while this snapshot was being taken; take it again")
                              .execution_options(synchronize_session=False))
             checking = list((await db.scalars(select(Snapshot.id).where(Snapshot.status == SnapshotStatus.CHECKING))).all())
+        for host_id, dep_id in resized:
+            with contextlib.suppress(Exception):
+                await _left_off_after_restart(host_id, dep_id)
         for snapshot_id in checking:
             snapshots.schedule_validation(snapshot_id)
         # A job of an environment recovery marked succeeded has no Retry, and its chain hook never ran: the
@@ -6477,10 +7649,58 @@ class DeployRunner:
                 await environments.chain_notice(dep_id, why="restart")
 
     async def shutdown(self) -> None:
+        """Cancel every job and wait for each to end. The wait has no limit of its own: a job cut off in
+        Terraform waits for its shielded SIGINT grace (30 s) so Terraform saves its state, inside the container's
+        60 s stop grace (P5 D27)."""
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+async def _recover_provider_step(db: Any, dep: Deployment, cut: str) -> tuple[uuid.UUID, uuid.UUID] | None:
+    """What a restart leaves of a deploy cut off in ``prepare`` or ``resize`` (P4 §15.13, P5 §9.12), in the
+    recovery's transaction. Returns ``(host, deployment)`` for an interrupted resize, whose notice is written
+    once the transaction has committed."""
+    instance = await db.get(Instance, dep.instance_id)
+    host = instance.host if instance is not None else None
+    if host is None or (host.provider or "ssh") == "ssh":
+        return None
+    slot = str(instance.slot or instance.name)
+    if cut == "prepare":
+        if host.provider == "digitalocean":
+            lines = await do_provision.recover_prepare(db, dep)
+        else:
+            machine = await machines.recover_prepare(db, dep)
+            lines = [f"{machine.name} keeps its stage ({machine.stage}); the next deploy to {slot} continues from "
+                     "there"] if machine is not None else []
+        if lines:
+            dep.log = (dep.log or "") + "".join(f"[{utcnow():%H:%M:%S}] {line}\n" for line in lines)
+        return None
+    return host.id, dep.id
+
+
+async def _left_off_after_restart(host_id: uuid.UUID, dep_id: uuid.UUID) -> None:
+    """A ``resize`` a restart cut off: the droplet may be off (P4 §15.13), or the VM was left off (P5 §9.12)."""
+    async with session_scope() as db:
+        host = await db.get(Host, host_id)
+        if host is None:
+            return
+        instance = await db.scalar(select(Instance).where(Instance.host_id == host_id))
+        slot = str((instance.slot if instance is not None else None) or host.name)
+        env_id = host.owner_environment_id
+        mctx = None
+        if host.provider in vmnet.PROVIDERS:
+            mctx = await machines.load_context(db, host_id=host_id, deployment_id=dep_id, say=_say_nothing,
+                                               hide=ssh.Redactor())
+    if mctx is not None:
+        await machines.left_off(mctx, f"Slipway restarted while resizing {mctx.vm}")
+    elif host.provider == "digitalocean" and env_id is not None:
+        await machines.set_notice(env_id, do_provision.powered_off_notice(slot), deployment_id=dep_id)
+
+
+async def _say_nothing(_line: str) -> None:
+    return None
 
 
 def _declared_data(dep: Deployment) -> bool:
@@ -6618,6 +7838,8 @@ runner = DeployRunner()
 async def run_on_instance(
     instance: Instance, command: str, *, connect: ConnectFactory = ssh.open_session, check: bool = True
 ) -> str:
-    async with connect(ssh.SSHTarget.from_host(instance.host)) as remote:
+    """Run ``command`` on the instance's host. DeployError for a host-less owner; ``ssh.HostNotBuilt`` (not an
+    SSHError) for a host a provider hasn't built yet."""
+    async with connect(ssh.SSHTarget.from_host(host_of(instance))) as remote:
         _, output = await remote.run(command, check=check, timeout=120)
     return output

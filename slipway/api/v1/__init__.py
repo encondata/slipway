@@ -7,6 +7,7 @@ from slipway.api.v1 import (
     environments,
     hosts,
     instances,
+    provider_accounts,
     repositories,
     roles,
     settings,
@@ -20,5 +21,5 @@ from slipway.api.v1 import (
 
 api_router = APIRouter()
 for module in (system, auth, users, roles, tokens, hosts, unmanaged, repositories, instances, environments, deployments,
-               snapshots, audit, settings, updates):
+               snapshots, audit, settings, provider_accounts, updates):
     api_router.include_router(module.router)

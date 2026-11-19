@@ -16,6 +16,10 @@
 {% block content %}
 {% set traffic = env.traffic or {} %}
 {% set dns = traffic.get("dns") %}
+{#- A DigitalOcean environment's names go through its load balancer (phase 4 §3.2): the switch stays do_lb, DNS
+    stays on at the load balancer's address, and only "proxied" changes. Its listener serves its own certificate,
+    so there is no Switchyard TLS mode to choose. #}
+{% set on_do = traffic.get("switch") == "do_lb" %}
 <div class="page-head">
   <div>
     <div class="breadcrumb"><a href="/environments">Environments</a>{{ icon("chevron-right", "i-sm") }}<a href="/environments/{{ env.id }}">{{ env.name }}</a>{{ icon("chevron-right", "i-sm") }}<span>Settings</span></div>
@@ -69,17 +73,31 @@
     <div class="card-body stack" style="gap: 16px">
       {% if env.hostnames %}
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Public name</th><th>Follows</th><th>TLS</th></tr></thead>
+        <thead><tr><th>Public name</th><th>Follows</th>{% if not on_do %}<th>TLS</th>{% endif %}</tr></thead>
         <tbody>{% for h in env.hostnames %}
           {%- set chosen = (env.route_tls or {}).get(h.hostname, "") %}
           <tr><td class="mono">{{ h.hostname }}</td><td>{{ "The data server" if h.follows == "server" else "The live slot" }}</td>
-            <td><select class="input" data-map="route_tls" data-map-key="{{ h.hostname }}" aria-label="TLS for {{ h.hostname }}">
+            {% if not on_do %}<td><select class="input" data-map="route_tls" data-map-key="{{ h.hostname }}" aria-label="TLS for {{ h.hostname }}">
               <option value="" {{ 'selected' if not chosen }}>Switchyard's default ({{ default_tls }})</option>
               {% for value, label in tls_modes %}<option value="{{ value }}" {{ 'selected' if chosen == value }}>{{ label }}</option>{% endfor %}
-            </select></td></tr>
+            </select></td>{% endif %}</tr>
         {% endfor %}</tbody>
       </table></div>
       {% endif %}
+      {% if on_do %}
+      <input type="hidden" name="traffic.switch" value="do_lb">
+      <div class="field">
+        <span class="label-text">Switch</span>
+        <span>The DigitalOcean load balancer{% if (env.cloud or {}).get("lb_ip") %} <span class="subtle mono">({{ env.cloud.lb_ip }})</span>{% endif %} <span class="subtle">(a DigitalOcean environment keeps it, with HTTPS on its own certificate)</span></span>
+      </div>
+      {% if dns %}
+      <div class="field">
+        <span class="label-text">DNS records in Cloudflare{% if cloudflare %} <span class="subtle">({{ cloudflare.zone }})</span>{% endif %}</span>
+        <span class="help">Always published, at the load balancer's address, which Slipway sets.</span>
+        <label class="check"><input type="checkbox" name="traffic.dns.proxied" {{ 'checked' if dns.get('proxied') }}><span>Proxied</span></label>
+      </div>
+      {% endif %}
+      {% else %}
       <div class="field">
         <span class="label-text">Switch</span>
         <div class="row wrap" style="gap: 8px 20px">
@@ -97,7 +115,9 @@
         <label class="check" style="align-self: end"><input type="checkbox" name="traffic.dns.proxied" {{ 'checked' if (dns or {}).get('proxied', cloudflare.proxied if cloudflare else False) }}><span>Proxied</span></label>
       </div>
       {% if dns %}<label class="check" data-show-when="dns_on=" hidden><input type="checkbox" name="traffic.forget_lost_zone"><span>Forget the records whose zone is gone <span class="subtle">(when the Cloudflare zone was deleted or moved to another account, its records went with it; Slipway deletes nothing)</span></span></label>{% endif %}
-      {% if two %}<label class="check"><input type="checkbox" name="auto_activate" {{ 'checked' if env.auto_activate }}><span><strong>Activate automatically when the smoke test passes</strong></span></label>{% endif %}
+      {% endif %}
+      {% if two and env.production %}<label class="check" title="A production environment waits for Activate"><input type="checkbox" name="auto_activate" disabled><span><strong>Activate automatically when the smoke test passes</strong> <span class="subtle">(a production environment waits for Activate)</span></span></label>
+      {% elif two %}<label class="check"><input type="checkbox" name="auto_activate" {{ 'checked' if env.auto_activate }}><span><strong>Activate automatically when the smoke test passes</strong></span></label>{% endif %}
     </div>
   </section>
 

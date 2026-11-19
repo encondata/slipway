@@ -8,7 +8,9 @@ This module holds the pieces that don't need an environment:
 
 * the integration settings (``app_settings`` row ``cloudflare``: zone, zone id, public IP and the
   proxied default in ``value``, the API token in ``secret``) and the checks for what people type;
-* ``CloudflareClient``, the handful of API calls Slipway makes;
+* ``CloudflareClient``, the handful of API calls Slipway makes, the TXT records of ACME challenges
+  among them (``create_txt``, ``txt_records``; these are found by their comment, not by a
+  ``resources`` row);
 * ``plan_dns``, which decides, per hostname, whether a record is up to date, needs a change,
   can be created, is covered by a wildcard, could be claimed, is one Slipway made but never recorded
   (adopt), or is in someone else's way. It is a pure function, so the rules can be tested without
@@ -43,6 +45,7 @@ MARKER = "Managed by Slipway"
 TIMEOUT = 30
 MAX_RETRY_AFTER = 30  # seconds; a 429 is retried once, after at most this long
 MESSAGE_CHARS = 200  # how much of Cloudflare's own error text goes into ours
+TXT_TTL = 60  # seconds: a challenge record lives for one ACME order
 # Record types that can't sit beside Slipway's A record at a name: a CNAME (DNS forbids it), an
 # AAAA (IPv6 clients would go somewhere Slipway doesn't manage; open question 6) and NS (the name
 # is delegated elsewhere, so a record here would never be served).
@@ -289,6 +292,22 @@ class CloudflareClient:
         return await self._call("PATCH", f"/zones/{zone_id}/dns_records/{record_id}", body={
             "content": content, "proxied": bool(proxied), "ttl": 1, "comment": comment,
         })
+
+    async def create_txt(self, zone_id: str, name: str, content: str, comment: str) -> dict[str, Any]:
+        """A TXT record (an ACME challenge's): not proxied, the shortest TTL Cloudflare allows everywhere."""
+        return await self._call("POST", f"/zones/{zone_id}/dns_records", body={
+            "type": "TXT", "name": name, "content": content, "ttl": TXT_TTL, "comment": comment,
+        })
+
+    async def txt_records(self, zone_id: str, comment: str) -> list[dict[str, Any]]:
+        """Every TXT record in the zone whose comment is exactly ``comment``.
+
+        Cloudflare filters on both; they are checked here again, so a record that only looks like it
+        matches is never returned (and so never deleted by the caller).
+        """
+        found = await self._call("GET", f"/zones/{zone_id}/dns_records",
+                                 params={"type": "TXT", "comment": comment, "per_page": 100}) or []
+        return [r for r in found if isinstance(r, dict) and r.get("type") == "TXT" and r.get("comment") == comment]
 
     async def delete_record(self, zone_id: str, record_id: str) -> bool:
         """True when deleted, False when it was already gone. A 404 about the zone raises."""

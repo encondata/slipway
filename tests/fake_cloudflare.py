@@ -37,6 +37,7 @@ class FakeCloudflare:
         self.rate_limit_once = False  # the next call answers 429 with Retry-After: 1
         self.deny: bool | set[str] = False  # True, or a set of methods, answered with 403
         self.echo_token_in_errors = False  # a misbehaving API that repeats the token in its message
+        self.ignore_comment_filter = False  # an API that ignores ``comment=`` in a record listing
 
     # -- set-up helpers
 
@@ -97,9 +98,12 @@ class FakeCloudflare:
 
     def _collection(self, method: str, zid: str, params: dict[str, str], body: Any) -> httpx.Response:
         if method == "GET":
+            # ``comment`` is Cloudflare's exact match on the record's comment (unless ``ignore_comment_filter``).
             recs = [r for r in self.records.values() if r["zone_id"] == zid
                     and ("name" not in params or r["name"] == params["name"])
-                    and ("type" not in params or r["type"] == params["type"])]
+                    and ("type" not in params or r["type"] == params["type"])
+                    and ("comment" not in params or self.ignore_comment_filter
+                         or r.get("comment") == params["comment"])]
             per_page = int(params.get("per_page", 100))
             return _ok(recs[:per_page], result_info={"count": min(len(recs), per_page), "total_count": len(recs)})
         if method == "POST":

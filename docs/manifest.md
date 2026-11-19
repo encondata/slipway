@@ -5,7 +5,7 @@ A repository describes how it is deployed in a `slipway.yml`. An instance whose 
 instance (a `.yml` or `.yaml` file, at most 256 KB). Slipway knows nothing about the app beyond what
 this file says, so any app is deployed the same way.
 
-The file has two parts:
+The file has these parts:
 
 - **Deploying** (phase 1): the settings Slipway asks for, the values it sets, the secrets it
   generates once and keeps, the services and their ports and hostnames, the Compose projects and
@@ -18,6 +18,9 @@ The file has two parts:
 - **Environments** (phase 3, all optional): health paths for smoke tests, and how the app runs as
   Blue/Green app slots that share a data server (`data.migrations`, `data.attach`, `data.server`).
   An instance outside an environment ignores them.
+- **DigitalOcean** (phase 4, all optional): how the app serves its names behind a cloud load
+  balancer (`edge`) and how it runs on a managed database and object store (`data.managed`).
+  Only an environment on DigitalOcean reads them.
 
 A complete example is [examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml).
 Slipway checks the whole file before anything runs, and a mistake fails the deploy with a message
@@ -46,7 +49,8 @@ An app's commands run on the host as trusted code, like a compose file.
 15. [Which commands go together](#which-commands-go-together)
 16. [What Slipway offers an app](#what-slipway-offers-an-app)
 17. [Environments: attach and server](#environments-attach-and-server)
-18. [Examples](#examples)
+18. [DigitalOcean: edge and data.managed](#digitalocean-edge-and-datamanaged)
+19. [Examples](#examples)
 
 ---
 
@@ -69,6 +73,7 @@ An app's commands run on the host as trusted code, like a compose file.
 | `data` | no | What the app's data is, and how it runs in an environment. |
 | `first_admin` | no | How to create the app's first administrator. |
 | `timeouts` | no | How long commands may run, in minutes. |
+| `edge` | no | How the app serves its names behind a cloud load balancer ([DigitalOcean](#digitalocean-edge-and-datamanaged)). |
 
 Any other key is refused, so a typing mistake never goes unnoticed. Text values are one line. YAML
 reads a bare number as a number (`3.10` becomes `3.1`), so put numbers, versions and octal values
@@ -103,9 +108,10 @@ quotes) can't be used either, because Slipway would copy its unexpanded text; se
 or `vars` instead.
 
 `{data.<endpoint>.<field>}`, `{secret.<KEY>}`, `{server.host}`, `{server.port.<name>}` and
-`{server.clients}` are values of an environment, allowed only in `data.attach` and `data.server`
-([Environments](#environments-attach-and-server)); anywhere else Slipway refuses them and says where
-they can be used.
+`{server.clients}` are values of an environment, allowed only in `data.attach`, `data.server` and
+`data.managed.env` ([Environments](#environments-attach-and-server)). `{edge.address}` and
+`{edge.trusted}` are allowed only in `edge.env` ([DigitalOcean](#digitalocean-edge-and-datamanaged)).
+Anywhere else Slipway refuses them and says where they can be used.
 
 `{slipway.out}`, `{slipway.in}` and `{admin.<field>}` are not template values. They are
 [slots](#slots-and-stream-mode), filled in when a command runs, and only some commands can use them.
@@ -128,7 +134,10 @@ When the same key comes from several places, the later one in this list wins:
 
 In an environment, an app slot whose data is on the data server also gets `data.attach.env`, and
 the data server `data.server.env`, both between `vars` and the secrets
-([Environments](#environments-attach-and-server)).
+([Environments](#environments-attach-and-server)). On DigitalOcean an app slot gets
+`data.attach.env`, then `data.managed.env`, then `edge.env`, in that order, in the same place; a
+setting or var that `edge.env` names takes the edge's value there
+([DigitalOcean](#digitalocean-edge-and-datamanaged)).
 
 Their keys never overlap, except that an environment variable of the instance may replace a secret
 or an `env_file` default. It may not replace a setting, a var or a port variable: Slipway refuses
@@ -464,7 +473,10 @@ What a release's slipway.yml declares decides what the instance page and the API
 | First admin | `first_admin` |
 | Starter content | `seed` |
 | An environment with a data server (one app slot) | `data.attach` and `data.server` |
-| Blue/Green (two app slots on one data server) | `data.server` and `data.migrations: expand_contract` |
+| Blue/Green (two app slots on one set of data) | `data.server` or `data.managed`, and `data.migrations: expand_contract` |
+| Serving behind a cloud load balancer | `edge` |
+| Managed data | `data.managed` |
+| An environment on DigitalOcean | `edge`, and `data.managed` with an entry for every `data.attach.needs` endpoint |
 
 When `has_data` exits 4 (the data lives outside the host), Slipway still backs the data up, but
 won't restore it, roll it back, reset it or seed it.
@@ -565,11 +577,84 @@ The environment's own variables may not set a key that `data.attach.env`, `data.
 its `start` migrates the shared database while the active slot keeps serving the release before.
 Two app slots need it.
 
+## DigitalOcean: edge and data.managed
+
+On DigitalOcean an environment's app slots run on droplets behind a cloud load balancer, and their
+data is a managed PostgreSQL cluster and a Spaces bucket. There is no data server. Two keys say how
+the app runs there; an environment on SSH hosts and an instance outside an environment ignore them.
+
+```yaml
+edge:                                   # how the app serves its names behind a cloud load balancer
+  port: 80                              # the host port each app slot serves plain HTTP on
+  health: /healthz                      # what the load balancer asks for
+  env:                                  # written into every app slot's .env behind the load balancer
+    STACK_CADDY: "1"
+    STACK_PROXY_IP: 172.30.0.2          # a setting: behind the load balancer it isn't asked for
+    STACK_HOSTS_IP: "{edge.address}"
+    STACK_TRUSTED_PROXIES: "{edge.trusted}"
+  projects: ["ss-{STACK_ENV}-proxy"]    # projects the edge adds
+
+data:
+  managed:                              # how the app runs on a managed database and object store
+    skip: [spaces]                      # services that don't run when the data is managed
+    db:      {version: "16", database: serversherpa, user: serversherpa, password: "{secret.POSTGRES_PASSWORD}"}
+    objects: {cors: [portal, kiosk, wiki]}
+    env:                                # written only when the data is managed
+      SS_SPACES_BUCKET: "{data.objects.bucket}"
+    commands:                           # replace these commands on managed data
+      has_data: [deploy/stack/ss-stack, has-data, "{slipway.env_dir}", --external]
+```
+
+**`edge`**
+
+| Key | Meaning |
+|---|---|
+| `port` | Required. The host port (1-65535) each app slot serves plain HTTP on. Not a service's `port`. It can't change once the environment's load balancer exists. |
+| `health` | Required. The path the load balancer asks for, such as `/healthz`. It is asked with a `Host` outside the app's names. It can't change once the load balancer exists. |
+| `env` | 1 to 30 `.env` keys written into every app slot's `.env` behind the load balancer. A key may be an `env_file` key, a setting or a var; not a secret, a port variable, the optional services variable, or a `data.attach.env` or `data.managed.env` key. Values may use `{edge.address}`, `{edge.trusted}`, settings and vars; never `{secret.…}`, `{data.…}` or `{server.…}`. A setting named here is **set by the edge**: behind the load balancer it isn't required and isn't asked for, and the edge's value wins. |
+| `projects` | Up to 4 Compose projects the edge adds, written like `projects`; none may be one of `projects`. They are stopped, checked and removed like the rest. |
+
+**Edge values**
+
+| Value | Allowed in | Filled with |
+|---|---|---|
+| `{edge.address}` | `edge.env` | the load balancer's IP address |
+| `{edge.trusted}` | `edge.env` | the environment's VPC range, where the load balancer's requests come from |
+
+**`data.managed`** needs `data.attach` (the app slots must be told where the data is), and an entry
+for every `data.attach.needs` endpoint and no other. `skip`, `env` and `commands` are its own keys,
+so they can't be endpoint names.
+
+| Key | Meaning |
+|---|---|
+| `<endpoint>` (`postgres`) | `version` (required, `"13"` to `"17"`, in quotes), `database` and `user` (a lowercase letter or `_`, then lowercase letters, digits and `_`, at most 63; not a name PostgreSQL or DigitalOcean keeps for itself, such as `postgres`, `doadmin`, `defaultdb`, `template1` or one starting `pg_`), and `password`, exactly one declared `{secret.<KEY>}`. The role and the database are made with these. |
+| `<endpoint>` (`s3`) | `cors`: 0 to 10 services, each declared, with a hostname and not in `skip`. Their `https://` origins may PUT, GET and HEAD. |
+| `skip` | Services that don't run when the data is managed, such as an object store. Each must be declared. |
+| `env` | Up to 20 `.env` keys written into every app slot's `.env` only when the data is managed, right after `data.attach.env`. The rules are `data.attach.env`'s: a key may not be a setting, a var, a secret, a port variable or a `data.attach.env` key; values may use `{data.<endpoint>.<field>}` and `{secret.<KEY>}`. An `env_file` key, such as ServerSherpa's `SS_SPACES_BUCKET`, is allowed. |
+| `commands` | `has_data` and `data_up`, written as in `commands` (no slots), in place of the app's own on managed data. |
+
+**What a DigitalOcean app slot gets** (on top of the app slot column of
+[What each member gets](#environments-attach-and-server)):
+
+| | App slot on managed data, behind the load balancer |
+|---|---|
+| Services, port variables and routes | without `data.managed.skip` |
+| `.env` keys added | `data.attach.env` (filled with the cluster's and the bucket's values), `data.managed.env`, `edge.env` |
+| Projects | all, then `edge.projects` |
+| Volumes | only the `data.volumes` that hold `other`: the database and the files are managed |
+| Commands | as declared, with `data.managed.commands` in place of the app's |
+
+The environment's own variables may not set a key that `edge.env` or `data.managed.env` sets on
+DigitalOcean. On SSH hosts Slipway doesn't set them, so an environment variable there may.
+
+Blue/Green on DigitalOcean needs `data.managed` and `data.migrations: expand_contract`, as two slots
+on a data server need `data.server` and the same promise.
+
 ## Examples
 
 **ServerSherpa** ([examples/serversherpa.slipway.yml](examples/serversherpa.slipway.yml)) uses
-every feature, through its `deploy/stack/ss-stack` script, environments with a data server
-included.
+every feature, through its `deploy/stack/ss-stack` script, environments with a data server and
+DigitalOcean's `edge` and `data.managed` included.
 
 **A Django app with PostgreSQL**, no object store and no wrapper scripts:
 

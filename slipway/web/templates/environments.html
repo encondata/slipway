@@ -22,7 +22,10 @@
     {% for r in rows %}
       {% set e = r.env %}
       <tr>
-        <td><a class="primary-cell" href="/environments/{{ e.id }}" style="color:inherit"><span class="row-icon">{{ icon("environments") }}</span><span><strong>{{ e.name }}</strong><small>{{ badge("environment", e.status) }}</small></span></a></td>
+        <td><a class="primary-cell" href="/environments/{{ e.id }}" style="color:inherit"><span class="row-icon">{{ icon("environments") }}</span><span><strong>{{ e.name }}</strong><small>{{ badge("environment", e.status) }}
+          {%- if r.production %} <span class="badge primary">Production</span>{% endif %}
+          {%- if r.retiring %} <span class="badge warning">Retiring</span>{% endif %}
+          {%- if r.billing %} <span class="badge warning" data-billing title="{{ r.billing_title }}">Billing</span>{% endif %}</small></span></a></td>
         <td class="muted">{{ e.repository.full_name }}<div><span class="chip">{{ icon("branch", "i-sm") }} {{ e.branch }}</span></div></td>
         <td>{% if r.active %}{{ slot_chip(r.active.slot, True) }} <span class="mono subtle">{{ (r.active.current_commit_sha or "")[:7] }}</span>{% else %}<span class="muted">Nothing live</span>{% endif %}</td>
         <td>{% if r.idle %}{{ slot_chip(r.idle.slot) }} <span class="mono subtle">{{ (r.idle.current_commit_sha or "")[:7] or "—" }}</span> {% if r.idle_check %}{{ check_chip(r.idle_check) }}{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>

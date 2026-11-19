@@ -213,6 +213,13 @@ class HostOut(Out):
     os_info: str | None
     metrics: dict[str, Any]
     created_at: datetime
+    # Phases 4 and 5 (Decision 33): the environment that made the host ({id, name, slot}), None for a host added
+    # by hand; whether it is built (a droplet or VM not made yet isn't); what its provider recorded.
+    owned_by: dict[str, Any] | None = None
+    built: bool = True
+    provider_state: dict[str, Any] = {}
+    # Phase 5 (P5 §11): a VM Slipway made: {stage, account: {id, name, provider}}; None for any other host.
+    machine: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _copy_label(self) -> HostOut:
@@ -518,8 +525,9 @@ class InstanceOut(Out):
     slug: str
     repository_id: uuid.UUID
     repository: str
-    host_id: uuid.UUID
-    host: str
+    # None for a managed environment's data owner, which has no host (phase 4 §3.4).
+    host_id: uuid.UUID | None
+    host: str | None
     branch: str
     build_source: str
     dockerfile_path: str
@@ -579,7 +587,7 @@ class InstanceOut(Out):
             repository_id=i.repository_id,
             repository=i.repository.full_name,
             host_id=i.host_id,
-            host=i.host.name,
+            host=i.host.name if i.host is not None else None,
             branch=i.branch,
             build_source=i.build_source,
             dockerfile_path=i.dockerfile_path,
@@ -860,6 +868,12 @@ class RetryIn(BaseModel):
     take_over_lock: bool = False  # data:reset
     # A teardown's retry forgets the Switchyard hosts and DNS records it can't delete (the typed name).
     forget_traffic: bool = False
+    # Phases 4 and 5 (P4 §16, P5 §11): asked again on every retry, never copied from the job retried.
+    confirm_production: Confirm | None = None  # a production teardown: "delete production <name>"
+    confirm_no_snapshot: Confirm | None = None  # ... when it went without a snapshot
+    rebuild_data: bool = False  # make a gone cluster or bucket again, empty (data:reset, the typed name)
+    drop_data: bool = False  # a teardown whose data's only home goes with it (data:reset)
+    forget_vms: bool = False  # Remove slot or teardown: forgettable VM blockers pass (machines:write, the name)
 
 
 class ConfirmIn(BaseModel):
@@ -929,6 +943,7 @@ class BackupOut(BaseModel):
     identity_note: str | None
     needs_reset_perm: bool  # restoring it puts back other identity keys: data:reset
     dirty_note: str | None = None
+    location: str = "host"  # host (the instance's backups folder) or slipway (Slipway's storage, P4 §10.5)
 
     @classmethod
     def of(cls, view: data.BackupView, *, created_by: str | None = None, note: str | None = None) -> BackupOut:
@@ -941,6 +956,7 @@ class BackupOut(BaseModel):
             note=row.note if row.note is not None else note, checked_at=row.checked_at, pinned=view.pinned,
             pinned_reason=view.pinned_reason, restorable=view.restorable, reason_text=view.reason_text,
             identity_note=view.identity_note, needs_reset_perm=view.needs_reset_perm, dirty_note=view.dirty_note,
+            location=str(row.location or "host"),
         )
 
 
@@ -1017,7 +1033,8 @@ class DnsIn(BaseModel):
 
 
 class TrafficIn(BaseModel):
-    switch: Literal["none", "switchyard"] = "none"
+    # ``do_lb``: a DigitalOcean environment's load balancer, only with placement digitalocean (phase 4 §3.2).
+    switch: Literal["none", "switchyard", "do_lb"] = "none"
     dns: DnsIn | None = None
     # Turning DNS off: forget, without deleting, the records whose Cloudflare zone is gone (deleted and added
     # again, or moved to another account), since there is nothing left there to delete.
@@ -1051,19 +1068,76 @@ class _EnvironmentFields(BaseModel):
         return None if v is None else {switchyard.clean_hostname(k): m for k, m in v.items()}
 
 
+# Phase 4 (§15.1) and phase 5 (§9.2): where the environment runs. One create body serves both (Decision 24).
+DoSize = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")]
+CostFigure = Annotated[str, Field(max_length=20), NoNul]  # the monthly total as shown, "84.00" (§12.2)
+
+
+class PlacementIn(BaseModel):
+    """``placement`` of a DigitalOcean environment (P4 §15.1). ``region`` defaults to the account's; ``slots`` is
+    1 (blue) or 2 (Blue/Green)."""
+
+    provider: Literal["digitalocean"]
+    account_id: uuid.UUID
+    region: Annotated[str, Field(max_length=8, pattern=r"^[a-z]{3}[0-9]$")] | None = None
+    droplet_size: DoSize
+    db_size: DoSize
+    db_standby: bool = False
+    acme_staging: bool = False
+    slots: Literal[1, 2] = 1
+
+
+class MachineSpecIn(BaseModel):
+    """A new VM (P5 §9.2): one of the account's networks, a typed IPv4 address or ``auto``, and its size."""
+
+    account_id: uuid.UUID
+    network: Annotated[str, Field(min_length=1, max_length=40), NoNul]
+    address: Annotated[str, Field(max_length=15), NoNul] | None = "auto"
+    cores: int | None = None
+    memory_mb: int | None = None
+    disk_gb: int | None = None
+
+    def size(self) -> dict[str, int]:
+        return {k: v for k, v in (("cores", self.cores), ("memory_mb", self.memory_mb), ("disk_gb", self.disk_gb))
+                if v is not None}
+
+
+class MachineIn(BaseModel):
+    """``hosts.<slot> = {machine: …}``: a VM Slipway makes for the slot."""
+
+    machine: MachineSpecIn
+
+
 class EnvironmentCreate(_EnvironmentFields):
     name: EnvName
     repository_id: uuid.UUID
     branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
     manifest_file: Annotated[str, Field(max_length=255), NoNul] | None = None
-    data_mode: Literal["slot", "server"]
-    hosts: dict[SlotKey, uuid.UUID]
+    # ``managed`` is forced with placement digitalocean (P4 D21).
+    data_mode: Literal["slot", "server", "managed"]
+    # A host id (P3), or a new VM (P5 §9.2). Left out with placement digitalocean: the droplets are made.
+    hosts: dict[SlotKey, uuid.UUID | MachineIn] = {}
     seed_snapshot_id: uuid.UUID | None = None
     first_admin: FirstAdminIn | None = None
+    placement: PlacementIn | None = None
+    production: bool = False
+    confirm_cost: CostFigure | None = None
+
+
+class CloudSizesIn(BaseModel):
+    """A DigitalOcean environment's sizes, grown by PATCH (P4 §15.7): sizes only grow, a standby is only added."""
+
+    droplet_size: DoSize | None = None
+    db_size: DoSize | None = None
+    db_standby: bool | None = None
 
 
 class EnvironmentUpdate(_EnvironmentFields):
-    """PATCH: only the fields sent change. Each slot uses them from its next deploy."""
+    """PATCH: only the fields sent change. Each slot uses them from its next deploy. ``cloud`` grows a
+    DigitalOcean environment's sizes and needs ``confirm_cost`` (``environments.grow_plan``)."""
+
+    cloud: CloudSizesIn | None = None
+    confirm_cost: CostFigure | None = None
 
 
 class EnvDeployIn(BaseModel):
@@ -1082,8 +1156,25 @@ class SlotIn(BaseModel):
     slot: Literal["blue", "green"]
 
 
+class ActivateIn(SlotIn):
+    """Activate and Switch back: a production environment's name typed (P4 §13, Decision 39)."""
+
+    confirm: Confirm | None = None
+
+
+class RetireIn(BaseModel):
+    """Retire and un-retire a production environment (P4 §13): its name typed."""
+
+    confirm: Confirm | None = None
+
+
 class SlotAdd(BaseModel):
-    host_id: uuid.UUID
+    """Add the second app slot (Decision 25). On SSH placement exactly one of ``host_id`` and ``machine`` (P5
+    §9.5); on DigitalOcean neither, and ``confirm_cost`` the new monthly total (P4 §15.5)."""
+
+    host_id: uuid.UUID | None = None
+    machine: MachineSpecIn | None = None
+    confirm_cost: CostFigure | None = None
     update_data_server: bool = False  # queue an update of the data server so it lets the new host in
 
 
@@ -1102,8 +1193,166 @@ class SnapshotFirst(BaseModel):
 
 
 class EnvironmentDelete(BaseModel):
+    """One body for both phases (P4 §15.10, P5 §9.9); the rules are ``environments.delete_problem``."""
+
     confirm: Confirm | None = None
     snapshot: SnapshotFirst | None = None  # take a snapshot of the data first (data:backup)
+    # Delete without a snapshot although the data's only home (a managed cluster, a data VM) goes (data:reset).
+    drop_data: bool = False
+    confirm_production: Confirm | None = None  # "delete production <name>"
+    confirm_no_snapshot: Confirm | None = None  # "delete production <name> without a snapshot"
+    forget_vms: bool = False  # forgettable VM blockers pass (machines:write, environments:delete)
+
+
+class RemoveSlotIn(BaseModel):
+    """Remove a slot (P3 §9.9, P5 §9.5, Decision 44): the environment's name typed; ``forget_vms`` lets the slot's
+    forgettable VM blockers pass (machines:write and environments:delete)."""
+
+    confirm: Confirm | None = None
+    forget_vms: bool = False
+
+
+class MachineResizeIn(BaseModel):
+    """``PATCH /environments/{id}/machines/{slot}`` (P5 §9.4): the VM's wanted size and how many automatic VM
+    snapshots it keeps. Stored only; the slot's next deploy applies it. ``environments.resize_plan`` checks it."""
+
+    cores: int | None = None
+    memory_mb: int | None = None
+    disk_gb: int | None = None
+    keep_vm_snapshots: int | None = None
+
+
+class VmSnapshotIn(BaseModel):
+    """Take a VM snapshot (P5 §9.6)."""
+
+    note: Annotated[str, Field(max_length=300), NoNul] | None = None
+
+
+class VmRevertIn(BaseModel):
+    """Revert to a VM snapshot (P5 §9.7): the environment's name typed; ``skip_pre_revert`` takes no snapshot of
+    the VM as it is first (ZFS never takes one)."""
+
+    confirm: Confirm | None = None
+    skip_pre_revert: bool = False
+
+
+class MachineStateOut(BaseModel):
+    """What the hypervisor shows of a VM now (``machines.MachineState``), read for a page. ``error`` is ``busy``
+    when the account's page reads are all taken, else why the account couldn't be read; ``detail`` says it in
+    a sentence."""
+
+    exists: bool | None = None
+    ours: bool | None = None
+    why_not_ours: str | None = None
+    hidden: bool = False
+    lost: bool = False  # ready, and gone from the hypervisor (Forget the VM, P5 §9.10)
+    power: str | None = None
+    busy: str | None = None
+    addresses: list[str] = []
+    applied: dict[str, Any] | None = None
+    snapshot_mode: str | None = None
+    error: str | None = None
+    detail: str | None = None
+
+
+class MachineBlockerOut(BaseModel):
+    """One reason the VM can't be removed now (``vmtypes.Blocker``): ``forgettable`` when ``forget_vms`` gets
+    past it."""
+
+    text: str
+    forgettable: bool
+
+
+class MachineOut(BaseModel):
+    """A VM Slipway made for an environment's slot (P5 §11). ``applies_at`` says when a pending resize is
+    applied: ``next deploy``, ``when idle`` (the active slot of two) or ``never (data server)``.
+
+    ``blockers`` and ``forgettable`` are read only for ``GET .../machines?blockers=true`` (None otherwise, or
+    when the read didn't answer in time): what stops Remove slot and Delete removing the VM now, as their check
+    reads it (``machines.blockers``), and whether ``forget_vms`` gets past all of it (False when nothing blocks
+    the removal, or a blocker isn't forgettable)."""
+
+    slot: str
+    name: str
+    account: dict[str, Any]  # {id, name, provider}
+    network: str | None
+    address: str | None
+    stage: str
+    size: dict[str, Any]
+    applied: dict[str, Any] | None = None
+    pending_resize: bool = False
+    applies_at: Literal["next deploy", "when idle", "never (data server)"] | None = None
+    keep_vm_snapshots: int
+    snapshot_mode: str | None = None
+    last_task: dict[str, Any] | None = None
+    ready_at: datetime | None = None
+    last_error: str | None = None
+    host_id: uuid.UUID
+    live: MachineStateOut | None = None
+    note: str | None = None  # Forget the VM: what Slipway did
+    blockers: list[MachineBlockerOut] | None = None
+    forgettable: bool | None = None
+
+    @classmethod
+    def of(cls, machine: Any, *, active: bool = False, live: MachineStateOut | None = None,
+           note: str | None = None, blockers: list[Any] | None = None) -> MachineOut:
+        """``active``: the slot takes the traffic in an environment of two app slots."""
+        from slipway.services import machines
+
+        network = dict(machine.network or {})
+        account = machine.account
+        pending = machine.stage == "ready" and machines.size_differs(machine)
+        applies_at = None
+        if pending:
+            applies_at = "never (data server)" if machine.slot == "data" else "when idle" if active else "next deploy"
+        return cls(
+            slot=machine.slot, name=machine.name,
+            account={"id": account.id, "name": account.name, "provider": account.provider} if account is not None
+            else {"id": machine.account_id, "name": None, "provider": machine.provider},
+            network=network.get("name"), address=network.get("address"), stage=machine.stage,
+            size=dict(machine.size or {}), applied=dict(machine.applied) if machine.applied else None,
+            pending_resize=pending, applies_at=applies_at, keep_vm_snapshots=machine.keep_vm_snapshots,
+            snapshot_mode=machine.snapshot_mode, last_task=machine.last_task, ready_at=machine.ready_at,
+            last_error=machine.last_error, host_id=machine.host_id, live=live, note=note,
+            blockers=None if blockers is None else [MachineBlockerOut(text=str(b.text), forgettable=bool(b.forgettable))
+                                                    for b in blockers],
+            forgettable=None if blockers is None else bool(blockers) and all(b.forgettable for b in blockers),
+        )
+
+
+class VmSnapshotOut(BaseModel):
+    """A VM snapshot Slipway recorded, joined with the hypervisor's list (P5 §11). ``on_hypervisor`` is None
+    when the hypervisor couldn't be read; ``backups_after`` are the data's backups taken after it, which a
+    revert loses."""
+
+    id: uuid.UUID
+    name: str
+    reason: str
+    status: str
+    taken_at: datetime
+    commit_sha: str | None = None
+    note: str | None = None
+    quiesced: bool | None = None
+    sizes: dict[str, Any] = {}
+    on_hypervisor: bool | None = None
+    newest: bool = False
+    revert: dict[str, Any] = {}  # {available, reason}
+    drop: dict[str, Any] = {}  # {available, reason}
+    backups_after: list[str] = []
+
+
+class VmSnapshotsOut(BaseModel):
+    """``GET /environments/{id}/vm-snapshots``: the VM the snapshots are of (the environment's one app slot), its
+    snapshot mode, the live read's error (``busy`` or why the account couldn't be read, with ``detail``), whether
+    a new one can be taken, and the snapshots, newest first."""
+
+    slot: str | None = None
+    vm: str | None = None
+    snapshot_mode: str | None = None
+    error: str | None = None
+    detail: str | None = None
+    take: dict[str, Any] = {}  # {available, reason}
+    snapshots: list[VmSnapshotOut] = []
 
 
 class SlotHost(BaseModel):
@@ -1118,7 +1367,7 @@ class SlotOut(BaseModel):
     slot: str
     instance_id: uuid.UUID
     role: Literal["app", "data"]
-    host: SlotHost
+    host: SlotHost | None  # None for a managed environment's data owner (phase 4 §3.4)
     status: str
     active: bool
     # {sha, deployed_at, release, settings_differ}: what runs now, and whether the environment's settings
@@ -1127,9 +1376,11 @@ class SlotOut(BaseModel):
     last_check: dict[str, Any] | None = None
     stale: dict[str, Any] | None = None
     ports: list[dict[str, Any]] = []
+    # "Resize pending: applies at <slot>'s next deploy" (Decision 33), set by the environment's answer.
+    resize_pending: str | None = None
 
     @classmethod
-    def of(cls, env: Any, i: Instance) -> SlotOut:
+    def of(cls, env: Any, i: Instance, *, resize_pending: str | None = None) -> SlotOut:
         live = data.live_state(i)
         live_out = None
         if live is not None or i.current_commit_sha:
@@ -1148,10 +1399,23 @@ class SlotOut(BaseModel):
         h = i.host
         return cls(slot=str(i.slot), instance_id=i.id, role="data" if i.slot == "data" else "app",
                    host=SlotHost(id=h.id, name=h.name, address=h.address, upstream_address=h.upstream_address,
-                                 lan_address=h.lan_address),
+                                 lan_address=h.lan_address) if h is not None else None,
                    status=i.status, active=env.active_slot_id == i.id, live=live_out,
                    last_check=state.get("last_check") if isinstance(state.get("last_check"), dict) else None,
-                   stale=state.get("stale") if isinstance(state.get("stale"), dict) else None, ports=ports)
+                   stale=state.get("stale") if isinstance(state.get("stale"), dict) else None, ports=ports,
+                   resize_pending=resize_pending)
+
+
+class ChangeCheckOut(BaseModel):
+    """``?check=true`` on ``POST /environments/{id}/slots`` and on a growing ``PATCH /environments/{id}`` (P4
+    §15.5, §15.7): every refusal ran and nothing was written. ``plan`` is the slot (``slot``, ``host_id``,
+    ``host``, ``planned``, a new VM's ``machine``) or the sizes (``from``, ``to``); ``cost`` the new estimate
+    (``lines``, ``total_cents``, ``total``, ``as_of``, ``note``, ``delta`` from the stored one), for DigitalOcean
+    only, and the figure ``confirm_cost`` must then be."""
+
+    ok: bool = True
+    plan: dict[str, Any]
+    cost: dict[str, Any] | None = None
 
 
 class SlotAdded(SlotOut):
@@ -1179,7 +1443,7 @@ class EnvironmentSummary(BaseModel):
             "id": env.id, "name": env.name, "status": env.status,
             "repository": {"id": env.repository_id, "full_name": env.repository.full_name if env.repository else None},
             "branch": env.branch, "data_mode": env.data_mode, "active_slot": active,
-            "slots": [{"slot": m.slot, "host_name": m.host.name, "status": m.status,
+            "slots": [{"slot": m.slot, "host_name": m.host.name if m.host is not None else None, "status": m.status,
                        "sha7": (m.current_commit_sha or "")[:7] or None} for m in slots],
             "last_job": {"id": last.id, "kind": last.kind, "status": last.status, "finished_at": last.finished_at,
                          "label": data.dep_label(last)} if last is not None else None,
@@ -1214,6 +1478,14 @@ class EnvironmentOut(EnvironmentSummary):
     deleted_at: datetime | None = None
     actions: dict[str, Any] = {}
     warnings: list[str] = []  # POST /environments: what was accepted but is worth knowing
+    # Phase 4 (§16): the placement (ssh or digitalocean), production and retiring; for a DigitalOcean environment
+    # what Slipway recorded of its cloud (``environment_out`` builds it; no DigitalOcean read).
+    provider: str = "ssh"
+    production: bool = False
+    retiring_at: datetime | None = None
+    cloud: dict[str, Any] | None = None
+    # Phase 5 (P5 §11): the environment's VMs, from Slipway's records (GET .../machines reads them live).
+    machines: list[MachineOut] = []
 
 
 # --------------------------------------------------------------------------- audit
@@ -1230,5 +1502,244 @@ class AuditOut(BaseModel):
     created_at: datetime
 
 
-def host_out(host: Host) -> HostOut:
-    return HostOut.model_validate(host)
+def host_out(host: Host, *, owned_by: dict[str, Any] | None = None,
+             machine: dict[str, Any] | None = None) -> HostOut:
+    """``owned_by`` ({id, name, slot}) names the environment that made the host, ``machine`` ({stage, account})
+    the VM it is; the API reads both (``api/v1/hosts.owned_by_of``, ``machines_of``)."""
+    from slipway.services import ssh
+
+    out = HostOut.model_validate(host)
+    out.owned_by = owned_by
+    out.machine = machine
+    out.built = ssh.host_is_built(host)
+    out.provider_state = dict(host.provider_state or {})
+    return out
+
+
+# ------------------------------------------------------------ provider accounts (phase 4 §16, phase 5 §11)
+#
+# Field types are loose on purpose: services/provider_accounts.py checks every value and answers 422 with the
+# field it refused (``vmtypes.AccountInvalid``), with texts a person can act on. The bounds here only keep
+# absurd input out. Secrets are write-only: no answer carries one.
+
+AccountName = Annotated[str, Field(max_length=100), NoNul]
+AccountSecret = Annotated[str, Field(max_length=500), NoNul]
+AccountText = Annotated[str, Field(max_length=300), NoNul]
+NetText = Annotated[str, Field(max_length=100), NoNul]
+SshSource = Annotated[str, Field(max_length=60), NoNul]
+
+
+class AddressPool(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    first: NetText
+    last: NetText
+
+
+class Network(BaseModel):
+    """One network of a Proxmox or ESXi account (phase 5 §3.1), checked by ``vmnet.check_network_profile``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: NetText
+    bridge: NetText | None = None  # Proxmox
+    vlan_tag: int | None = None  # Proxmox
+    port_group: NetText | None = None  # ESXi
+    subnet: NetText
+    gateway: NetText
+    dns_servers: list[NetText] = Field(default_factory=list, max_length=10)
+    pool: AddressPool | None = None
+
+
+class DigitalOceanAccountIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["digitalocean"]
+    name: AccountName
+    secret: AccountSecret | None = None
+    production: bool = False
+    region: Annotated[str, Field(max_length=20), NoNul]
+    ssh_sources: list[SshSource] = Field(max_length=50)
+    monthly_limit_cents: int | None = None
+    prices: dict[str, Any] | None = None
+
+
+class ProxmoxAccountIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["proxmox"]
+    name: AccountName
+    secret: AccountSecret | None = None
+    trust_fingerprint: AccountText | None = None
+    url: AccountText
+    node: AccountText
+    pool: AccountText
+    storage: AccountText
+    template_vmid: int | str
+    networks: list[Network] = Field(max_length=50)
+
+
+class EsxiAccountIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["esxi"]
+    name: AccountName
+    secret: AccountSecret | None = None
+    trust_fingerprint: AccountText | None = None
+    url: AccountText
+    user: AccountText
+    datastore: AccountText
+    resource_pool: AccountText | None = None  # ESXi's root pool, Resources, when left out
+    source_vm: AccountText
+    networks: list[Network] = Field(default_factory=list, max_length=50)
+
+
+ProviderAccountIn = Annotated[DigitalOceanAccountIn | ProxmoxAccountIn | EsxiAccountIn, Field(discriminator="provider")]
+
+
+class ProviderAccountUpdate(BaseModel):
+    """PATCH: every field optional, and an omitted one keeps its value. A field of another provider's account is
+    refused by name. An omitted secret is kept (for Proxmox and ESXi only while the URL and user stay)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: AccountName | None = None
+    secret: AccountSecret | None = None
+    clear_secret: bool = False  # DigitalOcean: drop the stored token
+    production: bool | None = None
+    region: Annotated[str, Field(max_length=20), NoNul] | None = None
+    ssh_sources: list[SshSource] | None = Field(None, max_length=50)
+    monthly_limit_cents: int | None = None  # null clears the limit
+    prices: dict[str, Any] | None = None  # null drops the override
+    trust_fingerprint: AccountText | None = None
+    url: AccountText | None = None
+    node: AccountText | None = None
+    pool: AccountText | None = None
+    storage: AccountText | None = None
+    template_vmid: int | str | None = None
+    user: AccountText | None = None
+    datastore: AccountText | None = None
+    resource_pool: AccountText | None = None
+    source_vm: AccountText | None = None
+    networks: list[Network] | None = Field(None, max_length=50)
+
+
+class AccountTestIn(BaseModel):
+    """POST /provider-accounts/test: a DigitalOcean token that isn't saved."""
+
+    secret: AccountSecret
+    region: Annotated[str, Field(max_length=20), NoNul] | None = None
+
+
+class TrustIn(BaseModel):
+    fingerprint: AccountText
+
+
+class AccountDelete(BaseModel):
+    confirm: Confirm | None = None
+
+
+class AccountTestOut(BaseModel):
+    status: str
+    checks: list[dict[str, Any]]
+    facts: dict[str, Any]
+
+
+class AccountUse(BaseModel):
+    environment: str
+    environment_id: uuid.UUID
+    slot: str | None = None  # a VM's slot
+    name: str | None = None  # a VM's name
+
+
+class PinnedCertificate(BaseModel):
+    fingerprint_sha256: str
+    subject: str
+    not_after: str | None = None
+
+
+class _AccountOutBase(BaseModel):
+    id: uuid.UUID
+    name: str
+    production: bool
+    has_secret: bool
+    secret_hint: str
+    status: str
+    checks: list[dict[str, Any]]
+    facts: dict[str, Any]
+    last_checked_at: datetime | None
+    removed: bool
+    removed_at: datetime | None
+    used_by: list[AccountUse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DigitalOceanAccountOut(_AccountOutBase):
+    provider: Literal["digitalocean"]
+    region: str | None = None
+    team_name: str | None = None
+    ssh_sources: list[str] = []
+    ssh_open: bool = False  # an SSH source is 0.0.0.0/0 or ::/0
+    monthly_limit_cents: int | None = None
+    estimate_cents: int = 0  # the confirmed monthly cost of the environments that use it
+    prices: dict[str, Any] | None = None
+
+
+class _HypervisorAccountOut(_AccountOutBase):
+    url: str | None = None
+    networks: list[dict[str, Any]] = []
+    tls: PinnedCertificate | None = None
+
+
+class ProxmoxAccountOut(_HypervisorAccountOut):
+    provider: Literal["proxmox"]
+    node: str | None = None
+    pool: str | None = None
+    storage: str | None = None
+    template_vmid: int | None = None
+
+
+class EsxiAccountOut(_HypervisorAccountOut):
+    provider: Literal["esxi"]
+    user: str | None = None
+    datastore: str | None = None
+    resource_pool: str | None = None
+    source_vm: str | None = None
+
+
+ProviderAccountOut = Annotated[DigitalOceanAccountOut | ProxmoxAccountOut | EsxiAccountOut,
+                               Field(discriminator="provider")]
+
+
+def provider_account_out(account: Any, *, used_by: list[dict[str, Any]],
+                         estimate_cents: int = 0) -> DigitalOceanAccountOut | ProxmoxAccountOut | EsxiAccountOut:
+    """The answer for one ``provider_accounts`` row; never its secret."""
+    from slipway.services import do_rules
+
+    config = account.config or {}
+    common: dict[str, Any] = {
+        "id": account.id, "name": account.name, "production": account.production,
+        "has_secret": bool(account.secret), "secret_hint": account.secret_hint or "",
+        "status": account.status, "checks": list(account.checks or []), "facts": dict(account.facts or {}),
+        "last_checked_at": account.last_checked_at, "removed": account.removed_at is not None,
+        "removed_at": account.removed_at, "used_by": used_by,
+        "created_at": account.created_at, "updated_at": account.updated_at,
+    }
+    if account.provider == "digitalocean":
+        sources = list(config.get("ssh_sources") or [])
+        return DigitalOceanAccountOut(
+            provider="digitalocean", **common, region=config.get("region"),
+            team_name=(config.get("team") or {}).get("name"), ssh_sources=sources,
+            ssh_open=do_rules.open_to_world(sources), monthly_limit_cents=config.get("monthly_limit_cents"),
+            estimate_cents=estimate_cents, prices=config.get("prices"))
+    tls = account.tls or None
+    hypervisor = {"url": config.get("url"), "networks": list(config.get("networks") or []),
+                  "tls": {k: tls.get(k) for k in ("fingerprint_sha256", "subject", "not_after")} if tls else None}
+    if account.provider == "proxmox":
+        return ProxmoxAccountOut(provider="proxmox", **common, **hypervisor, node=config.get("node"),
+                                 pool=config.get("pool"), storage=config.get("storage"),
+                                 template_vmid=config.get("template_vmid"))
+    return EsxiAccountOut(provider="esxi", **common, **hypervisor, user=config.get("user"),
+                          datastore=config.get("datastore"), resource_pool=config.get("resource_pool"),
+                          source_vm=config.get("source_vm"))

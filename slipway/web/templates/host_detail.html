@@ -5,23 +5,35 @@
 <div class="page-head">
   <div>
     <div class="breadcrumb"><a href="/hosts">Hosts</a>{{ icon("chevron-right", "i-sm") }}<span>{{ host.name }}</span></div>
-    <h1 class="row">{{ host.name }} {{ badge("host", host.status) }}</h1>
+    <h1 class="row">{{ host.name }} {% if hv.built %}{{ badge("host", host.status) }}{% endif %}{% if hv.made %} {{ provider_chip(hv, auth) }} {{ build_chip(hv) }}{% endif %}</h1>
     <p class="lede mono">{{ host.username }}@{{ host.address }}{% if host.label %} · {{ host.label }}{% endif %}</p>
   </div>
   <div class="actions">
-    {% if host.is_pinned or auth.can(Perm.HOSTS_WRITE) %}
+    {% if not hv.off.check and (host.is_pinned or (auth.can(Perm.HOSTS_WRITE) and not hv.made)) %}
     <button class="btn btn-primary" data-api="POST /api/v1/hosts/{{ host.id }}/check" data-success="Health check finished" data-then="reload">{{ icon("activity") }} {{ "Run health check" if host.is_pinned else "Verify connection" }}</button>
     {% endif %}
     {% if auth.can(Perm.HOSTS_WRITE) %}
     <button class="btn" data-open="edit-host">{{ icon("edit") }} Edit</button>
+    {% if hv.off.delete %}
+    <span class="subtle owned-note" title="{{ hv.off.delete }}">{{ icon("info", "i-sm") }} {{ hv.off.delete }}</span>
+    {% else %}
     <button class="btn btn-danger" data-api="DELETE /api/v1/hosts/{{ host.id }}" data-confirm="Remove {{ host.name }} from Slipway? Nothing on the host is changed." data-then="redirect:/hosts">{{ icon("trash") }} Remove</button>
+    {% endif %}
     {% endif %}
   </div>
 </div>
 
+{% if hv.made %}
+<div class="callout primary">{{ icon("cloud") }}<div>
+  {%- if hv.env %}Slipway made this {{ hv.noun }} for {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a href="/environments/{{ hv.env.id }}"><strong>{{ hv.env.name }}</strong></a>{% else %}<strong>{{ hv.env.name }}</strong>{% endif %}{% if hv.slot %}'s {{ "data server" if hv.slot == "data" else hv.slot ~ " slot" }}{% endif %}{% if hv.account %} on {{ hv.account }}{% endif %}. Its address, key and deploy root are the environment's; the label and description stay yours to change.
+  {%- else %}Slipway made this {{ hv.noun }}, but the environment it was made for is gone.{% endif %}
+  {%- if hv.off.check %} {{ hv.off.check }}.{% endif %}</div></div>
+{% endif %}
+
 {% if host.status == "error" %}
-<div class="callout error">{{ icon("alert") }}<div><strong>Host key mismatch.</strong> {{ host.last_error }}
-  {% if auth.can(Perm.HOSTS_WRITE) %}<div style="margin-top:8px"><button class="btn btn-sm btn-danger" data-api="POST /api/v1/hosts/{{ host.id }}/reset-host-key" data-confirm="Only do this if you know the server was rebuilt. Reset the pinned key?" data-then="reload">Reset pinned key</button></div>{% endif %}
+<div class="callout error">{{ icon("alert") }}<div><strong>{{ "Host key mismatch." if host.host_key else "Not checked." }}</strong> {{ host.last_error }}
+  {% if hv.off.reset_key %}<div class="subtle" style="margin-top:8px">{{ hv.off.reset_key }}.</div>
+  {% elif auth.can(Perm.HOSTS_WRITE) %}<div style="margin-top:8px"><button class="btn btn-sm btn-danger" data-api="POST /api/v1/hosts/{{ host.id }}/reset-host-key" data-confirm="Only do this if you know the server was rebuilt. Reset the pinned key?" data-then="reload">Reset pinned key</button></div>{% endif %}
 </div></div>
 {% elif host.last_error %}
 <div class="callout warning">{{ icon("alert") }}<div><strong>{{ "Cannot reach host" if host.status == "unreachable" else "Docker problem" }}:</strong> <span class="mono">{{ host.last_error }}</span></div></div>
@@ -29,10 +41,10 @@
 
 {% if root_in_ram %}
 <div class="callout warning">{{ icon("alert") }}<div><strong>Unraid clears {{ host.deploy_root }} when it restarts.</strong> Only <code>/mnt</code> and <code>/boot</code> survive a restart, so releases and settings kept there are lost.
-  {% if auth.can(Perm.HOSTS_WRITE) %}Edit the host and set the deploy root to a folder under <code>/mnt/user</code>, such as <code>/mnt/user/appdata</code>: Slipway moves the instances deployed here.{% endif %}</div></div>
+  {% if hv.off.move_root %}{{ hv.off.move_root }}.{% elif auth.can(Perm.HOSTS_WRITE) %}Edit the host and set the deploy root to a folder under <code>/mnt/user</code>, such as <code>/mnt/user/appdata</code>: Slipway moves the instances deployed here.{% endif %}</div></div>
 {% endif %}
 
-{% if not host.is_pinned and host.public_key %}
+{% if not host.is_pinned and host.public_key and not hv.made %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("key", "i-lg") }}</span>
     <div><h2>Finish setting up {{ host.name }}</h2><p>Authorize Slipway's key on the host, then verify the connection.</p></div></div>
@@ -42,6 +54,35 @@
     <div class="copy-row"><pre class="code" id="install-cmd">mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\n' {{ host.public_key|shquote }} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shquote }} {{ host.deploy_root|shquote }} && sudo usermod -aG docker {{ host.username|shquote }}</pre><button class="btn" data-copy-target="#install-cmd">{{ icon("copy") }} Copy</button></div>
     <div><strong>2.</strong> Click <em>Verify connection</em>. Slipway records the server's host key fingerprint and refuses to connect if it ever changes.</div>
+  </div>
+</section>
+{% endif %}
+
+{% if hv.made %}
+{%- set ps = host.provider_state or {} %}
+<section class="card provider-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("cloud", "i-lg") }}</span><div><h2>{{ hv.kind }}</h2><p>What Slipway recorded when it made the {{ hv.noun }}.</p></div></div>
+  <div class="card-body">
+    <dl class="kv">
+      <dt>{{ icon("environments", "i-sm") }} Environment</dt><dd>{% if hv.env %}{% if auth.can(Perm.ENVIRONMENTS_READ) %}<a href="/environments/{{ hv.env.id }}">{{ hv.env.name }}</a>{% else %}{{ hv.env.name }}{% endif %}{% if hv.slot %} · {{ "data server" if hv.slot == "data" else hv.slot }}{% endif %}{% else %}<span class="muted">Gone</span>{% endif %}</dd>
+      <dt>{{ icon("activity", "i-sm") }} State</dt><dd>{{ build_chip(hv) }}{% if hv.pending_resize %} <span class="subtle">{{ hv.pending_resize }}</span>{% endif %}</dd>
+      {% if hv.account %}<dt>{{ icon("key", "i-sm") }} Account</dt><dd>{{ hv.account }}</dd>{% endif %}
+      {% if hv.provider == "digitalocean" %}
+      {% if ps.droplet_name %}<dt>{{ icon("box", "i-sm") }} Droplet</dt><dd class="mono">{{ ps.droplet_name }}</dd>{% endif %}
+      {% if ps.region %}<dt>{{ icon("globe", "i-sm") }} Region</dt><dd class="mono">{{ ps.region }}</dd>{% endif %}
+      {% if ps.size %}<dt>{{ icon("cpu", "i-sm") }} Size</dt><dd class="mono">{{ ps.size }}</dd>{% endif %}
+      {% if ps.image %}<dt>{{ icon("package", "i-sm") }} Image</dt><dd class="mono">{{ ps.image }}</dd>{% endif %}
+      {% if ps.public_ip %}<dt>{{ icon("globe", "i-sm") }} Public address</dt><dd class="mono">{{ ps.public_ip }}</dd>{% endif %}
+      {% if ps.private_ip %}<dt>{{ icon("globe", "i-sm") }} VPC address</dt><dd class="mono">{{ ps.private_ip }}</dd>{% endif %}
+      {% if ps.built_at %}<dt>{{ icon("clock", "i-sm") }} Built</dt><dd>{{ ps.built_at }}</dd>{% endif %}
+      {% elif hv.machine %}
+      {%- set m = hv.machine %}
+      <dt>{{ icon("box", "i-sm") }} VM</dt><dd class="mono">{{ m.name }}{% if m.ids.vmid %} (id {{ m.ids.vmid }}){% endif %}</dd>
+      <dt>{{ icon("globe", "i-sm") }} Address</dt><dd class="mono">{{ m.network.address }}{% if m.network.name %} <span class="subtle">on {{ m.network.name }}</span>{% endif %}</dd>
+      <dt>{{ icon("cpu", "i-sm") }} Size</dt><dd>{{ hv.size or "—" }}</dd>
+      {% if hv.last_error %}<dt>{{ icon("alert", "i-sm") }} Last error</dt><dd>{{ hv.last_error }}</dd>{% endif %}
+      {% endif %}
+    </dl>
   </div>
 </section>
 {% endif %}
@@ -77,7 +118,9 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
         {% if host.public_key %}<dt>{{ icon("key", "i-sm") }} Slipway's key</dt><dd><button class="btn btn-sm" data-copy="{{ host.public_key }}">{{ icon("copy", "i-sm") }} Copy public key</button></dd>{% endif %}
         <dt>{{ icon("clock", "i-sm") }} Added</dt><dd>{{ host.created_at|dt }}</dd>
       </dl>
-      {% if host.is_pinned and auth.can(Perm.HOSTS_WRITE) and host.status != "error" %}
+      {% if host.is_pinned and hv.off.reset_key %}
+      <p class="subtle" style="margin: 14px 0 0">{{ hv.off.reset_key }}.</p>
+      {% elif host.is_pinned and auth.can(Perm.HOSTS_WRITE) and host.status != "error" %}
       <div style="margin-top: 14px"><button class="btn btn-sm btn-danger" data-api="POST /api/v1/hosts/{{ host.id }}/reset-host-key" data-confirm="Forget the pinned host key? The next check will trust whatever key the server presents." data-then="reload">Reset pinned key</button></div>
       {% endif %}
     </div>
@@ -128,8 +171,24 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
 <dialog class="modal" id="edit-host" style="width: min(680px, calc(100vw - 32px))">
   <form method="post" action="/js-required" data-form="PATCH /api/v1/hosts/{{ host.id }}" data-then="reload" data-success="Host updated">
     <div class="modal-head"><h2>Edit {{ host.name }}</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    {% if hv.off.edit_address %}
+    {#- A host an environment made: only what people call it stays theirs (Decision 7). -#}
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field">
+          <label for="hf-label">Label <span class="subtle">(optional)</span></label>
+          <input class="input" id="hf-label" name="label" value="{{ host.label }}" maxlength="32" data-keep-empty>
+        </div>
+        <div class="field span-2">
+          <label for="hf-description">Description <span class="subtle">(optional)</span></label>
+          <input class="input" id="hf-description" name="description" value="{{ host.description }}" maxlength="255" data-keep-empty>
+        </div>
+      </div>
+      <p class="subtle">{{ hv.off.edit_address }}.</p></div>
+    {% else %}
     <div class="modal-body">{% with h = host %}{% include "_host_fields.html" %}{% endwith %}
       <p class="subtle">Changing the hostname or port forgets the pinned host key.</p></div>
+    {% endif %}
     <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit">Save changes</button></div>
   </form>
 </dialog>

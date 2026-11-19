@@ -187,52 +187,142 @@ _REENTER_COLUMNS = {
 }
 
 
-async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -> tuple[int, list[str]]:
+class RotationRefused(RuntimeError):
+    """rotate-encryption-key --clear-unreadable would erase something Slipway can't work without."""
+
+
+_TERRAFORM_STATE_LOST = (
+    "Slipway can't read the Terraform state of {vm} with any key in SLIPWAY_ENCRYPTION_KEY. "
+    "Put the old key back first; without the state Slipway can't remove the VM"
+)
+
+
+async def _refuse_lost_terraform_states(db: AsyncSession) -> None:
+    """--clear-unreadable never erases a VM's Terraform state: without it Slipway can't remove the VM."""
+    from sqlalchemy import text
+
+    from slipway.core.crypto import DecryptionError, decrypt
+
+    rows = (await db.execute(text(
+        "SELECT m.name, t.state FROM terraform_states t JOIN machines m ON m.id = t.machine_id "
+        "WHERE t.state IS NOT NULL ORDER BY m.name"
+    ))).all()
+    lost = []
+    for name, token in rows:
+        try:
+            decrypt(token)
+        except DecryptionError:
+            lost.append(name)
+    if lost:
+        raise RotationRefused(_TERRAFORM_STATE_LOST.format(vm=", ".join(lost)))
+
+
+_OWNED_HOST_KEY_KEPT = (
+    "Kept the SSH key of {n} host(s) Slipway made, which no configured key can read: Slipway made them, so the "
+    "key can't be entered again by hand. Put the old key back after the new one in SLIPWAY_ENCRYPTION_KEY and "
+    "run this again to re-encrypt it; until then Slipway can't reach them:"
+)
+
+
+async def _owned_host_ids(db: AsyncSession) -> set[object]:
+    """The hosts an environment made (a droplet or a VM): --clear-unreadable never erases their SSH key, since
+    the host page refuses a key for such a host and nothing else can set it again. It keeps the value as it is
+    (still readable with the old key) and lists the host, and the rest of the rotation goes ahead (F20)."""
+    from sqlalchemy import select
+
+    from slipway.db.base import Base
+
+    hosts = Base.metadata.tables["hosts"]  # its id and owner only: no encrypted column is read
+    return set((await db.execute(select(hosts.c.id).where(hosts.c.owner_environment_id.is_not(None)))).scalars())
+
+
+async def _rotate(
+    db: AsyncSession, *, clear_unreadable: bool = False
+) -> tuple[int, list[str], list[tuple[str, str, object]]]:
     """Re-encrypt every stored secret with the first key, bypassing the ORM types.
 
-    Returns the number re-encrypted and a description of each value no configured key could decrypt.
+    Returns the number re-encrypted, a description of each value no configured key could decrypt, and
+    (with ``clear_unreadable``) the (table, column, primary key) of each value erased. Each table is
+    updated by its own primary key (terraform_states has machine_id, not id).
     """
-    from sqlalchemy import Text, column, select, table, update
+    from sqlalchemy import Text, case, column, select, table, update
 
     import slipway.models  # noqa: F401  (registers every table on Base.metadata)
     from slipway.core.crypto import DecryptionError, encrypt, encrypted_columns, rotate
     from slipway.db.base import Base
 
-    rotated, unreadable = 0, []
+    if clear_unreadable and "terraform_states" in Base.metadata.tables:
+        await _refuse_lost_terraform_states(db)
+    owned = await _owned_host_ids(db) if clear_unreadable and "hosts" in Base.metadata.tables else set()
+
+    rotated, unreadable, cleared, kept = 0, [], [], []
     for source, col in encrypted_columns(Base.metadata):
-        raw = table(source.name, column("id", source.c.id.type), column(col.name, Text()))
-        value_col = raw.c[col.name]
-        rows = (await db.execute(select(raw.c.id, value_col).where(value_col.is_not(None)).with_for_update())).all()
+        (pk,) = source.primary_key.columns
+        extra = [column("status", Text()), column("location", Text())] if source.name == "backups" else []
+        raw = table(source.name, column(pk.name, pk.type), column(col.name, Text()), *extra)
+        key_col, value_col = raw.c[pk.name], raw.c[col.name]
+        rows = (await db.execute(select(key_col, value_col).where(value_col.is_not(None)).with_for_update())).all()
         for row_id, token in rows:
+            values: dict[str, object]
             try:
-                new = rotate(token)
+                values = {col.name: rotate(token)}
             except DecryptionError:
-                unreadable.append(f"{source.name}.{col.name} (id {row_id})")
+                if clear_unreadable and (source.name, col.name) == ("hosts", "private_key") and row_id in owned:
+                    kept.append(row_id)  # left as it is: see _owned_host_ids
+                    continue
+                unreadable.append(f"{source.name}.{col.name} ({pk.name} {row_id})")
                 if not clear_unreadable:
                     continue
+                cleared.append((source.name, col.name, row_id))
                 # Instance and environment env and app secrets become an encrypted JSON null, not NULL: the
                 # deployer treats that as "needs re-entry" and refuses to deploy, instead of deploying with no
-                # variables or generating new secrets the app's existing data won't open with.
-                new = encrypt("null") if (source.name, col.name) in _REENTER_COLUMNS else None
+                # variables or generating new secrets the app's existing data won't open with. Everything
+                # else (a provider account's secret among them) becomes NULL: an encrypted null would read
+                # as a secret that is set.
+                values = {col.name: encrypt("null") if (source.name, col.name) in _REENTER_COLUMNS else None}
+                if (source.name, col.name) == ("backups", "data_key"):
+                    # A backup on the Slipway server without its key can only be deleted; it can't stay
+                    # ready (ck_backups_slipway_key).
+                    values["status"] = case(
+                        ((raw.c.location == "slipway") & (raw.c.status == "ready"), "changed"), else_=raw.c.status
+                    )
             else:
                 rotated += 1
-            await db.execute(update(raw).where(raw.c.id == row_id).values({col.name: new}))
+            await db.execute(update(raw).where(key_col == row_id).values(values))
+    return rotated, unreadable, cleared, kept
+
+
+async def _rotate_secrets(db: AsyncSession, *, clear_unreadable: bool = False) -> tuple[int, list[str]]:
+    """Re-encrypt every stored secret with the first key, bypassing the ORM types.
+
+    Returns the number re-encrypted and a description of each value no configured key could decrypt.
+    Raises RotationRefused (changing nothing) when --clear-unreadable would erase a Terraform state; the SSH
+    key of a host an environment made is kept as it is (``_owned_host_ids``).
+    """
+    rotated, unreadable, _, _ = await _rotate(db, clear_unreadable=clear_unreadable)
     return rotated, unreadable
 
 
 _SNAPSHOT_KEY_LOST = "Its key was lost with an old SLIPWAY_ENCRYPTION_KEY; delete it"
 _FIRST_ADMIN_PASSWORD_LOST = "Set the password again"
+# What a provider account whose secret was erased shows until a person enters it again.
+_ACCOUNT_SECRET_LOST = "The {what} couldn't be read after a key change: enter it again"
 
 
-async def _fix_up_cleared(db: AsyncSession) -> list[str]:
+def _secret_word(provider: str) -> str:
+    return "password" if provider == "esxi" else "token"
+
+
+async def _fix_up_cleared(db: AsyncSession, cleared: list[tuple[str, str, object]] | None = None) -> list[str]:
     """After --clear-unreadable, mark rows whose erased secret they can't work without. Returns what was done.
 
-    Raw SQL by table name, like the column loop: the ORM types would turn unreadable values into None.
+    ``cleared`` is what the rotation erased, as (table, column, primary key). Raw SQL by table name, like
+    the column loop: the ORM types would turn unreadable values into None.
     """
-    from sqlalchemy import text
+    from sqlalchemy import Text, column, select, table, text, update
 
     import slipway.models  # noqa: F401  (registers every table on Base.metadata)
-    from slipway.db.base import Base
+    from slipway.db.base import Base, JSONType
 
     lines: list[str] = []
     tables = Base.metadata.tables
@@ -259,20 +349,69 @@ async def _fix_up_cleared(db: AsyncSession) -> list[str]:
                 "set it again on the instance's page:"
             )
             lines.extend(f"  first_admins (instance {instance_id})" for instance_id in waiting)
+    backups = [row_id for name, col, row_id in cleared or () if (name, col) == ("backups", "data_key")]
+    if backups:
+        lines.append(
+            f"{len(backups)} backup(s) lost the key their files on this Slipway server are under; "
+            "they can only be deleted now."
+        )
+    vm_snapshots = [row_id for name, col, row_id in cleared or () if (name, col) == ("machine_snapshots", "identity")]
+    if vm_snapshots and "machine_snapshots" in tables:
+        # The VM's data in such a snapshot was made with identity values Slipway no longer has: a revert would
+        # bring that data back under today's secrets, so the revert refuses it and it can only be deleted.
+        source = tables["machine_snapshots"]
+        raw = table("machine_snapshots", column("id", source.c.id.type), column("name", Text()),
+                    column("status", Text()))
+        lost_names = (await db.execute(
+            select(raw.c.name).where(raw.c.id.in_(vm_snapshots)).order_by(raw.c.name)
+        )).scalars().all()
+        await db.execute(update(raw).where(raw.c.id.in_(vm_snapshots)).values(status="failed"))
+        lines.append(f"Marked {len(lost_names)} VM snapshot(s) failed; their identity values were lost, so they can't "
+                     "be reverted to. Delete them on the environment's page:")
+        lines.extend(f"  {name}" for name in lost_names)
+    accounts = [row_id for name, col, row_id in cleared or () if (name, col) == ("provider_accounts", "secret")]
+    if accounts and "provider_accounts" in tables:
+        source = tables["provider_accounts"]
+        raw = table("provider_accounts", column("id", source.c.id.type), column("name", Text()),
+                    column("provider", Text()), column("status", Text()), column("checks", JSONType))
+        rows = (await db.execute(
+            select(raw.c.id, raw.c.name, raw.c.provider).where(raw.c.id.in_(accounts)).order_by(raw.c.name)
+        )).all()
+        for row_id, _, provider in rows:
+            check = {"name": "secret", "ok": False, "level": "error",
+                     "text": _ACCOUNT_SECRET_LOST.format(what=_secret_word(provider))}
+            await db.execute(update(raw).where(raw.c.id == row_id).values(status="error", checks=[check]))
+        lines.append(
+            f"{len(rows)} provider account(s) lost their token or password; enter it again on the Integrations page:"
+        )
+        lines.extend(f"  {name} ({provider})" for _, name, provider in rows)
     return lines
 
 
 async def _rotate_all(db: AsyncSession, args: argparse.Namespace) -> tuple[int, list[str], list[str]]:
-    rotated, unreadable = await _rotate_secrets(db, clear_unreadable=args.clear_unreadable)
-    fixed = await _fix_up_cleared(db) if args.clear_unreadable else []
+    rotated, unreadable, cleared, kept = await _rotate(db, clear_unreadable=args.clear_unreadable)
+    fixed = await _fix_up_cleared(db, cleared) if args.clear_unreadable else []
+    if kept:
+        from sqlalchemy import select
+
+        from slipway.db.base import Base
+
+        hosts = Base.metadata.tables["hosts"]
+        names = (await db.execute(select(hosts.c.name).where(hosts.c.id.in_(kept)).order_by(hosts.c.name))).scalars()
+        fixed = [_OWNED_HOST_KEY_KEPT.format(n=len(kept)), *(f"  {name}" for name in names), *fixed]
     return rotated, unreadable, fixed
 
 
 def rotate_encryption_key(args: argparse.Namespace) -> None:
-    rotated, unreadable, fixed = asyncio.run(_with_db(_rotate_all, args))
+    try:
+        rotated, unreadable, fixed = asyncio.run(_with_db(_rotate_all, args))
+    except RotationRefused as exc:
+        sys.exit(f"Nothing was changed. {exc}")
     print(f"Re-encrypted {rotated} secret(s) with the first SLIPWAY_ENCRYPTION_KEY.")
+    kept = bool(fixed) and fixed[0].startswith("Kept the SSH key")
     if not unreadable:
-        print("Older keys can now be removed from SLIPWAY_ENCRYPTION_KEY.")
+        if not kept:
+            print("Older keys can now be removed from SLIPWAY_ENCRYPTION_KEY.")
         if fixed:
             print("\n".join(fixed))
         return

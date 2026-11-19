@@ -63,6 +63,13 @@ class DeploymentKind(StrEnum):
     DISCARD = "discard"
     REMOVE_SLOT = "remove_slot"
     TEARDOWN = "teardown"
+    # Phase 4, environment-level: renew the certificate; take traffic off a retiring production environment.
+    CERTIFICATE = "certificate"
+    DEACTIVATE = "deactivate"
+    # Phase 5, on a VM slot's instance: take, revert to and delete a hypervisor snapshot.
+    VM_SNAPSHOT = "vm_snapshot"
+    VM_REVERT = "vm_revert"
+    VM_DROP = "vm_drop"
 
 
 class FreshData(StrEnum):
@@ -78,12 +85,16 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
         # One instance per slot of an environment; a slot always belongs to an environment and back.
         UniqueConstraint("environment_id", "slot", name="uq_instances_environment_id_slot"),
         CheckConstraint("(environment_id IS NULL) = (slot IS NULL)", name="slot_pair"),
+        # Phase 4: only a managed environment's data owner has no host (services.environments enforces the
+        # rest: it writes a host-less owner only for data_mode managed).
+        CheckConstraint("host_id IS NOT NULL OR (slot = 'data' AND environment_id IS NOT NULL)", name="host"),
     )
 
     name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(63), unique=True)
     repository_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("repositories.id", ondelete="RESTRICT"))
-    host_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("hosts.id", ondelete="RESTRICT"))
+    # None only for a managed environment's data owner (ck_instances_host).
+    host_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("hosts.id", ondelete="RESTRICT"))
     branch: Mapped[str] = mapped_column(String(255))
 
     build_source: Mapped[str] = mapped_column(String(16), default=BuildSource.DOCKERFILE)
@@ -166,7 +177,7 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     slot_state: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
 
     repository: Mapped[Repository] = relationship(lazy="selectin")
-    host: Mapped[Host] = relationship(lazy="selectin")
+    host: Mapped[Host | None] = relationship(lazy="selectin")
     environment: Mapped[Environment | None] = relationship(lazy="selectin", foreign_keys=[environment_id])
 
     @property

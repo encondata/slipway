@@ -9,7 +9,7 @@ import pytest
 
 from slipway.db.session import get_sessionmaker
 from slipway.models import AppSetting
-from slipway.services import cloudflare
+from slipway.services import certs, cloudflare
 from slipway.services.cloudflare import CloudflareClient, CloudflareError, RecordGone, plan_dns
 from tests.fake_cloudflare import TOKEN, ZONE, FakeCloudflare
 
@@ -218,6 +218,81 @@ async def test_check_connection(fake_cf):
     assert not fake_cf.writes()
     with pytest.raises(CloudflareError, match="No active zone other.com"):
         await cloudflare.check_connection(cloudflare.CloudflareConfig(zone="other.com", token=TOKEN))
+
+
+# ------------------------------------------------- phase 4 test 30: TXT records
+
+
+CHALLENGE = certs.CHALLENGE_COMMENT
+
+
+async def test_create_txt_lists_it_by_comment_and_deletes_it(fake_cf):
+    zid = fake_cf.add_zone()
+    async with CloudflareClient(TOKEN) as cf:
+        rec = await cf.create_txt(zid, "_acme-challenge.api.example.com", "tok3n-value", CHALLENGE)
+        assert fake_cf.calls[-1]["method"] == "POST"
+        assert fake_cf.calls[-1]["path"] == f"/zones/{zid}/dns_records"
+        assert fake_cf.calls[-1]["body"] == {"type": "TXT", "name": "_acme-challenge.api.example.com",
+                                             "content": "tok3n-value", "ttl": cloudflare.TXT_TTL,
+                                             "comment": CHALLENGE}
+        assert "proxied" not in fake_cf.calls[-1]["body"]
+        stored = fake_cf.records[rec["id"]]
+        assert (stored["type"], stored["content"], stored["comment"]) == ("TXT", "tok3n-value", CHALLENGE)
+
+        listed = await cf.txt_records(zid, CHALLENGE)
+        assert [r["id"] for r in listed] == [rec["id"]]
+        assert fake_cf.calls[-1]["params"] == {"type": "TXT", "comment": CHALLENGE, "per_page": "100"}
+
+        assert await cf.delete_record(zid, rec["id"]) is True
+        assert rec["id"] not in fake_cf.records
+        assert await cf.txt_records(zid, CHALLENGE) == []
+        assert await cf.delete_record(zid, rec["id"]) is False  # a second delete finds it gone: no error
+
+
+async def test_txt_records_match_the_comment_exactly(fake_cf):
+    zid = fake_cf.add_zone()
+    other_zone = fake_cf.add_zone("example.net")
+    ours = fake_cf.add_record(zid, "TXT", "_acme-challenge.uat.example.com", "a", comment=CHALLENGE)
+    fake_cf.add_record(zid, "TXT", "_acme-challenge.www.example.com", "b", comment=CHALLENGE + " (old)")
+    fake_cf.add_record(zid, "TXT", "_acme-challenge.shop.example.com", "c", comment=None)
+    fake_cf.add_record(zid, "TXT", "example.com", "v=spf1 -all", comment="Managed by Slipway: uat (0123456789ab)")
+    fake_cf.add_record(zid, "A", "_acme-challenge.uat.example.com", "203.0.113.9", comment=CHALLENGE)
+    fake_cf.add_record(other_zone, "TXT", "_acme-challenge.example.net", "d", comment=CHALLENGE)
+    async with CloudflareClient(TOKEN) as cf:
+        assert [r["id"] for r in await cf.txt_records(zid, CHALLENGE)] == [ours["id"]]
+        # Should Cloudflare ignore a filter, the client still returns only exact TXT matches.
+        fake_cf.ignore_comment_filter = True
+        assert [r["id"] for r in await cf.txt_records(zid, CHALLENGE)] == [ours["id"]]
+    assert not fake_cf.writes()
+
+
+async def test_txt_errors_never_carry_the_token(fake_cf):
+    zid = fake_cf.add_zone()
+    fake_cf.echo_token_in_errors = True
+    fake_cf.deny = {"POST", "DELETE"}
+    rec = fake_cf.add_record(zid, "TXT", "_acme-challenge.api.example.com", "x", comment=CHALLENGE)
+    errors: list[str] = []
+    async with CloudflareClient(TOKEN) as cf:
+        with pytest.raises(CloudflareError) as err:
+            await cf.create_txt(zid, "_acme-challenge.api.example.com", "y", CHALLENGE)
+        assert err.value.status_code == 403
+        errors.append(str(err.value))
+        with pytest.raises(CloudflareError) as err:
+            await cf.delete_record(zid, rec["id"])
+        errors.append(str(err.value))
+        fake_cf.deny = True
+        with pytest.raises(CloudflareError) as err:
+            await cf.txt_records(zid, CHALLENGE)
+        errors.append(str(err.value))
+    async with CloudflareClient(TOKEN + "x") as cf:  # a wrong token, echoed back by the API
+        with pytest.raises(CloudflareError) as err:
+            await cf.create_txt(zid, "_acme-challenge.api.example.com", "y", CHALLENGE)
+        assert err.value.status_code == 401
+        errors.append(str(err.value))
+    for text in errors:
+        assert TOKEN not in text
+    assert all("<token>" in text for text in errors[:3])
+    assert rec["id"] in fake_cf.records  # the refused delete left it
 
 
 async def test_read_state(fake_cf):

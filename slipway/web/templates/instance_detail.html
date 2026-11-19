@@ -3,7 +3,9 @@
 {% from "_data_dialogs.html" import restore_dialog, backup_dialog, snapshot_dialog, reset_dialog, start_over_dialog, first_admin_dialog, backups_card with context %}
 {% block title %}{{ instance.name }}{% endblock %}
 {% block content %}
-{% set live = instance.status not in ("created",) %}
+{# A managed environment's data owner has no host (P4 §3.4): nothing on it runs over SSH. #}
+{% set hostless = instance.host is none %}
+{% set live = instance.status not in ("created",) and not hostless %}
 {% set can_hosts = auth.can(Perm.HOSTS_READ) %}
 {# A data hold turns Deploy, Start and Restart off until the data is put right (spec §8.4). #}
 {% set held = member.hold if member else (d.hold_text if d else None) %}
@@ -15,7 +17,7 @@
     <div class="breadcrumb"><a href="/instances">Instances</a>{{ icon("chevron-right", "i-sm") }}<span>{{ instance.name }}</span></div>
     <h1 class="row">{{ instance.name }} {{ badge("instance", instance.status, active_job.kind if active_job else None) }}
       {%- if data_only_job %} {% if auth.can(Perm.DEPLOYMENTS_READ) %}<a href="/deployments/{{ active_job.id }}" class="badge warning spin">{{ active_job.kind|kind_label }}…</a>{% else %}<span class="badge warning spin">{{ active_job.kind|kind_label }}…</span>{% endif %}{% endif %}</h1>
-    <p class="lede">{{ instance.repository.full_name }} · <span class="mono">{{ instance.branch }}</span> on {% if can_hosts %}<a href="/hosts/{{ instance.host.id }}">{{ instance.host.name }}</a>{% else %}{{ instance.host.name }}{% endif %}</p>
+    <p class="lede">{{ instance.repository.full_name }} · <span class="mono">{{ instance.branch }}</span>{% if hostless %} · its data is in a managed database{% else %} on {% if can_hosts %}<a href="/hosts/{{ instance.host.id }}">{{ instance.host.name }}</a>{% else %}{{ instance.host.name }}{% endif %}{% if hv and hv.made %} {{ provider_chip(hv, auth) }}{% endif %}{% endif %}</p>
   </div>
   <div class="actions">
     {% if auth.can(Perm.INSTANCES_OPERATE) and live and instance.status != "deploying" %}
@@ -39,8 +41,10 @@
 </div>
 
 {% if member %}
-{%- set slot_name = "the data server" if member.slot == "data" else "the " ~ member.slot ~ " slot" %}
-<div class="callout primary member-banner">{{ icon("environments") }}<div>This is {{ slot_name }} of environment {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a href="/environments/{{ member.env.id }}"><strong>{{ member.env.name }}</strong></a>{% else %}<strong>{{ member.env.name }}</strong>{% endif %}{% if member.slot != "data" %} ({{ "live" if member.live else "idle" }}){% endif %}. Its settings, secrets, data and names belong to the environment.</div></div>
+{%- set slot_name = ("the data owner" if hostless else "the data server") if member.slot == "data" else "the " ~ member.slot ~ " slot" %}
+<div class="callout primary member-banner">{{ icon("environments") }}<div>This is {{ slot_name }} of environment {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a href="/environments/{{ member.env.id }}"><strong>{{ member.env.name }}</strong></a>{% else %}<strong>{{ member.env.name }}</strong>{% endif %}{% if member.slot != "data" %} ({{ "live" if member.live else "idle" }}){% endif %}. Its settings, secrets, data and names belong to the environment.
+  {%- if hostless %} Its data is in {{ member.env.name }}'s managed database, so it has no host of its own.
+  {%- elif hv and hv.owned and hv.noun %} Its host is the {{ hv.noun }} {{ (hv.machine.name if hv.machine else instance.host.name) }}, which Slipway made{% if hv.account %} on {{ hv.account }}{% endif %}.{% if not hv.built %} {{ hv.off.check }}.{% endif %}{% endif %}</div></div>
 {% if held %}<div class="callout error" role="alert">{{ icon("alert") }}<div><strong>{{ held }}</strong></div></div>{% endif %}
 {% if member.stale %}<div class="callout warning">{{ icon("alert") }}<span>{{ member.stale }}.</span></div>{% endif %}
 {% endif %}
@@ -145,12 +149,18 @@
           {%- endif -%}
         </dd>
         {% endif %}
-        {% if can_hosts %}<dt>{{ icon("hosts", "i-sm") }} Folder on host</dt><dd><span class="mono">{{ folder }}</span>
+        {% if can_hosts and not hostless %}<dt>{{ icon("hosts", "i-sm") }} Folder on host</dt><dd><span class="mono">{{ folder }}</span>
           {%- if folder_in_ram %} <span class="badge warning" title="Unraid clears it when it restarts">Cleared at restart</span> <span class="subtle">Unraid keeps only <code>/mnt</code> and <code>/boot</code>; {% if auth.can(Perm.INSTANCES_WRITE) %}<a href="/instances/{{ instance.id }}/edit">set a folder under /mnt/user</a>{% else %}ask for a folder under /mnt/user{% endif %} and Slipway moves the files.</span>{% endif %}</dd>{% endif %}
       </dl>
     </div>
   </section>
 
+  {% if hostless %}
+  <section class="card">
+    <div class="card-head"><span class="head-icon">{{ icon("database", "i-lg") }}</span><div><h2>Containers</h2><p>None: the database is managed, not run on a host.</p></div></div>
+    <div class="card-body"><p class="muted" style="margin: 0">{{ instance.name }} has no host, so there are no containers or logs to show. Its environment's page has its backups.</p></div>
+  </section>
+  {% else %}
   <section class="card">
     <div class="card-head"><span class="head-icon">{{ icon("instances", "i-lg") }}</span><div><h2>Containers</h2><p>Live from <code>docker ps</code> on {{ instance.host.name }}</p></div>
       <span class="spacer"></span>{% if live %}<button class="btn btn-sm" data-reload-target="#containers">{{ icon("sync", "i-sm") }} Refresh</button>{% endif %}</div>
@@ -158,6 +168,7 @@
       {% if live %}<p class="muted">Loading…</p>{% else %}<p class="muted">Not deployed yet.</p>{% endif %}
     </div>
   </section>
+  {% endif %}
 </div>
 
 {% if auth.can(Perm.LOGS_READ) and live %}

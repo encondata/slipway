@@ -267,6 +267,9 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
 .avatar.sm { width: 28px; height: 28px; font-size: 11px; }
 
 .content { padding: 28px; display: flex; flex-direction: column; gap: 22px; max-width: 1600px; width: 100%; }
+/* A page that sets content_class " content-fluid" (Hosts) fills the window on wide screens. */
+.content.content-fluid { max-width: none; }
+.content.content-fluid .page-head .lede { max-width: 960px; }  /* the intro stays a readable line length */
 
 /* ------------------------------------------------------------ page header */
 .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
@@ -367,6 +370,11 @@ table.table { width: 100%; border-collapse: collapse; }
 .table .primary-cell small { display: block; color: var(--text-muted); font-size: 12.5px; }
 .table .num { text-align: right; }
 .table td.actions-cell { text-align: right; white-space: nowrap; }
+/* The Slots card: the host cell (a VM's or droplet's name, size and chips) keeps a readable width, and the row's
+   buttons wrap instead of pushing the table wider than its card. */
+.table.slots td.host-cell { min-width: 240px; }
+.table.slots td.actions-cell { white-space: normal; min-width: 140px; }
+.table.slots td.actions-cell .btn { margin: 2px 0; }
 .row-icon {
   width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border);
   display: grid; place-items: center; flex: none; color: var(--text-muted); background: var(--surface);
@@ -688,3 +696,52 @@ a.badge:hover { text-decoration: none; }
   .flow-stepper .step { font-size: 13px; }
 }
 .card > [data-load] > p.callout { margin: 0 20px 18px; }
+
+/* Hosts Slipway made (phases 4 and 5): the provider chip and the build chip */
+.provider-chip { font-size: 12px; padding: 1px 8px; margin-top: 4px; background: var(--primary-soft); color: var(--primary-text); border-color: transparent; }
+a.provider-chip:hover { text-decoration: underline; }
+.build-chip { white-space: nowrap; }
+.owned-note { font-size: 12.5px; cursor: help; }
+
+/* Provider accounts on Settings > Integrations: the three account cards and their dialogs */
+.table.accounts td small { display: block; color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
+.table.accounts tr.removed td { color: var(--text-muted); }
+/* An account's name keeps its width; its four buttons wrap rather than widen the table past its card. */
+.table.accounts td:first-child { min-width: 150px; }
+.table.accounts td.actions-cell { white-space: normal; min-width: 150px; }
+.table.accounts td.actions-cell .btn { margin: 2px 0; }
+.account-chip.production { font-size: 12px; padding: 1px 8px; background: var(--warning-soft); color: var(--warning-text); border-color: transparent; }
+.account-checks summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); margin-top: 4px; }
+.check-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.check-list li { display: flex; gap: 8px; align-items: baseline; }
+.check-list .badge { flex: none; min-width: 72px; justify-content: center; }
+.account-test { margin-top: 16px; }
+.networks .net-row { display: grid; gap: 6px; align-items: center; grid-template-columns: minmax(0, 1fr) minmax(0, .9fr) 64px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto; }
+.networks[data-networks="esxi"] .net-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto; }
+.networks .net-head { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.networks .net-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.networks .net-row .input { font-size: 12.5px; padding-left: 8px; padding-right: 8px; }
+@media (max-width: 720px) {
+  .networks .net-row, .networks[data-networks="esxi"] .net-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .networks .net-head { display: none; }
+}
+
+/* DigitalOcean environments (phase 4 §17.2-17.4): the host cell's chips, the cost table, a typed total */
+.host-chips { gap: 4px; margin-top: 2px; }
+.host-chips .provider-chip { margin-top: 0; }
+.table.cost-table tfoot th { border-top: 1px solid var(--border-strong); font-weight: 650; }
+.table.cost-table td:last-child, .table.cost-table th:last-child { text-align: right; }
+.table.cloud-objects td .subtle { font-family: inherit; font-size: 12.5px; }
+.cost-box { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; }
+[data-cloud-callouts]:empty { display: none; }
+
+/* New VMs (P5 §12.2-12.4): the create flow's and Add a slot's VM sub-form, the Slots card's live power, the VM
+   snapshots card. */
+.vm-form { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; }
+.vm-form .form-grid { gap: 12px; }
+.vm-live:empty { display: none; }
+.vm-power { font-size: 12.5px; color: var(--text-muted); white-space: nowrap; }
+.vm-power.off { color: var(--warning-text); }
+.vm-live-foot:empty { display: none; }
+.table.vm-snapshots td.mono { white-space: nowrap; }
+.table.vm-snapshots .actions-cell .subtle { max-width: 280px; white-space: normal; margin-top: 4px; }

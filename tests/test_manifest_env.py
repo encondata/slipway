@@ -61,12 +61,14 @@ def _env_text(plan: manifest.AppPlan, template: str = ENV_EXAMPLE) -> str:
 
 
 def _phase2(text: str) -> str:
-    """The manifest as phase 2 knew it: without health, data.migrations, data.attach and data.server."""
+    """The manifest as phase 2 knew it: without health, data.migrations, data.attach and data.server (and
+    phase 4's edge and data.managed, which need data.attach)."""
     raw = yaml.safe_load(text)
     for spec in raw["services"].values():
         spec.pop("health", None)
-    for key in ("migrations", "attach", "server"):
+    for key in ("migrations", "attach", "server", "managed"):
         raw["data"].pop(key, None)
+    raw.pop("edge", None)
     return yaml.safe_dump(raw, sort_keys=False)
 
 
