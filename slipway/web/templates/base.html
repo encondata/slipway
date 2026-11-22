@@ -18,6 +18,7 @@
   ("/", "home", "Overview", None),
   ("/repositories", "repositories", "Repositories", Perm.REPOS_READ),
   ("/deployments", "rocket", "Deployments", Perm.DEPLOYMENTS_READ),
+  ("/deployments/history", "clock", "History", Perm.DEPLOYMENTS_READ),
   ("/hosts", "hosts", "Hosts", Perm.HOSTS_READ),
   ("/instances", "instances", "Instances", Perm.INSTANCES_READ),
   ("/environments", "environments", "Environments", Perm.ENVIRONMENTS_READ),
@@ -29,8 +30,11 @@
   <aside class="sidebar" id="sidebar">
     <a class="brand" href="/">{{ logo() }}</a>
     <nav class="nav" aria-label="Main">
+      {#- The longest matching item is the active one, so /deployments/history lights History, not Deployments. #}
+      {% set here = namespace(href="") %}
+      {% for href in nav|map(attribute=0) %}{% if (path == href or (href != '/' and path.startswith(href))) and href|length > here.href|length %}{% set here.href = href %}{% endif %}{% endfor %}
       {% for href, ic, label, perm in nav if perm is none or auth.can(perm) %}
-      <a href="{{ href }}" class="{{ 'active' if path == href or (href != '/' and path.startswith(href)) }}">{{ icon(ic) }} {{ label }}</a>
+      <a href="{{ href }}" class="{{ 'active' if href == here.href }}{{ ' nav-sub' if href.count('/') > 1 }}">{{ icon(ic) }} {{ label }}</a>
       {% endfor %}
       <hr>
       <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">{{ icon("settings") }} Settings</a>

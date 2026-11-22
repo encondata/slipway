@@ -614,3 +614,25 @@ async def test_the_flow_can_read_the_manifest_with_environments_write_only(make_
     reader = await client_with(make_client, "reader@example.com", ["repos:read", "environments:read"])
     r = await reader.get(url)
     assert r.status_code == 403 and r.json()["detail"] == "Missing permission: instances:write"
+
+
+async def test_environment_jobs_group_on_deployments_and_filter_history(admin_client):
+    """/deployments groups an environment's own jobs (no instance) under the environment; History filters by it."""
+    ids = await _world()
+    first = await _env_job(ids["env"], "activate", slot="blue")
+    latest = await _env_job(ids["env"], "activate", slot="green")
+    async with get_sessionmaker()() as db:  # one hour apart, so the order is certain
+        await db.execute(update(Deployment).where(Deployment.id == first).values(created_at=T0 + timedelta(hours=1)))
+        await db.execute(update(Deployment).where(Deployment.id == latest).values(created_at=T0 + timedelta(hours=2)))
+        await db.commit()
+    page = (await admin_client.get("/deployments")).text
+    group, earlier = (b for b in re.findall(r"<tbody.*?</tbody>", page, re.S) if f"dep-earlier-{ids['env']}" in b)
+    assert "Environment jobs" in group and f"/deployments/{latest}" in group and f"/deployments/{first}" not in group
+    assert f"/deployments/{first}" in earlier
+    assert f'href="/deployments/history?environment={ids["env"]}"' in earlier
+    history = (await admin_client.get(f"/deployments/history?environment={ids['env']}&status=succeeded")).text
+    assert "Deployments of uat" in _text(history)
+    assert {f"/deployments/{first}", f"/deployments/{latest}"} <= set(re.findall(r"/deployments/[0-9a-f-]{36}", history))
+    assert f'href="/deployments/history?status=succeeded"' in history  # the environment chip clears only it
+    env_page = (await admin_client.get(f"/environments/{ids['env']}")).text
+    assert f'href="/deployments/history?environment={ids["env"]}"' in env_page

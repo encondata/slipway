@@ -220,7 +220,7 @@
 {% if auth.can(Perm.DEPLOYMENTS_READ) %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("rocket", "i-lg") }}</span><div><h2>Deployments</h2><p>Every job of {{ env.name }}: its slots'{{ ", its data server's" if env.data_mode == "server" }} and its own.</p></div>
-    <span class="spacer"></span><a class="link-more" href="/deployments?environment={{ env.id }}">View All {{ icon("arrow-right", "i-sm") }}</a></div>
+    <span class="spacer"></span><a class="link-more" href="/deployments/history?environment={{ env.id }}">View All {{ icon("arrow-right", "i-sm") }}</a></div>
   {% if deployments %}
   <div class="table-wrap"><table class="table">
     <thead><tr><th>When</th><th>What</th><th>Slot</th><th>Commit</th><th>Status</th><th>By</th><th></th></tr></thead>

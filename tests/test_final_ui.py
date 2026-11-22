@@ -263,7 +263,7 @@ async def _dead_links(c, ids: dict[str, str]) -> list[tuple[str, str]]:
     pages = [
         "/", "/search?q=payroll", "/repositories", f"/repositories?repo={ids['repo']}", "/hosts", f"/hosts/{ids['host']}",
         "/instances", "/instances/new", f"/instances/{ids['instance']}", f"/instances/{ids['instance']}/edit",
-        "/deployments", f"/deployments/{ids['dep']}", "/settings", "/settings/tokens",
+        "/deployments", "/deployments/history", f"/deployments/{ids['dep']}", "/settings", "/settings/tokens",
     ]
     status: dict[str, int] = {}
     dead = []
