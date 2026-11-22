@@ -21,7 +21,7 @@ from slipway.models.environment import (
     ResourceOrigin,
     SlotName,
 )
-from slipway.models.host import Host, HostAuthMethod, HostStatus
+from slipway.models.host import Host, HostAuthMethod, HostOS, HostSetupStatus, HostStatus
 from slipway.models.instance import (
     BuildSource,
     Deployment,
@@ -68,6 +68,8 @@ __all__ = [
     "FreshData",
     "Host",
     "HostAuthMethod",
+    "HostOS",
+    "HostSetupStatus",
     "HostStatus",
     "Instance",
     "InstanceStatus",

@@ -32,8 +32,8 @@ from slipway.models import (
     Machine,
     ProviderAccount,
 )
-from slipway.schemas import HostCreate, HostOut, HostUpdate, host_out
-from slipway.services import audit, data, deployer, hosts, ssh
+from slipway.schemas import HostCreate, HostOut, HostSetupIn, HostSetupOut, HostUpdate, host_out
+from slipway.services import audit, data, deployer, hosts, provisioning, ssh
 from slipway.services.auth import AuthContext
 from slipway.services.hosts import check_host
 
@@ -177,10 +177,37 @@ async def list_hosts(ctx: Reader, db: DB) -> list[HostOut]:
     return [host_out(h, owned_by=owned.get(h.id), machine=vms.get(h.id)) for h in found]
 
 
+def _not_while_setting_up(host: Host) -> None:
+    if host.setup_running or provisioning.runner.running(host.id):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Slipway is setting up {host.name}; try again when it finishes")
+
+
+def _admin_login(username: str | None, password: str | None, ssh_user: str) -> provisioning.AdminLogin:
+    if not password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter the admin password Slipway should use once to set up the server")
+    if ssh_user == "root":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Pick a separate SSH user for Slipway to create, such as deploy, rather than root"
+        )
+    return provisioning.AdminLogin(username or "root", password)
+
+
+def _start_setup(host: Host, admin: provisioning.AdminLogin, ctx: AuthContext) -> None:
+    try:
+        provisioning.runner.start(host.id, admin, ctx.user.id)
+    except provisioning.SetupError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
 @router.post("", status_code=201)
 async def create_host(body: HostCreate, ctx: Writer, request: Request, db: DB) -> HostOut:
+    """Add a host. With ``setup: "new"`` Slipway also sets the server up, in the background, with the
+    one-time admin login (follow it with GET /hosts/{id}/setup)."""
     if await db.scalar(select(Host).where(Host.name == body.name)):
         raise HTTPException(status.HTTP_409_CONFLICT, "A host with this name already exists")
+    admin = _admin_login(body.admin_username, body.admin_password, body.username) if body.setup == "new" else None
+    if admin is not None:
+        body = body.model_copy(update={"auth_method": "generate"})  # Slipway installs its own key
     host = Host(
         name=body.name,
         hostname=body.hostname,
@@ -191,14 +218,54 @@ async def create_host(body: HostCreate, ctx: Writer, request: Request, db: DB) -
         deploy_root=body.deploy_root or "/opt/slipway",
         proxy_address=body.proxy_address or None,
         lan_address=body.lan_address or None,
+        os_type=body.os_type,
         metrics={},
         created_by_id=ctx.user.id,
     )
     _apply_credentials(host, body)
+    if admin is not None:
+        provisioning.begin(host)
     db.add(host)
     await db.flush()
     audit.record(db, "host.create", actor=ctx.user, target=host, summary=f"Added host {host.name} ({host.address})", request=request)
+    if admin is not None:
+        audit.record(
+            db, "host.setup_started", actor=ctx.user, target=host, request=request,
+            summary=f"Started setting up {host.name} as {admin.username}: user {host.username}, SSH key and Docker",
+        )
     await db.commit()
+    if admin is not None:
+        _start_setup(host, admin, ctx)
+    return host_out(host)
+
+
+@router.get("/{host_id}/setup")
+async def get_setup(host_id: uuid.UUID, ctx: Reader, db: DB) -> HostSetupOut:
+    host = await _get(db, host_id)
+    return HostSetupOut(status=host.setup_status, step=host.setup_step, error=host.setup_error, log=host.setup_log or "")
+
+
+@router.post("/{host_id}/setup", status_code=202)
+async def start_setup(host_id: uuid.UUID, body: HostSetupIn, ctx: Writer, request: Request, db: DB) -> HostOut:
+    """Set the host up (again) with a one-time admin login: user, Slipway's key, Docker and the deploy root."""
+    host = await _get(db, host_id)
+    _not_while_setting_up(host)
+    if (host.provider or "ssh") != "ssh" or host.owner_environment_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{host.name} was made by Slipway, which sets it up itself")
+    if host.auth_method != HostAuthMethod.KEY or not host.public_key:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Slipway can only set up a host it signs in to with a key: switch it to a generated key first"
+        )
+    if host.os_type not in (None, *provisioning.OS_LABELS):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Slipway can only set up Ubuntu servers")
+    admin = _admin_login(body.admin_username, body.admin_password, host.username)
+    provisioning.begin(host)
+    audit.record(
+        db, "host.setup_started", actor=ctx.user, target=host, request=request,
+        summary=f"Started setting up {host.name} as {admin.username}: user {host.username}, SSH key and Docker",
+    )
+    await db.commit()
+    _start_setup(host, admin, ctx)
     return host_out(host)
 
 
@@ -236,6 +303,7 @@ async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request
     Answers the host, with a ``warning`` when the move left something for the user to do.
     """
     host = await _get(db, host_id)
+    _not_while_setting_up(host)
     old_root = host.deploy_root
     to_move: list[Instance] = []
     if body.deploy_root is not None and body.deploy_root != old_root:
@@ -334,6 +402,7 @@ async def update_host(host_id: uuid.UUID, body: HostUpdate, ctx: Writer, request
 @router.delete("/{host_id}", status_code=204)
 async def delete_host(host_id: uuid.UUID, ctx: Writer, request: Request, db: DB) -> None:
     host = await _get(db, host_id)
+    _not_while_setting_up(host)
     await _refuse_owned(db, host, "delete")
     in_use = await db.scalar(select(func.count()).select_from(Instance).where(Instance.host_id == host.id))
     if in_use:
@@ -348,6 +417,7 @@ async def check(host_id: uuid.UUID, ctx: Auth, request: Request, db: DB) -> Host
     """Probe the host. The first successful check pins its SSH host key, which needs hosts:write. A host a
     provider makes pins its own key and is checked with hosts:read once built; before that, 409."""
     host = await _get(db, host_id)
+    _not_while_setting_up(host)
     owned = (host.provider or "ssh") != "ssh"
     needed = Perm.HOSTS_READ if host.is_pinned or owned else Perm.HOSTS_WRITE
     if not ctx.can(needed):
@@ -365,6 +435,7 @@ async def check(host_id: uuid.UUID, ctx: Auth, request: Request, db: DB) -> Host
 @router.post("/{host_id}/reset-host-key")
 async def reset_host_key(host_id: uuid.UUID, ctx: Writer, request: Request, db: DB) -> HostOut:
     host = await _get(db, host_id)
+    _not_while_setting_up(host)
     await _refuse_owned(db, host, "reset_key")
     old = await _stored_fingerprint(db, host)
     _forget_host_key(host)

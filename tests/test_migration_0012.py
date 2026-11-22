@@ -48,9 +48,8 @@ async def test_migration_0012_round_trip_and_models_match(migration_url):  # noq
     engine = create_async_engine(url)
     try:
         ids = await _seed_0008(engine)
-        _ok(url, "upgrade", "head")
+        _ok(url, "upgrade", "0012")  # not head: later revisions build on 0012 (the final check runs at head)
         assert await _version(engine) == ["0012"]
-        _ok(url, "check")  # the migrations, 0001 to 0012, match the models exactly
 
         machines = await _names(engine, "machines")
         assert machines["pk"] == {"pk_machines"}

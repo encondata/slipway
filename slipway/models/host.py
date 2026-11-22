@@ -19,6 +19,19 @@ class HostAuthMethod(StrEnum):
     PASSWORD = "password"
 
 
+class HostOS(StrEnum):
+    UBUNTU = "ubuntu"
+
+
+class HostSetupStatus(StrEnum):
+    """Slipway preparing a new server itself: user, SSH key and Docker (see services/provisioning.py)."""
+
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"  # Slipway restarted while it ran
+
+
 class HostStatus(StrEnum):
     UNKNOWN = "unknown"
     HEALTHY = "healthy"
@@ -71,6 +84,15 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     # {"cpu_percent", "mem_percent", "mem_total_mb", "cpus", "containers_running"}
     metrics: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
+    # The operating system picked when the host was added (None for hosts added before there was a choice).
+    os_type: Mapped[str | None] = mapped_column(String(32))
+    # Set only when Slipway prepared the server itself; None when it was set up by hand.
+    setup_status: Mapped[str | None] = mapped_column(String(16))
+    setup_step: Mapped[str | None] = mapped_column(String(32))
+    setup_log: Mapped[str | None] = mapped_column(Text)
+    setup_error: Mapped[str | None] = mapped_column(Text)
+    setup_started_at: Mapped[datetime | None]
+
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
     # A host a provider makes: {phase: planned | creating | ready | gone, ...} plus the provider's own keys
@@ -95,6 +117,10 @@ class Host(UUIDPrimaryKey, Timestamps, Base):
     def client_address(self) -> str:
         """The address other LAN hosts see this host's connections come from (a data server's allow list)."""
         return self.lan_address or self.upstream_address
+
+    @property
+    def setup_running(self) -> bool:
+        return self.setup_status == HostSetupStatus.RUNNING
 
     @property
     def is_pinned(self) -> bool:
