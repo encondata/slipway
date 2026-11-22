@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, badge, meter, stat, empty, repo_icon %}
+{% from "_macros.html" import icon, badge, meter, stat, empty, repo_icon, migration_chip %}
 {% block title %}Overview{% endblock %}
 {% block content %}
 {% set can_repos = auth.can(Perm.REPOS_READ) %}
@@ -134,7 +134,7 @@
           {% else %}
           <div class="tl-title">{{ d.instance.name }}<span>{% if d.kind and d.kind != "deploy" %}{{ d.kind|kind_label }}: {{ {"succeeded": "done", "failed": "failed", "running": "running", "queued": "queued", "cancelled": "cancelled"}.get(d.status, "") }}{% else %}{{ {"succeeded": "Deployed", "failed": "Failed", "running": "Building", "queued": "Queued", "cancelled": "Cancelled"}.get(d.status, "") }}{% endif %}</span></div>
           {% endif %}
-          <div class="tl-meta">{{ d.branch }}{% if d.short_sha %} · <span class="mono">{{ d.short_sha }}</span>{% endif %}{% if d.commit_message %} · {{ d.commit_message|truncate(60) }}{% endif %}</div>
+          <div class="tl-meta">{{ d.branch }}{% if d.short_sha %} · <span class="mono">{{ d.short_sha }}</span>{% endif %}{% if d.commit_message %} · {{ d.commit_message|truncate(60) }}{% endif %}{% if d.is_migration %} {{ migration_chip(d, auth.can(Perm.HOSTS_READ)) }}{% endif %}</div>
         </a>
         <time>{{ d.created_at|timeago }}</time>
       </li>

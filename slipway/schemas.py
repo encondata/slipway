@@ -586,6 +586,8 @@ class InstanceOut(Out):
     proxy_entries: list[dict[str, Any]] = []
     # What the instance was claimed from, when it was claimed (see POST /hosts/{id}/claim).
     claim: dict[str, Any] | None = None
+    # The stopped copy a migration left on the old host, until it is removed (see POST .../old-copy/remove).
+    migrated_from: dict[str, Any] | None = None
     status: str
     current_commit_sha: str | None
     last_deployed_at: datetime | None
@@ -640,6 +642,7 @@ class InstanceOut(Out):
             routes=i.routes or [],
             proxy_entries=i.proxy_entries or [],
             claim=i.claim,
+            migrated_from=i.migrated_from,
             status=i.status,
             current_commit_sha=i.current_commit_sha,
             last_deployed_at=i.last_deployed_at,
@@ -780,6 +783,19 @@ def _options_out(options: dict[str, Any] | None) -> dict[str, Any]:
     if "switch" in out:
         out["switch"] = _switch_summary(out["switch"])
     return out
+class MigrateIn(BaseModel):
+    """Move a deployed instance to another host (POST /instances/{id}/migrate, and /migrate/check)."""
+
+    host_id: uuid.UUID
+    # The instance's folder on the new host; empty: <that host's deploy root>/<slug>.
+    deploy_dir: Annotated[str, Field(max_length=255), NoNul] | None = None
+    # Ids (from the check) of found volumes and paths not to copy: the new host's own are used.
+    skip: list[Annotated[str, Field(max_length=600), NoNul]] = Field(default_factory=list, max_length=500)
+
+    @field_validator("deploy_dir")
+    @classmethod
+    def _migrate_dir(cls, v: str | None) -> str | None:
+        return None if not v or not v.strip() else deployer.clean_instance_dir(v)
 
 
 class DeploymentOut(BaseModel):

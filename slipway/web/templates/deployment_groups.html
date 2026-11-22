@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, badge, empty %}
+{% from "_macros.html" import icon, badge, empty, migration_chip %}
 {#- /deployments: one group per instance, and one per environment for its own jobs (activate, teardown...: no
     instance). Every deployment, flat, is the History page (deployments.html). #}
 {% block title %}Deployments{% endblock %}
@@ -17,7 +17,7 @@
 {% macro cells(d, can_hosts, can_envs, env_col, first) -%}
   {% if env_col %}<td>{% if d.environment %}{% if can_envs %}<a href="/environments/{{ d.environment.id }}">{{ d.environment.name }}</a>{% else %}{{ d.environment.name }}{% endif %}{% if d.instance and d.instance.slot %} <span class="subtle">· {{ d.instance.slot }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>{% endif %}
   <td>{{ badge("deployment", d.status, d.kind) }}{% if d.environment_id %}<div class="subtle">{{ d|dep_label }}</div>{% elif d.kind and d.kind != "deploy" %}<div class="subtle">{{ d.kind|kind_label }}</div>{% endif %}</td>
-  <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span><div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div>
+  <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span> {{ migration_chip(d, can_hosts) }}<div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div>
     {%- if first and d.instance and d.status != "succeeded" and d.instance.current_commit_sha and d.instance.current_commit_sha != d.commit_sha %}<div class="subtle">Live: <span class="mono">{{ d.instance.current_commit_sha[:7] }}</span></div>{% endif %}</td>
   {% if can_hosts %}<td class="muted nowrap">{% if first %}{{ d.instance.host.name if d.instance else "—" }}{% endif %}</td>{% endif %}
   <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>

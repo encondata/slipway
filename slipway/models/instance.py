@@ -70,6 +70,8 @@ class DeploymentKind(StrEnum):
     VM_SNAPSHOT = "vm_snapshot"
     VM_REVERT = "vm_revert"
     VM_DROP = "vm_drop"
+    # Move a standalone instance and its data to another host (services/migrate.py).
+    MIGRATE = "migrate"
 
 
 class FreshData(StrEnum):
@@ -140,6 +142,10 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     # What the last proxy sync left in Switchyard, one per hostname:
     # [{hostname, switchyard_id, upstream, state: "live" | "staged" | "error", message, synced_at}].
     proxy_entries: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+
+    # Set after the instance was migrated to another host, until its stopped copy on the old host is
+    # removed (or forgotten): {host_id, host_name, dir, volumes, binds, deployment_id, at}.
+    migrated_from: Mapped[dict[str, Any] | None] = mapped_column()
 
     status: Mapped[str] = mapped_column(String(16), default=InstanceStatus.CREATED)
     current_commit_sha: Mapped[str | None] = mapped_column(String(40))
@@ -294,6 +300,18 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
         if self.started_at and self.finished_at:
             return (self.finished_at - self.started_at).total_seconds()
         return None
+
+    @property
+    def is_migration(self) -> bool:
+        return self.kind == DeploymentKind.MIGRATE
+
+    @property
+    def migration(self) -> dict[str, Any] | None:
+        """A migration's request, kept in ``options["migration"]``: {source_host_id, source_host,
+        target_host_id, target_host, target_dir, skip}. Host names are kept so the history still reads
+        after a host is deleted."""
+        found = (self.options or {}).get("migration") if self.is_migration else None
+        return found if isinstance(found, dict) else None
 
     @property
     def short_sha(self) -> str:

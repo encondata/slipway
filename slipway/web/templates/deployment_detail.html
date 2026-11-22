@@ -98,7 +98,8 @@
   <div>
     <div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}{% if can_instances %}<a href="/instances/{{ dep.instance.id }}">{{ dep.instance.name }}</a>{% else %}<span>{{ dep.instance.name }}</span>{% endif %}</div>
     <h1 class="row">{% if dep.environment_id %}{{ dep|dep_label }} · {{ dep.environment.name if dep.environment else dep.instance.name }}{% elif kind == "deploy" %}{{ dep.instance.name }}{% else %}{{ kind|kind_label }} of {{ dep.instance.name }}{% endif %} {{ badge("deployment", dep.status, kind) }}</h1>
-    <p class="lede">{% if auth.can(Perm.REPOS_READ) %}{{ dep.instance.repository.full_name }} · {% endif %}<span class="mono">{{ dep.branch }}</span>{% if auth.can(Perm.HOSTS_READ) %} → {{ dep.instance.host.name }}{% endif %}</p>
+    {% set m = dep.migration or {} %}
+    <p class="lede">{% if auth.can(Perm.REPOS_READ) %}{{ dep.instance.repository.full_name }} · {% endif %}<span class="mono">{{ dep.branch }}</span>{% if auth.can(Perm.HOSTS_READ) %}{% if dep.is_migration %} · {{ m.source_host }} → {{ m.target_host }}{% else %} → {{ dep.instance.host.name }}{% endif %}{% endif %}</p>
   </div>
   <div class="actions">
     {% if can_instances %}<a class="btn" href="/instances/{{ dep.instance.id }}">{{ icon("box") }} Open instance</a>{% endif %}
@@ -153,7 +154,7 @@
   <div class="card stat"><div class="label">{{ icon("commit") }} Commit</div><div class="value mono" style="font-size: 22px">{{ dep.short_sha or "—" }}</div><div class="hint truncate">{{ dep.commit_message or ("Resolving…" if dep.is_active else "Not resolved") }}</div></div>
   <div class="card stat"><div class="label">{{ icon("user") }} Triggered by</div><div class="value" style="font-size: 22px">{{ dep.triggered_by.display_name if dep.triggered_by else "—" }}</div><div class="hint">{{ dep.created_at|dt }}</div></div>
   <div class="card stat"><div class="label">{{ icon("clock") }} Duration</div><div class="value" style="font-size: 22px">{{ dep.duration_seconds|duration }}</div><div class="hint">{% if dep.finished_at %}Finished {{ dep.finished_at|timeago }}{% else %}In progress{% endif %}</div></div>
-  <div class="card stat"><div class="label">{{ icon("instances") }} What</div><div class="value" style="font-size: 22px">{{ kind|kind_label }}</div><div class="hint mono">{% if kind == "deploy" %}{{ {"compose": "Compose", "app": "App"}.get(dep.instance.build_source, "Dockerfile") }} · {{ {"compose": dep.instance.compose_file, "app": dep.instance.manifest_file}.get(dep.instance.build_source, dep.instance.dockerfile_path) }}{% else %}{{ dep.instance.manifest_file }}{% endif %}</div></div>
+  <div class="card stat"><div class="label">{{ icon("instances") }} What</div><div class="value" style="font-size: 22px">{{ kind|kind_label }}</div><div class="hint{{ '' if kind == 'migrate' else ' mono' }}">{% if kind == "migrate" %}{% if auth.can(Perm.HOSTS_READ) %}From {{ m.source_host }} to {{ m.target_host }}{% if m.target_dir %} · <span class="mono">{{ m.target_dir }}</span>{% endif %}{% else %}To another host{% endif %}{% elif kind == "deploy" %}{{ {"compose": "Compose", "app": "App"}.get(dep.instance.build_source, "Dockerfile") }} · {{ {"compose": dep.instance.compose_file, "app": dep.instance.manifest_file}.get(dep.instance.build_source, dep.instance.dockerfile_path) }}{% else %}{{ dep.instance.manifest_file }}{% endif %}</div></div>
 </div>
 
 {% if dep.retry_of_id %}<div class="callout primary">{{ icon("info") }}<span>Retry of <a href="/deployments/{{ dep.retry_of_id }}">{{ (d.retry_of.kind if d.retry_of else kind)|kind_noun }} {{ dep.retry_of_id|string|truncate(8, True, "") }}</a>:

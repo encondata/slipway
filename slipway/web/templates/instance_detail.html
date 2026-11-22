@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, badge %}
+{% from "_macros.html" import icon, badge, migration_chip %}
 {% from "_data_dialogs.html" import restore_dialog, backup_dialog, snapshot_dialog, reset_dialog, start_over_dialog, first_admin_dialog, backups_card with context %}
 {% block title %}{{ instance.name }}{% endblock %}
 {% block content %}
@@ -28,6 +28,9 @@
       {% endif %}
       <button class="btn" data-api="POST /api/v1/instances/{{ instance.id }}/actions/restart" data-success="Restarted" data-then="reload" {% if held or stale_off %}disabled title="{{ held or stale_off }}"{% endif %}>{{ icon("restart") }} Restart</button>
     {% endif %}
+    {% if migrate_hosts %}<button class="btn" type="button" data-open="migrate-dialog" {{ 'disabled' if instance.status == 'deploying' or active_job }}>{{ icon("hosts") }} Migrate</button>
+    {% elif can_migrate %}<button class="btn" type="button" disabled title="Add another host first">{{ icon("hosts") }} Migrate</button>
+    {% elif migrate_refused and instance.current_commit_sha %}<button class="btn" type="button" disabled title="{{ migrate_refused }}">{{ icon("hosts") }} Migrate</button>{% endif %}
     {% if member %}
     {% if auth.can(Perm.ENVIRONMENTS_READ) %}<a class="btn btn-primary" href="/environments/{{ member.env.id }}">{{ icon("environments") }} Open {{ member.env.name }}</a>{% endif %}
     {% else %}
@@ -71,6 +74,21 @@
   The compose project <code>{{ instance.compose_project }}</code> runs as it was started{% if instance.claim.working_dir %} from <code>{{ instance.claim.working_dir }}</code>{% endif %}. The first deploy builds <code>{{ instance.branch }}</code> under the same project name, so Compose replaces its containers and keeps its volumes. That directory is never changed or deleted.
   {% else %}
   The container <code>{{ instance.running_container_name }}</code> runs as it was started. The first deploy builds <code>{{ instance.branch }}</code>, stops it just before starting the new container and removes it once the new one runs; its volumes are kept. If the new container does not start, it is started again.
+  {% endif %}
+</div></div>
+{% endif %}
+
+{% if instance.migrated_from %}{% set old = instance.migrated_from %}
+<div class="callout warning">{{ icon("info") }}<div><strong>A stopped copy is still on {{ old.host_name }}.</strong>
+  {{ instance.name }} was migrated to {{ instance.host.name }}. On {{ old.host_name }} its containers are stopped, and its files are still in <code>{{ old.dir }}</code>{% if old.volumes %}, with the volume{{ "s" if old.volumes|length > 1 }} {% for v in old.volumes %}<code>{{ v }}</code>{{ ", " if not loop.last }}{% endfor %}{% endif %}{% if old.binds %}, as are the copied paths {% for b in old.binds %}<code>{{ b }}</code>{{ ", " if not loop.last }}{% endfor %}{% endif %}. Remove it once {{ instance.name }} works on {{ instance.host.name }}.
+  {% if auth.can(Perm.INSTANCES_WRITE) %}
+  <div class="row wrap" style="margin-top: 10px; gap: 8px">
+    <button class="btn btn-sm btn-danger" data-api="POST /api/v1/instances/{{ instance.id }}/old-copy/remove" {{ 'disabled' if instance.status == 'deploying' }}
+      data-confirm="Remove the stopped copy of {{ instance.name }} from {{ old.host_name }}? Its containers, images and {{ old.dir }}{% if old.volumes %}, and the volume{{ 's' if old.volumes|length > 1 }} {{ old.volumes|join(', ') }},{% endif %} are deleted there. This can't be undone.{% if old.binds %} {{ old.binds|join(', ') }} stay{{ 's' if old.binds|length == 1 }}: Slipway does not delete paths outside the instance's folder.{% endif %}"
+      data-success="Removed the old copy" data-then="reload">{{ icon("trash", "i-sm") }} Remove from {{ old.host_name }}</button>
+    <button class="btn btn-sm" data-api="POST /api/v1/instances/{{ instance.id }}/old-copy/remove?purge=false" {{ 'disabled' if instance.status == 'deploying' }}
+      data-confirm="Leave the copy on {{ old.host_name }} as it is and stop tracking it? Slipway won't remove it later." data-success="Kept the old copy" data-then="reload">Keep it there</button>
+  </div>
   {% endif %}
 </div></div>
 {% endif %}
@@ -189,7 +207,7 @@
       <tr>
         <td>{{ badge("deployment", dep.status, dep.kind) }}</td>
         <td class="nowrap">{{ (dep.kind or "deploy")|kind_label }}</td>
-        <td><span class="mono">{{ dep.short_sha or "—" }}</span> <span class="muted">{{ (dep.commit_message or "")|truncate(70) }}</span></td>
+        <td><span class="mono">{{ dep.short_sha or "—" }}</span> {{ migration_chip(dep) }} <span class="muted">{{ (dep.commit_message or "")|truncate(70) }}</span></td>
         <td class="muted">{{ dep.triggered_by.display_name if dep.triggered_by else "—" }}</td>
         <td class="muted nowrap">{{ dep.created_at|timeago }}</td>
         <td class="muted">{{ dep.duration_seconds|duration }}</td>
@@ -281,5 +299,38 @@
   {% if (pending or (not fa and not instance.current_commit_sha)) and auth.can(Perm.INSTANCES_WRITE) %}{{ first_admin_dialog(instance, d) }}
   {% elif not pending and instance.current_commit_sha and auth.can(Perm.DATA_RESET) %}{{ first_admin_dialog(instance, d, another=True) }}{% endif %}
 {% endif %}
+{% endif %}
+
+{% if migrate_hosts %}
+<dialog class="modal" id="migrate-dialog" style="width: min(760px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/instances/{{ instance.id }}/migrate" data-once
+        data-migrate-form="/api/v1/instances/{{ instance.id }}/migrate/check" data-slug="{{ instance.slug }}" data-success="Migration started"
+        data-then="{% if auth.can(Perm.DEPLOYMENTS_READ) %}redirect:/deployments/{id}{% else %}reload{% endif %}">
+    <div class="modal-head"><h2>Migrate {{ instance.name }}</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body stack" style="gap: 16px">
+      <input type="hidden" name="skip" data-type="json" value="[]">
+      <p class="lede" style="margin: 0">Moves {{ instance.name }} off {{ instance.host.name }}. Slipway stops it, copies its volumes and mounted folders to the new host, and deploys the commit it runs now (<span class="mono">{{ (instance.current_commit_sha or "")[:12] }}</span>) there{% if instance.routes %}, then points its hostnames in Switchyard at the new host{% endif %}. The stopped copy stays on {{ instance.host.name }} until you remove it. If anything fails before the switch, {{ instance.name }} starts again on {{ instance.host.name }}.</p>
+      <div class="form-grid">
+        <div class="field">
+          <label for="migrate-host">New host</label>
+          <select class="input" id="migrate-host" name="host_id" required data-migrate-input>
+            <option value="" selected disabled>Choose a host</option>
+            {% for h in migrate_hosts %}<option value="{{ h.id }}" data-root="{{ h.deploy_root }}" {{ 'disabled' if not h.is_pinned or h.setup_running }}>{{ h.name }}{% if not h.is_pinned %} (not verified yet){% elif h.setup_running %} (being set up){% endif %}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="migrate-dir">Folder on the new host <span class="subtle">(optional)</span></label>
+          <input class="input mono" id="migrate-dir" name="deploy_dir" placeholder="&lt;deploy root&gt;/{{ instance.slug }}" autocapitalize="off" spellcheck="false" data-migrate-input>
+        </div>
+      </div>
+      <div class="stack" style="gap: 10px" data-migrate-plan hidden></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn" type="button" data-migrate-check>{{ icon("search") }} Check</button>
+      <button class="btn btn-primary" type="submit" data-migrate-submit disabled>{{ icon("hosts") }} Migrate</button>
+    </div>
+  </form>
+</dialog>
 {% endif %}
 {% endblock %}

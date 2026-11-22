@@ -53,6 +53,7 @@ from slipway.schemas import (
     InstanceCreate,
     InstanceOut,
     InstanceUpdate,
+    MigrateIn,
     ResetIn,
     RestoreIn,
     SnapshotOut,
@@ -71,6 +72,7 @@ from slipway.services import (
     hosts,
     jobs,
     manifest,
+    migrate,
     snapshots,
     ssh,
     switchyard,
@@ -92,6 +94,7 @@ Restorer = Annotated[AuthContext, require(Perm.DATA_RESTORE)]
 Resetter = Annotated[AuthContext, require(Perm.DATA_RESET)]
 
 open_session = ssh.open_session  # replaced in tests
+Migrator = Annotated[AuthContext, require(Perm.INSTANCES_WRITE, Perm.DEPLOYMENTS_CREATE)]
 
 # Settings that decide where and how an instance runs; fixed once anything was deployed.
 _PLACEMENT_FIELDS = ("host_id", "build_source", "compose_file", "dockerfile_path", "build_context", "manifest_file")
@@ -501,7 +504,8 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST,
                     "The host and build settings can't change once an instance has been deployed. "
-                    "Delete it (removing it from the host) and create it again.",
+                    "To move it to another host, use Migrate on the instance page; to change how it builds, "
+                    "delete it (removing it from the host) and create it again.",
                 )
             return await _apply_update(db, instance, body, data, ctx, request)
     except deployer.RunnerBusy as exc:
@@ -640,6 +644,13 @@ async def delete_instance(instance_id: uuid.UUID, ctx: Writer, request: Request,
                 # open are written next to the dumps first (data-loss 16).
                 await db.commit()  # release the DB connection during SSH
                 warning = await deployer.keep_identity_files(instance, connect=open_session)
+            if purge and instance.migrated_from:
+                try:
+                    old_copy = await migrate.remove_old_copy(instance.id)
+                except (ssh.SSHError, deployer.DeployError) as exc:
+                    old_copy = (f"The stopped copy on {instance.migrated_from.get('host_name')} was not removed "
+                                f"({exc}); remove it there")
+                warning = " ".join(filter(None, [warning, old_copy])) or None
             if instance.proxy_entries:
                 warning = " ".join(filter(None, [warning, await _remove_proxy_entries(instance)])) or None
             summary = f"Deleted instance {instance.name}" + (f". {warning}" if warning else "")
@@ -730,6 +741,112 @@ async def deploy(
     audit.record(db, "deployment.create", actor=ctx.user, target=dep, summary=f"Deploy {instance.name}@{instance.branch}",
                  details=flags or None, request=request)
     return await _submit(db, dep, instance)
+
+
+# ------------------------------------------------------------------ migration
+
+
+async def _migration_target(db: AsyncSession, instance: Instance, body: MigrateIn) -> Host:
+    """Check that ``instance`` can migrate as ``body`` asks (nothing that needs SSH); returns the new host."""
+    refused = migrate.refusal(instance)
+    if refused:
+        raise HTTPException(status.HTTP_409_CONFLICT, refused)
+    if deployer.runner.is_deleting(instance.id):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This instance is being deleted")
+    if instance.status == InstanceStatus.DEPLOYING or await _active_deployment(db, instance.id) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
+    if instance.status == InstanceStatus.CREATED or not instance.current_commit_sha:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Deploy {instance.name} before migrating it")
+    if instance.claim_pending:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Deploy the claimed instance with Slipway once before migrating it")
+    if instance.migrated_from:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"A stopped copy of {instance.name} is still on {instance.migrated_from.get('host_name')}: remove it, "
+            "or keep it and stop tracking it, before migrating again",
+        )
+    if await env_unreadable(db, instance):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, ENV_UNREADABLE)
+    host = await db.get(Host, body.host_id)
+    if host is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown host")
+    if host.id == instance.host_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{instance.name} already runs on {host.name}")
+    refused = migrate.refusal(instance, host)
+    if refused:
+        raise HTTPException(status.HTTP_409_CONFLICT, refused)
+    for h in (instance.host, host):
+        if not h.is_pinned:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Host {h.name} has not been verified yet; run a connection check first")
+    if host.setup_running:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Slipway is still setting up {host.name}")
+    await _check_folder(db, host, _folder_of(host, instance.slug, body.deploy_dir), instance.id)
+    return host
+
+
+@router.post("/{instance_id}/migrate/check")
+async def migrate_check(instance_id: uuid.UUID, body: MigrateIn, ctx: Migrator, db: DB) -> dict[str, Any]:
+    """What migrating to ``host_id`` would copy, and what stands in the way. Changes nothing."""
+    instance = await _get(db, instance_id)
+    target = await _migration_target(db, instance, body)
+    await db.commit()  # release the DB connection during SSH
+    try:
+        plan = await migrate.check(instance.id, target.id, body.deploy_dir)
+    except ssh.SSHError as exc:
+        raise _ssh_error(exc) from exc
+    except deployer.DeployError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return plan.out(set(body.skip))
+
+
+@router.post("/{instance_id}/migrate", status_code=202)
+async def migrate_instance(instance_id: uuid.UUID, body: MigrateIn, ctx: Migrator, request: Request, db: DB) -> DeploymentOut:
+    """Queue the migration. It checks everything again before it stops the instance (see services/migrate.py)."""
+    instance = await _get(db, instance_id)
+    target = await _migration_target(db, instance, body)
+    migration = {
+        "source_host_id": str(instance.host_id), "source_host": instance.host.name,
+        "target_host_id": str(target.id), "target_host": target.name,
+        "target_dir": body.deploy_dir, "skip": sorted(set(body.skip)),
+    }
+    dep = await queue_deployment(db, instance, ctx.user, kind=DeploymentKind.MIGRATE, options={"migration": migration})
+    audit.record(db, "instance.migrate", actor=ctx.user, target=instance, request=request,
+                 summary=f"Migrate {instance.name} from {instance.host.name} to {target.name}", details=migration)
+    return await _submit(db, dep, instance)
+
+
+@router.post("/{instance_id}/old-copy/remove")
+async def remove_old_copy(instance_id: uuid.UUID, ctx: Writer, request: Request, db: DB, purge: bool = True) -> dict[str, Any]:
+    """Remove the stopped copy a migration left on the old host (``purge=false``: keep it, stop tracking it)."""
+    instance = await _get(db, instance_id)
+    old = dict(instance.migrated_from or {})
+    if not old:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{instance.name} has no copy on another host")
+    warning: str | None = None
+    try:
+        async with deployer.runner.exclusive(_runner_keys(instance)):
+            if await _active_deployment(db, instance.id) is not None:
+                raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
+            await db.commit()  # release the DB connection during SSH
+            if purge:
+                try:
+                    warning = await migrate.remove_old_copy(instance.id)
+                except (ssh.SSHError, deployer.DeployError) as exc:
+                    raise HTTPException(
+                        status.HTTP_502_BAD_GATEWAY,
+                        f"{exc}. Retry, or keep the copy and stop tracking it.",
+                    ) from exc
+            await db.execute(update(Instance).where(Instance.id == instance.id).values(migrated_from=None))
+            what = "Removed" if purge else "Stopped tracking"
+            audit.record(db, "instance.old_copy_remove" if purge else "instance.old_copy_keep", actor=ctx.user,
+                         target=instance, request=request,
+                         summary=f"{what} the old copy of {instance.name} on {old.get('host_name')}"
+                                 + (f". {warning}" if warning else ""),
+                         details={**old, **({"warning": warning} if warning else {})})
+            await db.commit()
+    except deployer.RunnerBusy as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return {"ok": True, **({"warning": warning} if warning else {})}
 
 
 @router.post("/{instance_id}/actions/{action}")

@@ -56,7 +56,7 @@ from slipway.models import (
 )
 from slipway.services import analytics as deploy_analytics
 from slipway.schemas import BackupOut, SnapshotOut, provider_account_out, seeding_needs_download
-from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, provisioning, snapshots, ssh, switchyard, updates
+from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, migrate, provisioning, snapshots, ssh, switchyard, updates
 from slipway.services import hosts as host_rules
 from slipway.services import provider_accounts as accounts_service
 from slipway.services.auth import AuthContext
@@ -742,9 +742,20 @@ async def instance_detail(request: Request, db: DB, ctx: PageAuth, instance_id: 
     # The host Slipway made for this slot (a droplet or a VM), or None for a managed environment's data owner,
     # which has no host (P4 §3.4).
     hv = (await host_views(db, [instance.host]))[instance.host.id] if instance.host is not None else None
+    # Migrate (services/migrate.py): offered once deployed; an instance it can't move shows the button disabled
+    # with the reason. The hosts it can move to are the other SSH hosts.
+    may_migrate = ctx.can(Perm.INSTANCES_WRITE) and ctx.can(Perm.DEPLOYMENTS_CREATE)
+    migrate_refused = migrate.refusal(instance) if may_migrate else None
+    can_migrate = (may_migrate and migrate_refused is None
+                   and instance.status in (InstanceStatus.RUNNING, InstanceStatus.STOPPED, InstanceStatus.FAILED)
+                   and bool(instance.current_commit_sha) and not instance.claim_pending and not instance.migrated_from)
+    migrate_hosts = (await db.scalars(
+        select(Host).where(Host.id != instance.host_id, Host.provider == "ssh").order_by(Host.name)
+    )).all() if can_migrate else []
     return await render(
         request, db, "instance_detail.html", ctx, instance=instance, deployments=deployments,
         env_unreadable=await env_unreadable(db, instance), hv=hv,
+        can_migrate=can_migrate, migrate_refused=migrate_refused, migrate_hosts=migrate_hosts,
         folder=folder,
         folder_in_ram=bool(folder) and instance.host is not None and deployer.ram_backed(instance.host, folder),
         active_job=await data.active_job(db, instance.id),
