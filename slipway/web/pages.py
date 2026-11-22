@@ -53,7 +53,7 @@ from slipway.models import (
     User,
 )
 from slipway.schemas import BackupOut, SnapshotOut, provider_account_out, seeding_needs_download
-from slipway.services import cloudflare, data, deployer, do_rules, environments, machines, snapshots, ssh, switchyard, updates
+from slipway.services import cloudflare, data, deployer, do_rules, environments, machines, provisioning, snapshots, ssh, switchyard, updates
 from slipway.services import hosts as host_rules
 from slipway.services import provider_accounts as accounts_service
 from slipway.services.auth import AuthContext
@@ -651,7 +651,7 @@ async def host_detail(request: Request, db: DB, ctx: PageAuth, host_id: uuid.UUI
     )
     return await render(
         request, db, "host_detail.html", ctx, host=host, instances=instances, claim_repos=claim_repos, env_slots=env_slots,
-        root_in_ram=deployer.ram_backed(host, host.deploy_root), hv=view,
+        root_in_ram=deployer.ram_backed(host, host.deploy_root), hv=view, setup_steps=provisioning.STEPS,
     )
 
 

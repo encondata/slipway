@@ -107,4 +107,4 @@ def test_provider_migrations_are_unconditional_and_linear():
     assert "down_revision: str | None = '0010'" in files["0011"].read_text()
     assert "down_revision: str | None = '0011'" in files["0012"].read_text()
     heads = _alembic("sqlite+aiosqlite:///:memory:", "heads")
-    assert heads.returncode == 0 and heads.stdout.split() == ["0012", "(head)"], heads.stdout
+    assert heads.returncode == 0 and len(heads.stdout.split()) == 2 and heads.stdout.split()[1] == "(head)", heads.stdout

@@ -212,6 +212,10 @@ class HostOut(Out):
     docker_version: str | None
     os_info: str | None
     metrics: dict[str, Any]
+    os_type: str | None = None
+    setup_status: str | None = None
+    setup_step: str | None = None
+    setup_error: str | None = None
     created_at: datetime
     # Phases 4 and 5 (Decision 33): the environment that made the host ({id, name, slot}), None for a host added
     # by hand; whether it is built (a droplet or VM not made yet isn't); what its provider recorded.
@@ -225,6 +229,25 @@ class HostOut(Out):
     def _copy_label(self) -> HostOut:
         self.environment = self.label
         return self
+
+
+class HostSetupOut(BaseModel):
+    status: str | None
+    step: str | None
+    error: str | None
+    log: str
+
+
+_UNIX_USER = r"^[a-z_][a-z0-9_.-]*$"
+AdminUser = Annotated[str, Field(min_length=1, max_length=64, pattern=_UNIX_USER), NoNul]
+AdminPassword = Annotated[str, Field(min_length=1, max_length=500), NoNul]
+
+
+class HostSetupIn(BaseModel):
+    """The one-time admin login Slipway uses to prepare a new server. Never stored."""
+
+    admin_username: AdminUser = "root"
+    admin_password: AdminPassword
 
 
 class _HostFields(BaseModel):
@@ -286,6 +309,12 @@ class HostCreate(_HostFields):
     port: int = Field(22, ge=1, le=65535)
     # "generate" asks Slipway to create an ed25519 key pair and show the public key.
     auth_method: Literal["generate", "key", "password"] = "generate"
+    os_type: Literal["ubuntu"] = "ubuntu"
+    # "existing": the SSH user and Docker are set up already. "new": Slipway signs in once with the admin
+    # login below and sets the server up itself (user, its own generated key, Docker, deploy root).
+    setup: Literal["existing", "new"] = "existing"
+    admin_username: AdminUser | None = None
+    admin_password: AdminPassword | None = None
 
 
 class HostUpdate(_HostFields):

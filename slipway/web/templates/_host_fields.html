@@ -1,6 +1,35 @@
 {# Shared add/edit host fields. `h` is the host being edited, or None. #}
 {% from "_macros.html" import icon %}
+{# Adding a host also asks for its OS and whether Slipway sets the server up; editing doesn't. #}
+{% set existing_only = "" if h else "setup=existing " %}
 <div class="form-grid">
+  {% if not h %}
+  <div class="field span-2">
+    <label for="hf-os">Operating system</label>
+    <select class="input" id="hf-os" name="os_type">
+      <option value="ubuntu" selected>Ubuntu</option>
+    </select>
+    <span class="help">Ubuntu for now. Slipway uses it to set up a new server.</span>
+  </div>
+  <div class="field span-2">
+    <span class="label-text">Server</span>
+    <div class="choice-grid">
+      <label class="choice"><input type="radio" name="setup" value="new"><span><strong>New server</strong><small>Sign in once with an admin password. Slipway creates the SSH user, adds its key and installs Docker.</small></span></label>
+      <label class="choice"><input type="radio" name="setup" value="existing" checked><span><strong>Existing server</strong><small>Docker and the SSH user are already set up.</small></span></label>
+    </div>
+  </div>
+  <div class="field" data-show-when="setup=new">
+    <label for="hf-admin-user">Admin user</label>
+    <input class="input mono" id="hf-admin-user" name="admin_username" value="root" autocomplete="off" pattern="[a-z_][a-z0-9_.\-]*">
+  </div>
+  <div class="field" data-show-when="setup=new">
+    <label for="hf-admin-pw">Admin password</label>
+    <input class="input" id="hf-admin-pw" name="admin_password" type="password" autocomplete="off" data-required-when="setup=new">
+  </div>
+  <div class="field span-2" data-show-when="setup=new">
+    <span class="help">Root, or a user that can use <code>sudo</code>. Slipway uses this login once to set up the server and does not store it. After that it signs in as the SSH user below, with a key it generates.</span>
+  </div>
+  {% endif %}
   <div class="field">
     <label for="hf-name">Name</label>
     <input class="input" id="hf-name" name="name" value="{{ h.name if h else '' }}" placeholder="prod-01" required pattern="[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}">
@@ -20,7 +49,7 @@
       <input class="input" id="hf-port" name="port" type="number" min="1" max="65535" value="{{ h.port if h else 22 }}">
     </div>
     <div class="field">
-      <label for="hf-user">SSH user</label>
+      <label for="hf-user">{% if h %}SSH user{% else %}<span data-show-when="setup=existing">SSH user</span><span data-show-when="setup=new">SSH user to create</span>{% endif %}</label>
       <input class="input mono" id="hf-user" name="username" value="{{ h.username if h else 'deploy' }}" required>
     </div>
   </div>
@@ -39,7 +68,7 @@
     <input class="input mono" id="hf-lan" name="lan_address" value="{{ (h.lan_address or '') if h else '' }}" placeholder="Same as the reverse proxy address" maxlength="45" data-keep-empty>
     <span class="help">The IP address this host's connections to other hosts on the LAN come from, when it isn't the address above (a host with more than one network). An environment's data server lets its app slots in by this address.</span>
   </div>
-  <div class="field span-2">
+  <div class="field span-2" {% if not h %}data-show-when="setup=existing"{% endif %}>
     <span class="label-text">Authentication</span>
     <div class="choice-grid">
       {% set method = "keep" if h else "generate" %}
@@ -51,15 +80,15 @@
       <label class="choice"><input type="radio" name="auth_method" value="password"><span><strong>Password</strong><small>Not recommended.</small></span></label>
     </div>
   </div>
-  <div class="field span-2" data-show-when="auth_method=key">
+  <div class="field span-2" data-show-when="{{ existing_only }}auth_method=key">
     <label for="hf-key">Private key</label>
     <textarea class="input" id="hf-key" name="private_key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
   </div>
-  <div class="field span-2" data-show-when="auth_method=key">
+  <div class="field span-2" data-show-when="{{ existing_only }}auth_method=key">
     <label for="hf-pass">Key passphrase <span class="subtle">(optional)</span></label>
     <input class="input" id="hf-pass" name="key_passphrase" type="password" autocomplete="off">
   </div>
-  <div class="field span-2" data-show-when="auth_method=password">
+  <div class="field span-2" data-show-when="{{ existing_only }}auth_method=password">
     <label for="hf-pw">SSH password</label>
     <input class="input" id="hf-pw" name="password" type="password" autocomplete="off">
   </div>

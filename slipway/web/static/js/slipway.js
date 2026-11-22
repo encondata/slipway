@@ -40,6 +40,9 @@
  *   <div data-render="cloud_objects">                       (the DigitalOcean card's objects; live callouts go to [data-cloud-callouts])
  *   <form data-cost-confirm data-old-cents="4700">          (Check the price, then the new total typed: wireCostForm)
  *   <div data-render="grow_sizes">                          (the Grow dialog's selects, from the account's catalog)
+ *
+ * Host setup:
+ *   <section data-host-setup="/api/v1/hosts/<id>/setup">  (follows Slipway setting up a new server)
  */
 (function () {
   "use strict";
@@ -508,6 +511,55 @@
       if (input) { ev.preventDefault(); input.focus(); input.select(); }
     }
   });
+
+  // --------------------------------------------- setting up a new host
+  // <section data-host-setup="/api/v1/hosts/<id>/setup" data-status="..."> follows Slipway preparing a server.
+  // The log comes from the server (apt output), so it is only ever set with textContent.
+  const SETUP_STATUS = {
+    running: ["Setting up", "warning spin"], succeeded: ["Set up", "success"],
+    failed: ["Failed", "error"], interrupted: ["Interrupted", "error"],
+  };
+
+  function drawSetup(el, d) {
+    const status = SETUP_STATUS[d.status] ? d.status : "failed";
+    const badge = $("[data-setup-status]", el);
+    if (badge) {
+      badge.className = "badge " + SETUP_STATUS[status][1];
+      badge.textContent = SETUP_STATUS[status][0];
+    }
+    const items = $$("[data-step]", el);
+    const at = Math.max(0, items.map((li) => li.dataset.step).indexOf(d.step));
+    items.forEach((li, i) => {
+      let state = "pending";
+      if (status === "succeeded" || i < at) state = "done";
+      else if (i === at) state = status === "running" ? "active" : "failed";
+      li.className = "update-step " + state;
+    });
+    const box = $("[data-setup-message]", el);
+    if (box) {
+      box.textContent = typeof d.error === "string" ? d.error : "";
+      box.hidden = !box.textContent || status === "running";
+    }
+    const pre = $("[data-setup-log]", el);
+    if (pre && typeof d.log === "string") {
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      pre.textContent = d.log.replace(ANSI, "");
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+  }
+
+  function followSetup(el) {
+    const url = el.dataset.hostSetup;
+    const started = el.dataset.status === "running";
+    async function tick() {
+      let d;
+      try { d = await api("GET", url); } catch (err) { setTimeout(tick, 5000); return; }
+      drawSetup(el, d);
+      if (d.status === "running") setTimeout(tick, 1500);
+      else if (started) location.reload(); // the host's health, key and buttons changed too
+    }
+    tick();
+  }
 
   // -------------------------------------------------- live deploy log
   const STATUS = {
@@ -1658,7 +1710,7 @@
     load();
   }
 
-  // ------------------------------------- conditional fields: data-show-when="field=value" (or value|value)
+  // ------- conditional fields: data-show-when="field=value" (or value|value; several, space-separated, all hold)
   function wireShowWhen(form) {
     const targets = $$("[data-show-when]", form);
     const required = $$("[data-required-when]", form);
@@ -1671,9 +1723,10 @@
       const value = field && field.type === "checkbox" && !field.checked ? "" : field && field.value;
       return Boolean(field) && values.split("|").includes(value);
     };
+    const allHold = (specs) => specs.split(/\s+/).filter(Boolean).every(holds);
     const update = () => {
-      targets.forEach((el) => { el.hidden = !holds(el.dataset.showWhen); });
-      required.forEach((el) => { el.required = holds(el.dataset.requiredWhen) && !el.closest("[hidden]"); });
+      targets.forEach((el) => { el.hidden = !allHold(el.dataset.showWhen); });
+      required.forEach((el) => { el.required = allHold(el.dataset.requiredWhen) && !el.closest("[hidden]"); });
       if (targets.length) syncRequired(form);
       checkMustEqual(form); // a typed field shown or hidden by this change counts, or no longer counts
     };
@@ -2966,6 +3019,7 @@
     } catch (e) { /* ignore */ }
     $$("[data-deploy-log]").forEach(streamLog);
     $$("[data-update-run]").forEach(watchRun);
+    $$("[data-host-setup]").forEach(followSetup);
     $$("[data-update-branches]").forEach(loadUpdateBranches);
     $$("[data-load]").forEach((el) => { if (el.dataset.lazy === undefined) load(el); });
     $$("select[data-fill]").forEach(wireFill);

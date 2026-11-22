@@ -9,10 +9,10 @@
     <p class="lede mono">{{ host.username }}@{{ host.address }}{% if host.label %} · {{ host.label }}{% endif %}</p>
   </div>
   <div class="actions">
-    {% if not hv.off.check and (host.is_pinned or (auth.can(Perm.HOSTS_WRITE) and not hv.made)) %}
+    {% if not host.setup_running and not hv.off.check and (host.is_pinned or (auth.can(Perm.HOSTS_WRITE) and not hv.made)) %}
     <button class="btn btn-primary" data-api="POST /api/v1/hosts/{{ host.id }}/check" data-success="Health check finished" data-then="reload">{{ icon("activity") }} {{ "Run health check" if host.is_pinned else "Verify connection" }}</button>
     {% endif %}
-    {% if auth.can(Perm.HOSTS_WRITE) %}
+    {% if auth.can(Perm.HOSTS_WRITE) and not host.setup_running %}
     <button class="btn" data-open="edit-host">{{ icon("edit") }} Edit</button>
     {% if hv.off.delete %}
     <span class="subtle owned-note" title="{{ hv.off.delete }}">{{ icon("info", "i-sm") }} {{ hv.off.delete }}</span>
@@ -44,7 +44,26 @@
   {% if hv.off.move_root %}{{ hv.off.move_root }}.{% elif auth.can(Perm.HOSTS_WRITE) %}Edit the host and set the deploy root to a folder under <code>/mnt/user</code>, such as <code>/mnt/user/appdata</code>: Slipway moves the instances deployed here.{% endif %}</div></div>
 {% endif %}
 
-{% if not host.is_pinned and host.public_key and not hv.made %}
+{% set can_setup = auth.can(Perm.HOSTS_WRITE) and not hv.made and host.auth_method == "key" and host.public_key and not host.setup_running %}
+{% if host.setup_status and host.setup_status != "succeeded" %}
+<section class="card" data-host-setup="/api/v1/hosts/{{ host.id }}/setup" data-status="{{ host.setup_status }}">
+  <div class="card-head"><span class="head-icon accent">{{ icon("terminal", "i-lg") }}</span>
+    <div><h2>{{ "Setting up " ~ host.name if host.setup_running else "Setting up " ~ host.name ~ " did not finish" }}</h2>
+      <p>Slipway signs in with the admin login, creates <code>{{ host.username }}</code>, authorizes its key, installs Docker and prepares <code>{{ host.deploy_root }}</code>.{% if host.setup_running %} This takes a few minutes.{% endif %}</p></div>
+    <span class="spacer"></span><span class="badge" data-setup-status></span>
+  </div>
+  <div class="card-body stack" style="gap: 14px">
+    <ol class="update-steps" aria-label="Steps">
+      {% for name, label in setup_steps %}<li class="update-step" data-step="{{ name }}"><b aria-hidden="true"></b><span>{{ label }}</span></li>{% endfor %}
+    </ol>
+    <div class="callout error" data-setup-message role="status" hidden></div>
+    <pre class="log" data-setup-log aria-label="Setup log"></pre>
+    {% if can_setup %}<div class="row wrap"><button class="btn btn-primary" data-open="setup-host">{{ icon("restart", "i-sm") }} Try again</button></div>{% endif %}
+  </div>
+</section>
+{% endif %}
+
+{% if not host.is_pinned and host.public_key and not hv.made and not host.setup_running %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("key", "i-lg") }}</span>
     <div><h2>Finish setting up {{ host.name }}</h2><p>Authorize Slipway's key on the host, then verify the connection.</p></div></div>
@@ -54,6 +73,10 @@
     <div class="copy-row"><pre class="code" id="install-cmd">mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\n' {{ host.public_key|shquote }} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shquote }} {{ host.deploy_root|shquote }} && sudo usermod -aG docker {{ host.username|shquote }}</pre><button class="btn" data-copy-target="#install-cmd">{{ icon("copy") }} Copy</button></div>
     <div><strong>2.</strong> Click <em>Verify connection</em>. Slipway records the server's host key fingerprint and refuses to connect if it ever changes.</div>
+    {% if can_setup and not host.setup_status %}
+    <div class="row wrap"><span class="muted">On an Ubuntu server, Slipway can do this for you, and install Docker, with a one-time admin login.</span>
+      <button class="btn btn-sm" data-open="setup-host">{{ icon("key", "i-sm") }} Set up with an admin login</button></div>
+    {% endif %}
   </div>
 </section>
 {% endif %}
@@ -165,6 +188,23 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
   </div>
 </section>
 {% if can_claim %}{% include "_claim_dialog.html" %}{% endif %}
+{% endif %}
+
+{% if can_setup %}
+<dialog class="modal" id="setup-host">
+  <form method="post" action="/js-required" data-form="POST /api/v1/hosts/{{ host.id }}/setup" data-then="reload" data-success="Setup started">
+    <div class="modal-head"><h2>Set up {{ host.name }}</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body">
+      <p>Slipway signs in to <span class="mono">{{ host.address }}</span> once, creates <code>{{ host.username }}</code> if it does not exist, authorizes its key, installs Docker and prepares <code>{{ host.deploy_root }}</code>. Ubuntu only. The login is not stored.</p>
+      <div class="form-grid">
+        <div class="field"><label for="sh-user">Admin user</label><input class="input mono" id="sh-user" name="admin_username" value="root" autocomplete="off" required pattern="[a-z_][a-z0-9_.\-]*"></div>
+        <div class="field"><label for="sh-pw">Admin password</label><input class="input" id="sh-pw" name="admin_password" type="password" autocomplete="off" required></div>
+      </div>
+      <span class="help">Root, or a user that can use <code>sudo</code>.</span>
+    </div>
+    <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit">Set up</button></div>
+  </form>
+</dialog>
 {% endif %}
 
 {% if auth.can(Perm.HOSTS_WRITE) %}

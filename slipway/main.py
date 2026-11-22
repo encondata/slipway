@@ -29,7 +29,7 @@ from slipway.db.base import Base
 from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
 from slipway.services import backup_store, renewals, snapshots
 from slipway.services import do_lb as _do_lb  # noqa: F401  (importing it registers the do_lb traffic backend)
-from slipway.services import updates
+from slipway.services import provisioning, updates
 from slipway.services.deployer import runner
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
@@ -104,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Snapshot storage: create and check the folders, drop unfinished files, check the rows left "checking".
     # A folder Slipway can't write is logged and answers 503 on the snapshot endpoints; deploys are unaffected.
     await snapshots.prepare_storage()
+    await provisioning.runner.recover_interrupted()
     poller = asyncio.create_task(poll_hosts_forever(), name="host-poller")
     sweeper = asyncio.create_task(snapshots.sweep_forever(), name="snapshot-sweeper")  # expired locked imports
     # Load balancer certificates due within 30 days (phase 4 §15.12); off when SLIPWAY_CERT_RENEW_INTERVAL is 0.
@@ -121,6 +122,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await task
         await runner.shutdown()
         await snapshots.shutdown()
+        await provisioning.runner.shutdown()
         await dispose_engine()
 
 

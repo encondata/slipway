@@ -26,7 +26,7 @@
         <td><a class="primary-cell" href="/hosts/{{ h.id }}" style="color:inherit"><span class="row-icon">{{ icon("cloud" if hv.made else "hosts") }}</span><span><strong>{{ h.name }}</strong><small class="mono">{{ h.username }}@{{ h.address if hv.built else (h.hostname if hv.provider != "digitalocean" else "address not known yet") }}</small></span></a>
           {%- if hv.made %}<div>{{ provider_chip(hv, auth) }}</div>{% endif %}</td>
         <td>{% if h.label %}<span class="chip">{{ h.label }}</span>{% else %}<span class="subtle">—</span>{% endif %}</td>
-        <td>{% if hv.built %}{{ badge("host", h.status) }}{% endif %}{% if hv.chip %} {{ build_chip(hv) }}{% endif %}</td>
+        <td>{% if h.setup_running %}<span class="badge warning spin">Setting up</span>{% elif h.setup_status in ("failed", "interrupted") %}<span class="badge error">Setup failed</span>{% else %}{% if hv.built %}{{ badge("host", h.status) }}{% endif %}{% if hv.chip %} {{ build_chip(hv) }}{% endif %}{% endif %}</td>
         <td>{% if h.metrics.cpu_percent is defined %}{{ meter("CPU", h.metrics.cpu_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td>{% if h.metrics.mem_percent is defined %}{{ meter("RAM", h.metrics.mem_percent) }}{% else %}<span class="subtle">—</span>{% endif %}</td>
         <td class="mono subtle">{{ h.docker_version or "—" }}</td>
@@ -45,7 +45,7 @@
     </tbody>
   </table></div>
   {% else %}
-    {% call empty("hosts", "No hosts yet", "Add a Linux machine running Docker. Slipway generates an SSH key for it, you add the public key to the host, and Slipway verifies the connection.") %}
+    {% call empty("hosts", "No hosts yet", "Add a Linux machine. Slipway can set up a new Ubuntu server with a one-time admin login, or connect to one that already runs Docker.") %}
       {% if auth.can(Perm.HOSTS_WRITE) %}<button class="btn btn-primary" data-open="add-host">{{ icon("plus") }} Add host</button>{% endif %}
     {% endcall %}
   {% endif %}

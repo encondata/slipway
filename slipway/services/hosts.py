@@ -146,7 +146,7 @@ async def _unraid_deploy_root(db: AsyncSession, host: Host, *, actor: User | Non
 async def _check_by_id(host_id: uuid.UUID) -> None:
     async with session_scope() as db:
         host = await db.get(Host, host_id)
-        if host is not None and host.is_pinned and ssh.host_is_built(host):
+        if host is not None and host.is_pinned and ssh.host_is_built(host) and not host.setup_running:
             await check_host(db, host)
 
 
