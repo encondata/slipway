@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty %}
+{% from "_data_dialogs.html" import upload_dialog, unlock_dialog, download_dialog, rename_dialog with context %}
+{% block title %}Snapshots{% endblock %}
+{% block content %}
+{% set can_upload = auth.can(Perm.SNAPSHOTS_UPLOAD) %}
+{% set can_download = auth.can(Perm.SNAPSHOTS_DOWNLOAD) %}
+{% set can_keep = auth.can(Perm.DATA_BACKUP) %}
+{% set can_delete = auth.can(Perm.DATA_RESET) %}
+{% set STATUS = {"pending": ("Taking", "warning spin"), "locked": ("Locked", "warning"), "checking": ("Checking", "warning spin"),
+                 "ready": ("Ready", "success"), "failed": ("Failed", "error")} %}
+<div class="page-head">
+  <div>
+    <h1>Snapshots</h1>
+    <p class="lede">A snapshot holds an app's database, its files and the keys its data needs. New instances and Reset data can start from one. Snapshots are kept encrypted on this Slipway server; download one with a passphrase to keep a copy that doesn't depend on this Slipway.</p>
+  </div>
+  <div class="actions">
+    {% if can_upload %}<button class="btn btn-primary" type="button" data-open="upload-snapshot">{{ icon("plus") }} Upload…</button>{% endif %}
+  </div>
+</div>
+
+<section class="card" {% if polling %}data-poll-reload="5000"{% endif %}>
+  {% if snaps %}
+  <div class="table-wrap"><table class="table snapshots">
+    <thead><tr><th>Name</th><th>App</th><th>Repository</th><th>Source</th><th>Created</th><th>Revision</th><th>Database</th><th>Files</th><th>Status</th><th></th></tr></thead>
+    <tbody>{% for s in snaps %}
+      {%- set label, cls = STATUS.get(s.status, (s.status|title, "")) %}
+      <tr>
+        <td><strong class="mono">{{ s.name }}</strong>{% if s.notes %}<div class="subtle" style="white-space: pre-line">{{ s.notes|truncate(160) }}</div>{% endif %}</td>
+        <td>{{ s.app_name or "—" }}{% if s.app %}<div class="subtle mono">{{ s.app }}</div>{% endif %}</td>
+        <td class="mono subtle">{{ s.repository or "unknown" }}</td>
+        <td>{% if s.origin == "instance" %}{% if s.source_instance_id in live_sources and auth.can(Perm.INSTANCES_READ) %}<a href="/instances/{{ s.source_instance_id }}">{{ s.source }}</a>{% else %}{{ s.source or "an instance" }}{% endif %}{% else %}{{ "Uploaded" if s.origin == "upload" else "Imported" }}{% if s.source %} <span class="subtle">from {{ s.source }}</span>{% endif %}{% endif %}</td>
+        <td class="nowrap muted" title="{{ s.created_at|dt }}">{{ s.created_at|timeago }}</td>
+        <td class="mono subtle">{{ s.revision_short or "—" }}</td>
+        <td class="nowrap">{{ s.db_bytes|bytes if s.db_bytes is not none else "—" }}</td>
+        <td class="nowrap">{{ s.files_bytes|bytes if s.files_bytes is not none else ("Yes" if s.has_files else "—") }}</td>
+        <td><span class="badge {{ cls }}" {% if s.error %}title="{{ s.error }}"{% endif %}>{{ label }}</span>
+          {%- if s.status == "locked" and s.expires_at %}<div class="subtle">until {{ s.expires_at|dt }}</div>{% endif %}
+          {%- if s.status == "failed" and s.error %}<div class="subtle">{{ s.error }}</div>{% endif %}</td>
+        <td class="actions-cell">
+          {%- if s.status == "locked" and can_upload %}
+          <button class="btn btn-sm" type="button" data-open="unlock-snapshot" data-fill='{{ {"action": "POST /api/v1/snapshots/" ~ s.id ~ "/unlock", "name": s.name, "passphrase": ""}|tojson }}'>{{ icon("lock", "i-sm") }} Unlock…</button>
+          {%- endif %}
+          {%- if s.status == "ready" and can_download %}
+          <button class="btn btn-sm" type="button" data-open="download-snapshot" data-fill='{{ {"action": "POST /api/v1/snapshots/" ~ s.id ~ "/exports", "source": (s.source if s.origin != "import" and s.source else s.app_name ~ " (" ~ s.name ~ ")"), "files": ", the files" if s.has_files else "", "identity": "identity keys (" ~ (s.identity_keys|join(", ") or "none") ~ ")", "passphrase": ""}|tojson }}'>{{ icon("arrow-right", "i-sm") }} Download…</button>
+          {%- endif %}
+          {%- if can_keep and s.status not in ("pending", "checking") %}
+          <button class="btn btn-sm" type="button" data-open="rename-snapshot" data-fill='{{ {"action": "PATCH /api/v1/snapshots/" ~ s.id, "name": s.name, "notes": s.notes}|tojson }}'>{{ icon("edit", "i-sm") }} Rename</button>
+          {%- endif %}
+          {%- if can_delete %}
+          <button class="btn btn-sm btn-danger" type="button" data-api="DELETE /api/v1/snapshots/{{ s.id }}" data-confirm="Delete snapshot {{ s.name }} from this Slipway? This can't be undone." data-success="Snapshot deleted" data-then="reload" {{ 'disabled' if s.status in ("pending", "checking") }}>{{ icon("trash", "i-sm") }} Delete</button>
+          {%- endif %}
+        </td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% else %}
+  {{ empty("database", "No snapshots yet", "Take one from an instance's Backups card, or upload a file.") }}
+  {% endif %}
+  <div class="card-foot"><span class="subtle">{{ usage.used|bytes }} of {{ usage.quota|bytes }} used</span></div>
+</section>
+
+{% if can_upload %}{{ upload_dialog(max_bytes, locked_days) }}{{ unlock_dialog() }}{% endif %}
+{% if can_download %}{{ download_dialog() }}{% endif %}
+{% if can_keep %}{{ rename_dialog() }}{% endif %}
+{% endblock %}

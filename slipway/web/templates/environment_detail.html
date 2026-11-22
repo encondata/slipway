@@ -1,0 +1,358 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, badge, slot_chip, check_chip %}
+{% from "_data_dialogs.html" import restore_dialog, backup_dialog, snapshot_dialog, reset_dialog, start_over_dialog, backups_card with context %}
+{% from "_environment_dialogs.html" import deploy_dialog, discard_dialog, env_rollback_dialog, activate_dialog, remove_slot_dialog, delete_dialog, resolve_dialog, add_slot_dialog, retire_dialog, unretire_dialog, deactivate_dialog, grow_dialog, resize_vm_dialog, forget_vm_dialog, vm_snapshot_take_dialog, vm_revert_dialog, vm_drop_dialog, continue_dialog with context %}
+{% block title %}{{ env.name }}{% endblock %}
+
+{#- One host cell for every placement (P4 §17.3, P5 §12.3, Decision 33): a host added by hand, a droplet or a VM,
+    from pages.host_view; ``cell`` is pages' host_cells[slot]: {view, pending}; ``vm`` pages.vm_view's slot entry.
+    A VM's power, and its Lost, Hidden and Off chips, come from GET .../machines (slipway.js renderers.vm_live). #}
+{% macro host_cell(s, cell, can_hosts, vm=none) -%}
+{%- set v = cell.view if cell else none -%}
+{%- if s.host is none -%}
+<span>Its managed database</span>{% if doenv and doenv.db_text %}<div class="subtle mono">{{ doenv.db_text }}</div>{% endif %}
+{%- if doenv and doenv.runner %}<div class="subtle">Its data commands run on {{ doenv.runner }}</div>{% endif %}
+{%- else -%}
+{%- set label = v.summary if v and v.summary else s.host.name -%}
+{% if can_hosts %}<a href="/hosts/{{ s.host.id }}" class="{{ 'mono' if v and v.kind }}">{{ label }}</a>{% else %}<span class="{{ 'mono' if v and v.kind }}">{{ label }}</span>{% endif %}
+{%- if v and v.kind and vm %}
+<div class="row wrap host-chips"><span class="chip provider-chip">{{ v.kind }}</span> <span data-vm-chip="{{ s.slot }}">{{ build_chip(v, gone_text="Gone: deploy to rebuild") }}</span> <span class="vm-live" data-vm-live="{{ s.slot }}"></span></div>
+{%- if vm.address %}<div class="subtle mono">{{ vm.address }}{% if vm.network %} <span class="subtle">on {{ vm.network }}</span>{% endif %}</div>{% endif %}
+{%- elif v and v.kind %}
+<div class="row wrap host-chips"><span class="chip provider-chip">{{ v.kind }}</span> {{ build_chip(v, gone_text="Gone: deploy to rebuild") }}</div>
+{%- else %}
+<div class="subtle mono">{{ s.host.lan_address or s.host.upstream_address }}</div>
+{%- endif %}
+{%- if vm and vm.last_error %}<div class="error-text" data-vm-error="{{ s.slot }}" {% if vm.ready %}hidden{% endif %}>{{ vm.last_error }}</div>
+{%- elif v and v.last_error and not vm %}<div class="error-text">{{ v.last_error }}</div>{% endif %}
+{%- endif %}
+{%- if cell and cell.pending %}<div class="subtle" data-resize-pending>{{ cell.pending }}</div>{% endif %}
+{%- endmacro %}
+{% block content %}
+{% set can_hosts = auth.can(Perm.HOSTS_READ) %}
+{% set can_switch = auth.can(Perm.TRAFFIC_SWITCH) %}
+{% set gone = env.status in ("deleted",) %}
+{% set dirty = (owner.data_dirty if owner else None) or None %}
+{% set data_slot = slots.get("data") %}
+{% set data_host = (data_slot.host.name if data_slot and data_slot.host else (owner.host.name if owner and owner.host else "its managed database")) %}
+{% set active_sha7 = ((active.live or {}).get("sha") or "")[:7] if active else "" %}
+<div {% if poll %}data-poll-reload="5000"{% endif %}>
+<div class="page-head">
+  <div>
+    <div class="breadcrumb"><a href="/environments">Environments</a>{{ icon("chevron-right", "i-sm") }}<span>{{ env.name }}</span></div>
+    <h1 class="row">{{ env.name }} {{ badge("environment", env.status) }}
+      {%- if doenv %} <span class="chip provider-chip" data-chip="placement">{{ doenv.chip }}</span>{% endif %}
+      {%- if production %} <span class="badge primary" data-chip="production">Production</span>{% endif %}
+      {%- if retiring %} <span class="badge warning" data-chip="retiring" title="Retiring since {{ env.retiring_at|dt }}">Retiring</span>{% endif %}
+      {%- if out.active_job %} {% if auth.can(Perm.DEPLOYMENTS_READ) %}<a href="/deployments/{{ out.active_job.id }}" class="badge warning spin">{{ out.active_job.kind|kind_label }}…</a>{% else %}<span class="badge warning spin">{{ out.active_job.kind|kind_label }}…</span>{% endif %}{% endif %}</h1>
+    <p class="lede">{{ env.repository.full_name }} · <span class="mono">{{ env.branch }}</span> · {{ "Blue/Green" if two else "Single" }}{% if env.data_mode == "managed" %} on managed data{% elif env.data_mode != "slot" %} with a data server{% endif %}</p>
+  </div>
+  {% if not gone %}
+  <div class="actions">
+    {% if auth.can(Perm.DEPLOYMENTS_CREATE) %}
+    <button class="btn btn-primary" type="button" data-open="deploy-env" {% if not actions.deploy.available %}disabled title="{{ actions.deploy.reason }}"{% endif %}>{{ icon("rocket") }} Deploy…</button>
+    {% endif %}
+    {% if can_switch %}
+      {% if actions.switch_back.available and back %}
+      <button class="btn" type="button" data-open="switch-back">{{ icon("restart") }} Switch back to {{ back.slot }}…</button>
+      {% elif two or not env.active_slot_id %}
+      <button class="btn" type="button" data-open="activate-slot" {% if not actions.activate.available %}disabled title="{{ actions.activate.reason }}"{% endif %}>{{ icon("play") }} Activate {{ actions.activate.slot }}…</button>
+      {% endif %}
+      {% if publishes %}
+      <button class="btn" type="button" data-api="POST /api/v1/environments/{{ env.id }}/publish" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Publishing the names"{% endif %} {% if not actions.publish.available %}disabled title="{{ actions.publish.reason }}"{% endif %}>{{ icon("globe") }} Publish names</button>
+      {% endif %}
+    {% endif %}
+    {% if auth.can(Perm.ENVIRONMENTS_WRITE) %}<a class="btn" href="/environments/{{ env.id }}/edit">{{ icon("settings") }} Settings</a>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# ------------------------------------------------------------------ callouts, in the order of §12.2 #}
+{% if unresolved %}
+<div class="callout error" role="alert">{{ icon("alert") }}<div><strong>{{ unresolved }}.</strong>
+  {% if can_switch %}<div class="row wrap" style="margin-top: 10px"><button class="btn btn-sm" type="button" data-open="resolve-traffic">Resolve…</button></div>{% endif %}</div></div>
+{% endif %}
+
+{% if d and d.hold_text %}
+<div class="callout error" role="alert">{{ icon("alert") }}<div><strong>{{ d.hold_text }}</strong>
+  <div class="row wrap" style="margin-top: 10px">
+    {% if auth.can(Perm.DEPLOYMENTS_READ) and d.last_job %}<a class="btn btn-sm" href="/deployments/{{ d.last_job.id }}">View the job</a>{% endif %}
+    {% if d.hold_backup and auth.can(Perm.DATA_RESTORE) and d.hold_backup.b.restorable and not d.hold_backup.restore_off %}
+    <button class="btn btn-sm" type="button" data-open="restore-backup" data-fill='{{ d.hold_backup.fill|tojson }}'>Restore {{ d.hold_backup.b.name }}…</button>
+    {% endif %}
+  </div></div></div>
+{% elif dirty %}
+{%- set first = dirty.first or {} %}
+<div class="callout warning" data-dirty>{{ icon("alert") }}<div>{{ env.name }}'s data was changed by failed {{ (first.kind or "deploy")|kind_noun }} {{ (first.deployment_id or "")[:8] }}.
+  {%- if actions.discard.available %} {{ active.slot if active else "The live slot" }} kept serving it: discard {{ actions.discard.slot }}, or roll back to the backup from before the deploy.{% else %} Roll back, retry or deploy a fix.{% endif %}
+  <div class="row wrap" style="margin-top: 10px">
+    {% if actions.discard.available %}<button class="btn btn-sm btn-primary" type="button" data-open="discard-slot" data-action="discard">Discard {{ actions.discard.slot }}…</button>{% endif %}
+    {% if actions.rollback.available and rollback %}<button class="btn btn-sm btn-danger" type="button" data-open="roll-back-env" data-action="rollback">Roll back…</button>{% endif %}
+    {% if not actions.discard.available and actions.discard.reason and actions.discard.slot %}<span class="subtle">Discard isn't available: {{ actions.discard.reason }}</span>{% endif %}
+  </div></div></div>
+{% endif %}
+
+{% if out.notice %}
+<div class="callout primary" data-notice>{{ icon("info") }}<div>{{ out.notice.text }}
+  {% if actions.continue %}<div class="row wrap" style="margin-top: 10px">
+    {% if actions.continue.needs_confirm and actions.continue.available %}<button class="btn btn-sm btn-primary" type="button" data-open="continue-chain">{{ cont_label }}…</button>
+    {% else %}<button class="btn btn-sm btn-primary" type="button" data-api="POST /api/v1/environments/{{ env.id }}/notice/continue" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Job queued"{% endif %} {% if not actions.continue.available %}disabled title="{{ actions.continue.reason }}"{% endif %}>{{ cont_label }}</button>{% endif %}
+  </div>{% endif %}</div></div>
+{% if actions.continue and actions.continue.needs_confirm and actions.continue.available %}{{ continue_dialog(env, cont_label) }}{% endif %}
+{% endif %}
+
+{% for slot, text in stale.items() %}
+<div class="callout warning">{{ icon("alert") }}<span>{{ text }}.</span></div>
+{% endfor %}
+
+{% for s in out.slots if s.live and s.live.settings_differ %}
+<div class="callout">{{ icon("info") }}<span>{{ "The data server" if s.slot == "data" else s.slot }} keeps the settings it was deployed with until you deploy to it.</span></div>
+{% endfor %}
+
+{# DigitalOcean's callouts (P4 §17.3), after phase 3's; the DigitalOcean card adds the live ones (a droplet powered
+   off, a gone droplet) to [data-cloud-callouts] once GET /cloud answers. #}
+{% if doenv and not gone %}
+{% for c in doenv.callouts %}
+<div class="callout {{ c.level }}" data-callout="{{ c.key }}" {% if c.level == "error" %}role="alert"{% endif %}>{{ icon("alert" if c.level in ("error", "warning") else "info") }}<div>{{ c.text }}.
+  {%- if c.link %} <a href="{{ c.link[0] }}">{{ c.link[1] }}</a>{% endif %}
+  {%- if c.host and can_hosts %} <a href="/hosts/{{ c.host.id }}">Open host {{ c.host.name }}</a>{% endif %}
+  {%- if c.deploy_slot and auth.can(Perm.DEPLOYMENTS_CREATE) %}
+  <div class="row wrap" style="margin-top: 10px"><button class="btn btn-sm btn-primary" type="button" data-api="POST /api/v1/environments/{{ env.id }}/deploy" data-body='{{ {"slot": c.deploy_slot}|tojson }}' {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Deploy queued"{% endif %}>{{ icon("rocket", "i-sm") }} Deploy to {{ c.deploy_slot }}</button></div>
+  {%- endif %}
+  {%- if c.renew and can_switch and actions.renew_certificate.available %}
+  <div class="row wrap" style="margin-top: 10px"><button class="btn btn-sm" type="button" data-api="POST /api/v1/environments/{{ env.id }}/certificate" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Renewal queued"{% endif %}>Renew now</button></div>
+  {%- endif %}</div></div>
+{% endfor %}
+<div data-cloud-callouts></div>
+{% endif %}
+
+{% if env.status == "deleted" %}<div class="callout">{{ icon("info") }}<span>{{ env.name }} was deleted {{ env.deleted_at|dt }}. Its jobs and their logs stay below.</span></div>{% endif %}
+
+{# ---------------------------------------------------------------------------- DigitalOcean card (P4 §17.3) #}
+{% if doenv %}
+{%- set dc = doenv.cloud -%}
+<section class="card" id="cloud-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("globe", "i-lg") }}</span><div><h2>DigitalOcean</h2><p>What Slipway made for {{ env.name }} on DigitalOcean. The objects are read live from DigitalOcean; nothing is changed here.</p></div>
+    <span class="spacer"></span><button class="btn btn-sm" type="button" data-reload-target="#cloud-objects">{{ icon("sync", "i-sm") }} Refresh</button></div>
+  <div class="card-body stack" style="gap: 12px">
+    <dl class="kv">
+      <dt>Account and team</dt><dd>{% if doenv.account %}{% if can_see_integrations(auth) %}<a href="/settings/integrations">{{ doenv.account.name }}</a>{% else %}{{ doenv.account.name }}{% endif %}{% else %}<span class="muted">Removed</span>{% endif %}{% if doenv.team %} <span class="subtle">· {{ doenv.team }}</span>{% else %} <span class="subtle">· team known after the first deploy</span>{% endif %}</dd>
+      <dt>Region</dt><dd class="mono">{{ doenv.region or "—" }}</dd>
+      <dt>Load balancer IP</dt><dd class="mono">{{ dc.lb_ip or "Known after the first deploy" }}</dd>
+      <dt>Certificate</dt><dd>{% if doenv.cert %}Valid until {{ doenv.cert_date }}{% if doenv.cert.days_left is not none %} <span class="subtle">({{ doenv.cert.days_left }} days)</span>{% endif %}{% else %}<span class="muted">Issued at the first deploy</span>{% endif %}
+        {%- if can_switch and not gone %} <button class="btn btn-sm" type="button" data-api="POST /api/v1/environments/{{ env.id }}/certificate" {% if auth.can(Perm.DEPLOYMENTS_READ) %}data-then="redirect:/deployments/{id}"{% else %}data-then="reload" data-success="Renewal queued"{% endif %} {% if not actions.renew_certificate.available %}disabled title="{{ actions.renew_certificate.reason }}"{% endif %}>Renew now</button>{% endif %}
+        {%- if doenv.renew_text %}<div class="subtle" data-renewal>{{ doenv.renew_text }}</div>{% endif %}</dd>
+      <dt>Estimate</dt><dd>About ${{ doenv.total }} a month{% if doenv.as_of %} <span class="subtle">· prices as of {{ doenv.as_of }}</span>{% endif %}</dd>
+      <dt>Sizes</dt><dd><span class="mono">{{ (dc.sizes or {}).droplet_size or "—" }}</span>{% if (dc.sizes or {}).droplets %} <span class="subtle">× {{ dc.sizes.droplets }}</span>{% endif %}{% if doenv.db_text %} · <span class="mono">{{ doenv.db_text }}</span>{% endif %}
+        {%- if auth.can(Perm.ENVIRONMENTS_WRITE) and not gone %} <button class="btn btn-sm" type="button" data-open="grow-env" {% if not actions.grow.available %}disabled title="{{ actions.grow.reason }}"{% endif %}>Grow…</button>{% endif %}
+        {%- for slot, text in (actions.grow.pending or {}).items() %}<div class="subtle">{{ text }}</div>{% endfor %}</dd>
+    </dl>
+  </div>
+  <div id="cloud-objects" data-load="/api/v1/environments/{{ env.id }}/cloud" data-render="cloud_objects" data-env="{{ env.id }}" data-env-name="{{ env.name }}" data-active-droplet="{{ doenv.active_droplet }}"
+       data-active-slot="{{ active.slot if active else '' }}" {% if auth.can(Perm.DEPLOYMENTS_CREATE) and not gone %}data-can-deploy{% endif %}>
+    <div class="card-body"><p class="muted" style="margin: 0">Reading DigitalOcean…</p></div>
+  </div>
+</section>
+{% endif %}
+
+{# ---------------------------------------------------------------------------------------- Slots card #}
+<section class="card" id="slots-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("environments", "i-lg") }}</span><div><h2>Slots</h2><p>{% if two %}Deploys go to the idle slot; Activate moves the traffic to it.{% else %}One slot: each deploy updates it in place.{% endif %}</p></div></div>
+  <div class="table-wrap"><table class="table slots">
+    <thead><tr><th>Slot</th><th>Host</th><th>Release</th><th>Status</th><th>Last check</th><th></th></tr></thead>
+    <tbody>{% for s in out.slots %}
+      <tr data-slot-row="{{ s.slot }}">
+        <td>{{ slot_chip(s.slot, s.active) }}</td>
+        {%- set vm = vmenv.slots.get(s.slot) if vmenv else none %}
+        <td class="host-cell">{{ host_cell(s, host_cells.get(s.slot), can_hosts, vm) }}</td>
+        <td>{% if s.live %}<span class="mono">{{ (s.live.sha or "")[:7] }}</span> <span class="subtle">{{ s.live.deployed_at|timeago }}</span>{% else %}<span class="muted">Not deployed</span>{% endif %}</td>
+        <td>{{ badge("instance", s.status) }}{% if s.stale %} <span class="badge warning" title="{{ s.stale.reason }}">Stale</span>{% endif %}</td>
+        <td>{% if s.role == "app" %}{{ check_chip(checks.get(s.slot)) }}{% if checks.get(s.slot) %} <span class="subtle">{{ checks[s.slot].at|timeago }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>
+        <td class="actions-cell">
+          {% if not gone %}
+          {% if s.role == "app" and can_switch %}
+            {% if back and s.slot == back.slot and actions.switch_back.available %}<button class="btn btn-sm" type="button" data-open="switch-back">Switch back…</button>
+            {% elif idle and s.slot == idle.slot and not s.active and actions.activate.available %}<button class="btn btn-sm" type="button" data-open="activate-slot">Activate…</button>{% endif %}
+          {% endif %}
+          {% if s.role == "data" and auth.can(Perm.DEPLOYMENTS_CREATE) and env.data_mode == "server" %}
+          <button class="btn btn-sm" type="button" data-open="deploy-env" data-fill='{"target": "data"}' {% if not actions.update_data_server.available %}disabled title="{{ actions.update_data_server.reason }}"{% endif %}>Update the data server…</button>
+          {% endif %}
+          {#- A VM's Resize (P5 §9.4; never a ready data server's) and Forget the VM (shown once the live read finds it lost). #}
+          {% if vm and auth.can(Perm.MACHINES_WRITE) and not (s.slot == "data" and vm.ready) %}
+          <button class="btn btn-sm" type="button" data-open="resize-vm-{{ s.slot }}" {% if not vm.resize.available %}disabled title="{{ vm.resize.reason }}"{% endif %}>Resize…</button>
+          {% endif %}
+          {% if vm and vm.forget.available %}
+          <button class="btn btn-sm btn-danger" type="button" data-open="forget-vm" data-forget-slot="{{ s.slot }}" hidden
+                  data-fill='{{ {"action": "POST /api/v1/environments/" ~ env.id ~ "/machines/" ~ s.slot ~ "/forget", "vm": vm.name, "account": vm.account, "address": vm.address, "slot": s.slot}|tojson }}'>Forget the VM…</button>
+          {% endif %}
+          {% if auth.can(Perm.INSTANCES_READ) %}<a class="btn btn-sm" href="/instances/{{ s.instance_id }}">Open instance</a>{% endif %}
+          {% if s.role == "app" and two and auth.can(Perm.ENVIRONMENTS_DELETE) %}
+          {%- set fill = {"action": "DELETE /api/v1/environments/" ~ env.id ~ "/slots/" ~ s.slot, "slot": s.slot, "host": s.host.name if s.host else ""} %}
+          {%- if vmenv %}{% set fill = dict(fill, vm=vm is not none, ssh=vm is none, account=vm.account if vm else "", forgettable=vm.forgettable if vm else false) %}{% endif %}
+          <button class="btn btn-sm btn-danger" type="button" data-open="remove-slot" {% if vmenv %}data-remove-slot="{{ s.slot }}" {% endif %}data-fill='{{ fill|tojson }}' {% if s.active %}disabled title="{{ s.slot }} takes the traffic: activate the other slot first"{% endif %}>Remove…</button>
+          {% endif %}
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% if vmenv and not gone %}
+  <div class="card-foot vm-live-foot" id="vm-live" data-load="/api/v1/environments/{{ env.id }}/machines" data-render="vm_live"><span class="subtle">Reading the VMs…</span></div>
+  {% endif %}
+  {% if not gone and auth.can(Perm.ENVIRONMENTS_WRITE) and env.data_mode != "slot" and not two %}
+  <div class="card-foot"><button class="btn btn-sm" type="button" data-open="add-slot" {% if not actions.add_slot.available %}disabled title="{{ actions.add_slot.reason }}"{% endif %}>{{ icon("plus", "i-sm") }} Add a slot…</button>
+    {% if not actions.add_slot.available %}<span class="subtle">{{ actions.add_slot.reason }}</span>{% endif %}</div>
+  {% endif %}
+</section>
+
+{# -------------------------------------------------------------------------------------- Traffic card #}
+{% if publishes and not gone %}
+<section class="card" id="traffic-card">
+  <div class="card-head"><span class="head-icon">{{ icon("globe", "i-lg") }}</span><div><h2>Traffic</h2><p>Where each public name goes now, and what Publish names or the next Activate would change. Read from {{ "the load balancer" if lb else "Switchyard" }}{% if (env.traffic or {}).get("dns") %} and Cloudflare{% endif %}; nothing is changed here.</p></div>
+    <span class="spacer"></span><button class="btn btn-sm" type="button" data-reload-target="#traffic-plan">{{ icon("sync", "i-sm") }} Refresh</button></div>
+  <div id="traffic-plan" data-load="/api/v1/environments/{{ env.id }}/traffic/plan" data-render="traffic_plan" data-env="{{ env.id }}" {% if lb %}data-switch-label="Load balancer"{% endif %} {% if can_switch %}data-can-claim{% endif %}>
+    <div class="card-body"><p class="muted" style="margin: 0">Reading {{ "the load balancer" if lb else "Switchyard" }}…</p></div>
+  </div>
+</section>
+{% endif %}
+
+{# ---------------------------------------------------------------------------------- Deployments card #}
+{% if auth.can(Perm.DEPLOYMENTS_READ) %}
+<section class="card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("rocket", "i-lg") }}</span><div><h2>Deployments</h2><p>Every job of {{ env.name }}: its slots'{{ ", its data server's" if env.data_mode == "server" }} and its own.</p></div>
+    <span class="spacer"></span><a class="link-more" href="/deployments/history?environment={{ env.id }}">View All {{ icon("arrow-right", "i-sm") }}</a></div>
+  {% if deployments %}
+  <div class="table-wrap"><table class="table">
+    <thead><tr><th>When</th><th>What</th><th>Slot</th><th>Commit</th><th>Status</th><th>By</th><th></th></tr></thead>
+    <tbody>{% for dep in deployments %}
+      {% set dslot = (dep.instance.slot if dep.instance else (dep.options or {}).get("slot")) %}
+      <tr>
+        <td class="muted nowrap" title="{{ dep.created_at|dt }}">{{ dep.created_at|timeago }}</td>
+        <td class="nowrap">{{ dep|dep_label }}</td>
+        <td>{% if dslot %}{{ "data server" if dslot == "data" else dslot }}{% else %}<span class="subtle">—</span>{% endif %}</td>
+        <td><span class="mono">{{ dep.short_sha or "—" }}</span> <span class="muted">{{ (dep.commit_message or "")|truncate(60) }}</span></td>
+        <td>{{ badge("deployment", dep.status, dep.kind) }}</td>
+        <td class="muted">{{ dep.triggered_by.display_name if dep.triggered_by else "Slipway" }}</td>
+        <td class="actions-cell"><a class="btn btn-sm" href="/deployments/{{ dep.id }}">View log</a></td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% else %}<div class="card-body"><p class="muted">No deployments yet.</p></div>{% endif %}
+</section>
+{% endif %}
+
+{# --------------------------------------------------------------------- Backups card (the data owner's) #}
+{#- The card reloads its rows from GET /instances/{owner}/backups, which needs instances:read too. #}
+{% if d and auth.can(Perm.DATA_READ) and auth.can(Perm.INSTANCES_READ) and not gone %}
+{%- if env.data_mode == "managed" %}
+{%- set subtitle = "Database dumps stored encrypted on this Slipway server. Slipway takes one before every deploy and every change that replaces data. DigitalOcean also keeps its own daily backups of the cluster; Slipway doesn't use them." %}
+{%- else %}
+{%- set subtitle = "Database dumps in " ~ ((d.folder ~ "/backups") if can_hosts and d.folder else "the data owner's backups folder") ~ " on " ~ data_host ~ ". Slipway takes one before every deploy to a slot and every change that replaces data." %}
+{%- endif %}
+{{ backups_card(owner, d, subtitle=subtitle) }}
+{% endif %}
+
+{# ---------------------------------------------------------------------- VM snapshots card (P5 §12.3) #}
+{% if vmenv and vmenv.card and not gone %}
+{%- set card = vmenv.card %}
+{%- set vs = card.action %}
+<section class="card" id="vm-snapshots-card">
+  <div class="card-head"><span class="head-icon">{{ icon("package", "i-lg") }}</span><div><h2>VM snapshots</h2><p>A VM snapshot is the whole VM's disk at one moment: the app, its data and the system. Reverting loses everything written since, backups on the VM included. Backups (above) are the way to restore only the data.</p></div>
+    {% if card.mode != "none" %}<span class="spacer"></span>
+    <button class="btn btn-sm" type="button" data-reload-target="#vm-snapshots">{{ icon("sync", "i-sm") }} Refresh</button>
+    {% if auth.can(Perm.MACHINES_WRITE) %}<button class="btn btn-sm btn-primary" type="button" data-open="vm-snapshot-take" {% if not vs.available %}disabled title="{{ vs.reason }}"{% endif %}>{{ icon("plus", "i-sm") }} Take a VM snapshot…</button>{% endif %}{% endif %}</div>
+  {% if card.mode == "none" %}
+  <div class="card-body"><p class="muted" style="margin: 0" data-vm-snapshots-none>{{ card.none_text }}</p></div>
+  {% else %}
+  <div id="vm-snapshots" data-load="/api/v1/environments/{{ env.id }}/vm-snapshots" data-render="vm_snapshots" data-env="{{ env.id }}" data-account="{{ card.account }}" data-none-text="{{ card.none_text }}" {% if auth.can(Perm.MACHINES_WRITE) %}data-can-act{% endif %}>
+    <div class="card-body"><p class="muted" style="margin: 0">Reading {{ card.account }}…</p></div>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{# ------------------------------------------------------------------------------- Data card (mode server) #}
+{% if env.data_mode == "server" and data_slot and data_slot.host %}
+{%- set clients = out.data.clients or [] %}
+<section class="card" id="data-card">
+  <div class="card-head"><span class="head-icon">{{ icon("database", "i-lg") }}</span><div><h2>Data</h2><p>The data server runs {{ env.name }}'s data services; the app slots attach to it.</p></div></div>
+  <div class="card-body stack" style="gap: 12px">
+    <dl class="kv">
+      <dt>{{ icon("hosts", "i-sm") }} Data server</dt><dd>{% if can_hosts %}<a href="/hosts/{{ data_slot.host.id }}">{{ data_slot.host.name }}</a>{% else %}{{ data_slot.host.name }}{% endif %} <span class="subtle mono">{{ data_slot.host.upstream_address }}</span></dd>
+      <dt>{{ icon("globe", "i-sm") }} Published ports</dt><dd>{% for p in data_slot.ports if p.host %}<span class="chip mono">{{ p.service or "port" }} on {{ data_slot.host.upstream_address }}:{{ p.host }}</span> {% else %}<span class="muted">Known after its first deploy</span>{% endfor %}</dd>
+      <dt>{{ icon("shield", "i-sm") }} Lets in</dt><dd>{% for c in clients %}<span class="chip mono">{{ c }}</span> {% else %}<span class="muted">Known after its first deploy</span>{% endfor %}</dd>
+    </dl>
+    <div class="callout warning" data-lan-warning>{{ icon("alert") }}<span>These ports are reachable from every machine on the LAN; Postgres lets in only {{ clients|join(", ") if clients else "the app slots' hosts" }}, and the file store needs its key. docs/environments.md shows how to firewall them.</span></div>
+  </div>
+</section>
+{% endif %}
+
+{# ------------------------------------------------------------------------------------------ Danger zone #}
+{% set can_reset_data = d and auth.can(Perm.DATA_RESET) and ("reset" in d.caps or d.start_over) %}
+{% if (auth.can(Perm.ENVIRONMENTS_DELETE) or can_reset_data) and not gone %}
+<section class="card">
+  <div class="card-head"><span class="head-icon" style="color: var(--error)">{{ icon("alert", "i-lg") }}</span><div><h2>Danger zone</h2><p>{% if doenv %}Deleting removes every DigitalOcean object Slipway made for {{ env.name }} (the droplets, the database cluster and its data, the bucket and its files, the load balancer) and the DNS records Slipway made. The backups stored on this Slipway server are kept.{% else %}Deleting removes the slots' containers and folders, and the Switchyard hosts and DNS records Slipway made. The data volumes and backups stay on {{ data_host }}.{% endif %}
+      {%- if production %} A production environment is retired first, then taken off the air, and deleted only after a snapshot.{% endif %}</p></div></div>
+  <div class="card-body row wrap">
+    {% if can_reset_data %}
+      {% if d.start_over %}
+      <button class="btn btn-danger" type="button" data-open="start-over" {% if d.busy %}disabled title="A job is running for {{ env.name }}; wait for it to finish"{% endif %}>{{ icon("restart") }} Start over…</button>
+      {% else %}
+      <button class="btn btn-danger" type="button" data-open="reset-data" {% if d.reset_off %}disabled title="{{ d.reset_off }}"{% endif %}>{{ icon("restart") }} Reset data…</button>
+      {% endif %}
+    {% endif %}
+    {#- Production (P4 §13, §17.3): Retire, then Take off the air, then Delete; Un-retire while it retires. #}
+    {% if production and auth.can(Perm.ENVIRONMENTS_DELETE) %}
+      {% if not retiring %}
+      <button class="btn btn-danger" type="button" data-open="retire-env" {% if not actions.retire.available %}disabled title="{{ actions.retire.reason }}"{% endif %}>{{ icon("clock") }} Retire…</button>
+      {% else %}
+      <button class="btn" type="button" data-open="unretire-env" {% if not actions.unretire.available %}disabled title="{{ actions.unretire.reason }}"{% endif %}>{{ icon("restart") }} Un-retire…</button>
+      {% if env.active_slot_id %}
+      <button class="btn btn-danger" type="button" data-open="deactivate-env" {% if not actions.deactivate.available %}disabled title="{{ actions.deactivate.reason }}"{% endif %}>{{ icon("alert") }} Take off the air…</button>
+      {% endif %}
+      {% endif %}
+    {% endif %}
+    {% if auth.can(Perm.ENVIRONMENTS_DELETE) %}
+    <button class="btn btn-danger solid" type="button" data-open="delete-env" {% if not actions.delete.available %}disabled title="{{ actions.delete.reason }}"{% endif %}>{{ icon("trash") }} Delete environment…</button>
+    {% if not actions.delete.available %}<span class="subtle">{{ actions.delete.reason }}</span>{% endif %}
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+</div>
+
+{# ------------------------------------------------------------------------------------------------ dialogs #}
+{% if not gone %}
+{% if auth.can(Perm.DEPLOYMENTS_CREATE) and actions.deploy.available or actions.update_data_server.available %}{{ deploy_dialog(env, out, slots, actions, two, host_cells, vmenv) }}{% endif %}
+{% if actions.discard.available %}{{ discard_dialog(env, actions, active) }}{% endif %}
+{% if rollback %}{{ env_rollback_dialog(env, rollback) }}{% endif %}
+{% if can_switch %}
+  {% if idle and actions.activate.available %}{{ activate_dialog(env, "activate-slot", idle, active.slot if active else None, active_names, lb=lb, production=production) }}{% endif %}
+  {% if back and actions.switch_back.available %}{{ activate_dialog(env, "switch-back", back, active.slot if active else None, active_names, back=True, lb=lb, production=production) }}{% endif %}
+  {% if unresolved %}{{ resolve_dialog(env) }}{% endif %}
+{% endif %}
+{% if two and auth.can(Perm.ENVIRONMENTS_DELETE) %}{{ remove_slot_dialog(env, data_host, doenv, vmenv) }}{% endif %}
+{% if auth.can(Perm.ENVIRONMENTS_DELETE) and actions.delete.available %}{{ delete_dialog(env, out, slots, teardown, default_snapshot_name, auth.can(Perm.DATA_BACKUP) and d and "backup" in d.caps, doenv, deleting, vmenv) }}{% endif %}
+{% if actions.add_slot.available %}{{ add_slot_dialog(env, add_hosts, doenv, add_vms) }}{% endif %}
+{% if vmenv %}
+  {% if auth.can(Perm.MACHINES_WRITE) %}{% for slot, vm in vmenv.slots.items() %}{% if vm.resize.available %}{{ resize_vm_dialog(env, slot, vm) }}{% endif %}{% endfor %}{% endif %}
+  {% if vmenv.slots.values()|selectattr("forget.available")|list %}{{ forget_vm_dialog(env) }}{% endif %}
+  {% if vmenv.card and vmenv.card.mode != "none" and auth.can(Perm.MACHINES_WRITE) %}
+    {% if vmenv.card.action.available %}{{ vm_snapshot_take_dialog(env, vmenv.card) }}{% endif %}
+    {% if auth.can(Perm.DATA_RESET) %}{{ vm_revert_dialog(env, vmenv.card) }}{% endif %}
+    {{ vm_drop_dialog(env, vmenv.card) }}
+  {% endif %}
+{% endif %}
+{% if production and auth.can(Perm.ENVIRONMENTS_DELETE) %}
+  {% if actions.retire.available %}{{ retire_dialog(env) }}{% endif %}
+  {% if actions.unretire.available %}{{ unretire_dialog(env) }}{% endif %}
+  {% if actions.deactivate.available %}{{ deactivate_dialog(env, active, active_names) }}{% endif %}
+{% endif %}
+{% if doenv and auth.can(Perm.ENVIRONMENTS_WRITE) and actions.grow.available %}{{ grow_dialog(env, doenv) }}{% endif %}
+{% if d and owner %}
+{% if auth.can(Perm.DATA_RESTORE) and auth.can(Perm.DATA_READ) %}{{ restore_dialog(owner, d) }}{% endif %}
+{% if auth.can(Perm.DATA_BACKUP) and "backup" in d.caps %}{{ backup_dialog(owner, d) }}{{ snapshot_dialog(owner, d) }}{% endif %}
+{% if can_reset_data %}{% if d.start_over %}{{ start_over_dialog(owner, d) }}{% else %}{{ reset_dialog(owner, d) }}{% endif %}{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}

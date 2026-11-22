@@ -481,8 +481,9 @@ prop("disabled", function () { return "disabled" in this.attrs; }, function (v) 
 prop("hidden", function () { return "hidden" in this.attrs; }, function (v) { if (v) this.attrs.hidden = ""; else delete this.attrs.hidden; });
 prop("form", function () { return this.parentNode ? this.parentNode.closest("form") : null; });
 prop("selectedOptions", function () {
+  // As in a browser: with none selected, the first option that isn't disabled (none when all are).
   var opts = this.querySelectorAll("option"), sel = opts.filter(function (o) { return o.selected; });
-  return sel.length ? sel.slice(0, 1) : opts.slice(0, 1);
+  return sel.length ? sel.slice(0, 1) : opts.filter(function (o) { return !("disabled" in o.attrs); }).slice(0, 1);
 });
 prop("value", function () {
   if (this.tagName === "SELECT") { var o = this.selectedOptions[0]; return o ? o.value : ""; }
@@ -495,9 +496,16 @@ prop("value", function () {
 prop("textContent", function () { return this._text + this.children.map(function (c) { return c.textContent; }).join(""); },
   function (v) { this._text = String(v); this.children.slice().forEach(function (c) { c.remove(); }); });
 prop("innerHTML", function () { return ""; }, function (v) {
-  var self = this, re = /<option ?(selected)?[^>]*>([^<]*)<\/option>/g, m;
+  // <option> tags only, with their value, selected and disabled attributes.
+  var self = this, re = /<option([^>]*)>([^<]*)<\/option>/g, m;
   this.textContent = "";
-  while ((m = re.exec(v))) { var o = new El("option", m[1] ? { selected: "" } : {}, [m[2]]); self.appendChild(o); }
+  while ((m = re.exec(v))) {
+    var attrs = {}, a, are = /([\w-]+)(?:="([^"]*)")?/g;
+    while ((a = are.exec(m[1]))) attrs[a[1]] = a[2] === undefined ? "" : a[2].replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+    var o = new El("option", attrs, [m[2]]);
+    if ("selected" in attrs) o.selected = true;
+    self.appendChild(o);
+  }
 });
 prop("defaultChecked", function () { return "checked" in this.attrs; });
 prop("defaultValue", function () { return this.attrs.value || ""; });
@@ -741,3 +749,147 @@ async def test_role_editor_saves_without_regranting_untouched_permissions(admin_
     assert legacy_saved["permissions"] == ["instances:read", "legacy:thing"]
     assert "Unknown permission(s): legacy:thing" in json.dumps(rejected)
     assert cleaned["permissions"] == ["hosts:read", "instances:read"]
+
+
+# ------------------------------------------------- provider accounts and hosts Slipway made (S21)
+
+
+async def test_integrations_account_forms_post_and_never_carry_a_secret(admin_client, make_client):
+    from tests import do_fixtures as dof
+    from tests import fake_digitalocean as fdo
+    from tests import vm_fixtures as vf
+
+    await dof.make_account("do-main")
+    await vf.proxmox_account(name="lab")
+    await vf.esxi_account(name="esx-01")
+    page = (await admin_client.get("/settings/integrations")).text
+    for secret in (fdo.TOKEN, vf.fp.TOKEN, vf.fp.TOKEN.split("=", 1)[1], vf.ESXI_PASSWORD):
+        assert secret not in page
+    forms = _parse(page).forms
+    accounts = [f for f in forms if "data-account-form" in f]
+    assert sorted(f["data-account-form"] for f in accounts) == ["digitalocean", "esxi", "proxmox"]
+    for form in accounts + [f for f in forms if "data-form" in f or "data-trust-form" in f]:
+        assert form.get("method") == "post" and form.get("action") == "/js-required", form
+    # A secret field is never rendered with a value, and the Edit buttons carry none.
+    assert not re.search(r'name="secret"[^>]*value=', page)
+    for raw in re.findall(r"data-account='([^']*)'", page):
+        edit = json.loads(html.unescape(raw))
+        assert "secret" not in edit and "BEGIN CERTIFICATE" not in json.dumps(edit)
+
+    # A viewer neither sees the tab nor reaches the page; a developer reads the accounts without changing them.
+    await make_user("viewer@example.com", roles=["viewer"])
+    viewer = make_client()
+    await login(viewer, "viewer@example.com")
+    assert 'href="/settings/integrations"' not in (await viewer.get("/settings")).text
+    assert (await viewer.get("/settings/integrations")).status_code == 403
+    dev = await _client_with(make_client, "readsaccounts@example.com", ["providers:read"])
+    dev_page = (await dev.get("/settings/integrations")).text
+    assert "do-main" in dev_page and "lab" in dev_page and "data-account-form" not in dev_page
+
+
+def test_js_account_dialog_forgets_a_typed_secret_when_opened_again(tmp_path):
+    result = run_js(tmp_path, """
+var form = h("form", { "data-account-form": "digitalocean", "data-provider": "digitalocean", "data-account-id": "" }, [
+  h("input", { name: "name" }), h("select", { name: "region" }, [h("option", { value: "nyc3" }, ["nyc3"])]),
+  h("input", { name: "production", type: "checkbox" }), h("input", { name: "secret", type: "password" }),
+  h("textarea", { name: "ssh_sources" }), h("input", { name: "monthly_limit", type: "number" }),
+  h("textarea", { name: "prices" }), h("label", { "data-clear-secret": "", hidden: "" }, [h("input", { name: "clear_secret", type: "checkbox" })]),
+  h("button", { type: "submit" })]);
+var dlg = h("dialog", { id: "account-digitalocean" }, [h("h2", { "data-slot": "account_title" }), form]);
+document.body.appendChild(dlg);
+document.dispatchEvent(new Event("DOMContentLoaded"));
+window.slipway.openAccount("digitalocean", null);
+form.querySelector('[name="secret"]').value = "dop_v1_typed";
+window.slipway.openAccount("digitalocean", { id: "a1", name: "do-main", region: "sfo3", has_secret: true, secret_hint: "abcd",
+  ssh_sources: ["198.51.100.0/24"], monthly_limit: "", monthly_limit_cents: null, prices: null, production: false });
+var out = { secret: form.querySelector('[name="secret"]').value, region: form.querySelector('[name="region"]').value,
+            title: dlg.querySelector('[data-slot="account_title"]').textContent,
+            placeholder: form.querySelector('[name="secret"]').getAttribute("placeholder"),
+            body: window.slipway.accountBody(form) };
+done(out);
+""")
+    assert result["secret"] == "" and result["region"] == "sfo3" and result["title"] == "Edit do-main"
+    assert result["placeholder"] == "Set (…abcd); leave it empty to keep it"
+    assert result["body"] == {}  # nothing changed, and no secret was typed
+
+
+# ------------------------------------------------------- DigitalOcean environment pages (S24a)
+
+
+async def test_digitalocean_environment_page_forms_post_through_js_and_carry_no_secret(admin_client):
+    from tests import do_fixtures as dof
+
+    prod = await dof.make_account("do-prod", production=True)
+    env = await dof.make_do_env(name="shop", account_id=prod, production=True)
+    page = (await admin_client.get(f"/environments/{env.env_id}")).text
+    assert dof.TOKEN not in page and dof.TOKEN[-4:] not in page
+    for secret in dof.SECRETS.values():
+        assert secret not in page
+    forms = [f for f in _parse(page).forms if "data-form" in f]  # the search box in the top bar is a GET
+    assert forms and all(f.get("method") == "post" and f.get("action") == "/js-required" for f in forms), forms
+    # Every typed confirmation is data-must-equal: the environment's name, a production phrase, or a cost figure
+    # the page learns from the API (empty until then, so it never matches an empty field).
+    for field in re.findall(r'<input[^>]*name="(?:confirm|confirm_production|confirm_no_snapshot|confirm_cost)"[^>]*>',
+                            page):
+        assert "data-must-equal=" in field, field
+        if 'name="confirm_cost"' in field:
+            assert 'data-must-equal=""' in field and "data-cost-input" in field
+    # No emoji anywhere on the page.
+    assert not re.search("[\U0001F300-\U0001FAFF☀-➿]", page)
+    # The New environment flow, with a DigitalOcean account.
+    flow = (await admin_client.get("/environments/new")).text
+    assert dof.TOKEN not in flow and not re.search("[\U0001F300-\U0001FAFF☀-➿]", flow)
+
+
+def test_js_a_cost_confirm_stays_off_until_priced_and_a_blocked_plan_until_clear(tmp_path):
+    result = run_js(tmp_path, """
+var typed = h("input", { name: "confirm_cost", "data-must-equal": "", "data-cost-input": "" });
+var box = h("div", { "data-cost-box": "", hidden: "" }, [typed]);
+var save = h("button", { type: "submit" });
+var form = h("form", { "data-form": "POST /api/v1/x", "data-cost-confirm": "" }, [box, save]);
+var name = h("input", { name: "confirm", "data-must-equal": "shop" });
+var go = h("button", { type: "submit", "data-plan-submit": "" });
+var plan = h("div", { "data-render": "traffic_plan", "data-mode": "list" });
+var other = h("form", { "data-form": "POST /api/v1/y" }, [plan, name, go]);
+document.body.appendChild(form); document.body.appendChild(other);
+document.dispatchEvent(new Event("DOMContentLoaded"));
+user("input", typed); await settle();
+var out = { emptyMatches: save.disabled };
+typed.dataset.mustEqual = "47.00"; typed.value = "47.00"; user("input", typed); await settle();
+out.priced = save.disabled;
+window.slipway.renderers.traffic_plan(plan, { switch: { blockers: ["The load balancer is busy"], changes: [] }, dns: null, routes: [] });
+name.value = "shop"; user("input", name); await settle();
+out.blocked = go.disabled;
+window.slipway.renderers.traffic_plan(plan, { switch: { blockers: [], changes: [] }, dns: null, routes: [] });
+out.clear = go.disabled;
+done(out);
+""")
+    assert result == {"emptyMatches": True, "priced": False, "blocked": True, "clear": False}
+
+
+# ---------------------------------------------------------------- environment pages for VMs (S24b)
+
+
+async def test_vm_environment_page_forms_post_through_js_and_carry_no_secret(admin_client, monkeypatch):
+    from tests import vm_fixtures as vf
+    from tests.fake_proxmox import TOKEN
+
+    vf.quiet_network(monkeypatch)
+    account = await vf.proxmox_account()
+    env = await vf.vm_env(account, mode="server", slots=("blue", "green"))
+    page = (await admin_client.get(f"/environments/{env.env_id}")).text
+    for secret in (TOKEN, TOKEN.split("=", 1)[1], vf.ESXI_PASSWORD):
+        assert secret not in page
+    assert "BEGIN CERTIFICATE" not in page
+    forms = [f for f in _parse(page).forms if "data-form" in f]
+    assert forms and all(f.get("method") == "post" and f.get("action") == "/js-required" for f in forms), forms
+    # Every typed confirmation is data-must-equal (Remove slot, Delete, Forget, Revert ask for the name).
+    for field in re.findall(r'<input[^>]*name="confirm"[^>]*>', page):
+        assert 'data-must-equal="uat"' in field, field
+    # A new VM's sub-form never sends its fields by itself: slipway.js builds the body's machine.
+    for field in re.findall(r'<(?:input|select)[^>]*data-vm="[a-z_]+"[^>]*>', page):
+        assert "data-no-send" in field, field
+    assert not re.search("[\U0001F300-\U0001FAFF\u2600-\u27BF]", page)
+    flow = (await admin_client.get("/environments/new")).text
+    assert TOKEN not in flow
+    assert not re.search("[\U0001F300-\U0001FAFF\u2600-\u27BF]", flow)

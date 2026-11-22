@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import ForeignKey, String, Text, text, true
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, Text, UniqueConstraint, false, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from slipway.core.crypto import EncryptedJSON
@@ -16,10 +16,14 @@ from slipway.models.host import Host
 from slipway.models.repository import Repository
 from slipway.models.user import User
 
+if TYPE_CHECKING:
+    from slipway.models.environment import Environment
+
 
 class BuildSource(StrEnum):
     DOCKERFILE = "dockerfile"
     COMPOSE = "compose"
+    APP = "app"  # the repository's slipway.yml says how (see services.manifest)
 
 
 class InstanceStatus(StrEnum):
@@ -42,13 +46,55 @@ class DeploymentStatus(StrEnum):
         return self in (DeploymentStatus.QUEUED, DeploymentStatus.RUNNING)
 
 
+class DeploymentKind(StrEnum):
+    """What a job does. Every data job is a Deployment with a kind (D1)."""
+
+    DEPLOY = "deploy"
+    RESTORE = "restore"
+    ROLLBACK = "rollback"
+    RESET = "reset"
+    BACKUP = "backup"
+    SNAPSHOT = "snapshot"
+    ADMIN = "admin"
+    CONTENT = "content"
+    # Environment-level jobs (phase 3 D9): instance_id is None and environment_id is set.
+    ACTIVATE = "activate"
+    PUBLISH = "publish"
+    DISCARD = "discard"
+    REMOVE_SLOT = "remove_slot"
+    TEARDOWN = "teardown"
+    # Phase 4, environment-level: renew the certificate; take traffic off a retiring production environment.
+    CERTIFICATE = "certificate"
+    DEACTIVATE = "deactivate"
+    # Phase 5, on a VM slot's instance: take, revert to and delete a hypervisor snapshot.
+    VM_SNAPSHOT = "vm_snapshot"
+    VM_REVERT = "vm_revert"
+    VM_DROP = "vm_drop"
+
+
+class FreshData(StrEnum):
+    """Data that only Slipway's own never-live attempts created (instances.fresh_data)."""
+
+    EMPTY = "empty"
+    SNAPSHOT = "snapshot"
+
+
 class Instance(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "instances"
+    __table_args__ = (
+        # One instance per slot of an environment; a slot always belongs to an environment and back.
+        UniqueConstraint("environment_id", "slot", name="uq_instances_environment_id_slot"),
+        CheckConstraint("(environment_id IS NULL) = (slot IS NULL)", name="slot_pair"),
+        # Phase 4: only a managed environment's data owner has no host (services.environments enforces the
+        # rest: it writes a host-less owner only for data_mode managed).
+        CheckConstraint("host_id IS NOT NULL OR (slot = 'data' AND environment_id IS NOT NULL)", name="host"),
+    )
 
     name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(63), unique=True)
     repository_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("repositories.id", ondelete="RESTRICT"))
-    host_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("hosts.id", ondelete="RESTRICT"))
+    # None only for a managed environment's data owner (ck_instances_host).
+    host_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("hosts.id", ondelete="RESTRICT"))
     branch: Mapped[str] = mapped_column(String(255))
 
     build_source: Mapped[str] = mapped_column(String(16), default=BuildSource.DOCKERFILE)
@@ -58,6 +104,16 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     # The instance's own folder on the host (releases, shared settings, ``current``). None: a folder
     # named after the slug in the host's deploy root, which moves with that root.
     deploy_dir: Mapped[str | None] = mapped_column(String(255))
+
+    # App mode (BuildSource.APP): the manifest's path in the repository, the values of its settings,
+    # the optional services that run (None: each one's default), the secrets Slipway generated for it
+    # (kept for good: changing one can lock the app out of its own data), and what the last deploy read
+    # and rendered: {manifest, routes: [{hostname, service, container}], projects, commands, release}.
+    manifest_file: Mapped[str] = mapped_column(String(255), default="slipway.yml", server_default="slipway.yml")
+    app_settings: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+    app_services: Mapped[list[str] | None] = mapped_column()
+    app_secrets: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
+    app_state: Mapped[dict[str, Any] | None] = mapped_column()
 
     env: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
     ports: Mapped[list[dict[str, Any]]] = mapped_column(default=list)  # [{host, container, protocol}]
@@ -90,8 +146,39 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     last_deployed_at: Mapped[datetime | None]
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
+    # Data safety (app instances whose slipway.yml declares data). How many automatic backups to keep (1-100).
+    keep_backups: Mapped[int] = mapped_column(default=5, server_default=text("5"))
+    # A snapshot the first deploy restores; cleared when that job succeeds. Instances and snapshots point
+    # at each other (snapshots.source_instance_id), hence use_alter.
+    seed_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("snapshots.id", ondelete="SET NULL", use_alter=True)
+    )
+    # Run the app's seed command on an empty first deploy; content_pending: a seed step ended in a warning.
+    seed_content: Mapped[bool] = mapped_column(default=True, server_default=true())
+    content_pending: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # The identity secret values the data now carries (set at finish and by the restore step), when they
+    # last changed and where they came from (such as "snapshot uat-2026-11-15").
+    live_identity: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
+    identity_changed_at: Mapped[datetime | None]
+    identity_source: Mapped[str | None] = mapped_column(String(300))
+    # The first job since the last success that began changing data and then failed, with its
+    # pre-change backup and whether the data is held (see services.data).
+    data_dirty: Mapped[dict[str, Any] | None] = mapped_column()
+    fresh_data: Mapped[str | None] = mapped_column(String(8))  # FreshData
+    last_control_at: Mapped[datetime | None]  # the last start or restart from the instance page
+
+    # Phase 3: the environment this instance is a slot of (None for a standalone instance), which slot
+    # (``blue``, ``green``, or ``data`` for the data server), and the slot's own state:
+    # {last_check: {ok, at, deployment_id, results} | None, stale: {reason, at, deployment_id} | None}.
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="RESTRICT"), index=True
+    )
+    slot: Mapped[str | None] = mapped_column(String(8))  # SlotName
+    slot_state: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+
     repository: Mapped[Repository] = relationship(lazy="selectin")
-    host: Mapped[Host] = relationship(lazy="selectin")
+    host: Mapped[Host | None] = relationship(lazy="selectin")
+    environment: Mapped[Environment | None] = relationship(lazy="selectin", foreign_keys=[environment_id])
 
     @property
     def container_name(self) -> str:
@@ -121,10 +208,50 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
         return self.container_name
 
 
+ACTIVE_ENV_JOB = "status IN ('queued', 'running') AND kind <> 'activate'"
+ACTIVE_ACTIVATE = "status IN ('queued', 'running') AND kind = 'activate'"
+
+
 class Deployment(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "deployments"
+    __table_args__ = (
+        # At most one queued or running job per instance.
+        Index(
+            "ux_deployments_one_active",
+            "instance_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+            sqlite_where=text("status IN ('queued', 'running')"),
+        ),
+        # Phase 3 (I2): at most one queued or running job per environment besides activate, and at most
+        # one activate. NULLs never conflict, so standalone instances are unaffected.
+        Index(
+            "ux_deployments_one_active_env",
+            "environment_id",
+            unique=True,
+            postgresql_where=text(ACTIVE_ENV_JOB),
+            sqlite_where=text(ACTIVE_ENV_JOB),
+        ),
+        Index(
+            "ux_deployments_one_active_activate",
+            "environment_id",
+            unique=True,
+            postgresql_where=text(ACTIVE_ACTIVATE),
+            sqlite_where=text(ACTIVE_ACTIVATE),
+        ),
+        # Every job is about an instance, an environment, or both.
+        CheckConstraint("instance_id IS NOT NULL OR environment_id IS NOT NULL", name="subject"),
+    )
 
-    instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("instances.id", ondelete="CASCADE"), index=True)
+    # None for an environment-level job (activate, publish, discard, remove_slot, teardown).
+    instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("instances.id", ondelete="CASCADE"), index=True
+    )
+    # Set on every job of an environment member and on every environment-level job. SET NULL keeps the
+    # job and its log should the environment row ever go (environments are only soft-deleted).
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[str] = mapped_column(String(16), default=DeploymentStatus.QUEUED, index=True)
     branch: Mapped[str] = mapped_column(String(255))
     commit_sha: Mapped[str | None] = mapped_column(String(40))
@@ -135,8 +262,25 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
     finished_at: Mapped[datetime | None]
     error: Mapped[str | None] = mapped_column(Text)
     log: Mapped[str] = mapped_column(Text, default="")
+    # The numbered steps, in order: [{key, name, status, started_at?, finished_at?, offset?, note?}];
+    # ``offset`` is where the step's part of ``log`` begins.
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(default=list, server_default=text("'[]'"))
+    # The release folder on the host (kept after a failure once the build succeeded, for a retry).
+    release: Mapped[str | None] = mapped_column(Text)  # a folder of up to 255 characters, plus the release
+    # A retry runs the same commit again and skips the steps the earlier run finished that it can reuse.
+    retry_of_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("deployments.id", ondelete="SET NULL"))
+    # What the job does (DeploymentKind) and its options, such as skip_backup or files.
+    kind: Mapped[str] = mapped_column(String(16), default=DeploymentKind.DEPLOY, server_default="deploy", index=True)
+    options: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
+    previous_sha: Mapped[str | None] = mapped_column(String(40))  # the instance's live commit when queued
+    # The chain's pre-change backup (taken or inherited), what a restore or roll back puts back, and the
+    # snapshot restored or taken.
+    backup_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("backups.id", ondelete="SET NULL"))
+    restore_backup_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("backups.id", ondelete="SET NULL"))
+    snapshot_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("snapshots.id", ondelete="SET NULL"))
 
-    instance: Mapped[Instance] = relationship(lazy="selectin")
+    instance: Mapped[Instance | None] = relationship(lazy="selectin")
+    environment: Mapped[Environment | None] = relationship(lazy="selectin")
     triggered_by: Mapped[User | None] = relationship(lazy="selectin")
 
     @property

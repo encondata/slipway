@@ -106,7 +106,7 @@ async def main() -> None:
         for name, ip, env, cpu, mem, status in HOSTS:
             key = ssh.generate_keypair()[1]
             hosts[name] = Host(
-                name=name, hostname=ip, username="deploy", environment=env, deploy_root="/opt/slipway",
+                name=name, hostname=ip, username="deploy", label=env, deploy_root="/opt/slipway",
                 auth_method="key", public_key=ssh.generate_keypair(f"slipway@{name}")[1], host_key=key,
                 host_key_fingerprint=ssh.fingerprint(key), status=status, last_checked_at=now - timedelta(minutes=3),
                 docker_version="27.3.1", os_info="Ubuntu 24.04.1 LTS",

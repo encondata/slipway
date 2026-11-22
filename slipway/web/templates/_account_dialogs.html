@@ -1,0 +1,184 @@
+{#- The provider account dialogs (P4 §17.1, P5 §12.1): one Add/Edit dialog per provider, the trust dialog and a
+    Remove dialog per account. ``wireAccountForm`` in slipway.js fills a dialog from the account (never a secret:
+    only whether one is set and its hint), builds the body and talks to /api/v1/provider-accounts. Included by
+    settings/integrations.html for users with providers:write. -#}
+{% from "_macros.html" import icon %}
+
+{% macro check_results() -%}
+<div class="account-test" data-account-test-result hidden>
+  <p class="subtle" data-account-test-status style="margin: 0"></p>
+  <ul class="check-list" data-account-checks></ul>
+</div>
+{%- endmacro %}
+
+{% macro networks_table(provider) -%}
+<fieldset class="fieldset span-2 networks" data-networks="{{ provider }}">
+  <legend>Networks</legend>
+  <p class="help" style="margin: 0 0 10px">The networks a VM can be put on. Slipway picks a VM's address from the pool, or you type one when you add the environment.</p>
+  <div class="net-row net-head" aria-hidden="true">
+    <span>Name</span>{% if provider == "proxmox" %}<span>Bridge</span><span>VLAN</span>{% else %}<span>Port group</span>{% endif %}<span>Subnet</span><span>Gateway</span><span>DNS</span><span>Pool from</span><span>Pool to</span><span></span>
+  </div>
+  <div class="net-rows" data-network-rows></div>
+  <div><button class="btn btn-sm" type="button" data-network-add>{{ icon("plus", "i-sm") }} Add a network</button></div>
+</fieldset>
+{%- endmacro %}
+
+{% macro account_dialog(provider, title) -%}
+<dialog class="modal" id="account-{{ provider }}" data-account-dialog="{{ provider }}" style="width: min({{ 760 if provider != 'digitalocean' else 640 }}px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-account-form="{{ provider }}" data-provider="{{ provider }}" data-account-id="">
+    <div class="modal-head"><h2 data-slot="account_title">Add a {{ title }} account</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field">
+          <label for="acct-{{ provider }}-name">Name</label>
+          <input class="input" id="acct-{{ provider }}-name" name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}" autocomplete="off" spellcheck="false" placeholder="{{ 'do-main' if provider == 'digitalocean' else ('lab' if provider == 'proxmox' else 'esx-01') }}">
+          <span class="help">How Slipway names the account everywhere. It can't be reused once removed.</span>
+        </div>
+        {% if provider == "digitalocean" %}
+        <div class="field">
+          <label for="acct-do-region">Default region</label>
+          <select class="input" id="acct-do-region" name="region" required>
+            {% for r in do_regions %}<option value="{{ r }}" {{ 'selected' if r == 'nyc3' }}>{{ r }}</option>{% endfor %}
+          </select>
+          <span class="help">Regions with Spaces, which an environment's bucket needs. Test checks that it is open.</span>
+        </div>
+        <label class="check span-2"><input type="checkbox" name="production"><span><strong>For production environments</strong><br><span class="subtle">Only production environments may use a production account, and production asks for typed confirmations before it changes anything.</span></span></label>
+        <div class="field span-2">
+          <label for="acct-do-secret">API token</label>
+          <input class="input mono" id="acct-do-secret" name="secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" placeholder="dop_v1_…" data-secret>
+          <span class="help"><span data-secret-state></span>A token with read and write on droplets, databases, load balancers, firewalls, VPCs, certificates and Spaces keys. Droplets never receive it. Encrypted at rest and never shown again.</span>
+          <label class="check" data-clear-secret hidden><input type="checkbox" name="clear_secret"><span>Remove the saved token</span></label>
+        </div>
+        <div class="field span-2">
+          <label for="acct-do-sources">SSH sources</label>
+          <textarea class="input mono" id="acct-do-sources" name="ssh_sources" rows="3" spellcheck="false" placeholder="198.51.100.0/24"></textarea>
+          <span class="help">One CIDR per line. The addresses Slipway connects from. 0.0.0.0/0 lets the whole internet try SSH.</span>
+        </div>
+        <div class="field">
+          <label for="acct-do-limit">Monthly limit <span class="subtle">(optional, US dollars)</span></label>
+          <input class="input" id="acct-do-limit" name="monthly_limit" type="number" min="0.01" step="0.01" placeholder="No limit">
+          <span class="help">Slipway refuses an environment that would take this account's estimate past it.</span>
+        </div>
+        <details class="advanced span-2">
+          <summary>Price overrides</summary>
+          <div class="field" style="margin-top: 8px">
+            <label for="acct-do-prices">Prices <span class="subtle">(JSON, optional)</span></label>
+            <textarea class="input mono" id="acct-do-prices" name="prices" rows="4" spellcheck="false" placeholder='{"as_of": "2026-11-15", "load_balancer": 1200}'></textarea>
+            <span class="help">US cents a month for what DigitalOcean's API doesn't price. Empty uses Slipway's dated table.</span>
+          </div>
+        </details>
+        {% elif provider == "proxmox" %}
+        <div class="field">
+          <label for="acct-pve-url">API URL</label>
+          <input class="input mono" id="acct-pve-url" name="url" required placeholder="https://pve.lan:8006" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field span-2">
+          <label for="acct-pve-secret">API token</label>
+          <input class="input mono" id="acct-pve-secret" name="secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" placeholder="slipway@pve!slipway=…" data-secret>
+          <span class="help"><span data-secret-state></span>The API token, user@realm!tokenid=&lt;secret&gt;. Slipway shows it never again.</span>
+        </div>
+        <div class="field">
+          <label for="acct-pve-node">Node</label>
+          <input class="input mono" id="acct-pve-node" name="node" required placeholder="pve1" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="acct-pve-pool">Pool</label>
+          <input class="input mono" id="acct-pve-pool" name="pool" required placeholder="slipway" autocomplete="off" spellcheck="false">
+          <span class="help">Slipway's VMs go in this pool; the token may see only it.</span>
+        </div>
+        <div class="field">
+          <label for="acct-pve-storage">Storage</label>
+          <input class="input mono" id="acct-pve-storage" name="storage" required placeholder="local-lvm" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="acct-pve-template">Template VM id</label>
+          <input class="input mono" id="acct-pve-template" name="template_vmid" required inputmode="numeric" placeholder="9000" autocomplete="off">
+        </div>
+        {{ networks_table("proxmox") }}
+        {% else %}
+        <div class="field">
+          <label for="acct-esx-url">URL</label>
+          <input class="input mono" id="acct-esx-url" name="url" required placeholder="https://esxi.lan" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="acct-esx-user">User</label>
+          <input class="input mono" id="acct-esx-user" name="user" required placeholder="slipway" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field span-2">
+          <label for="acct-esx-secret">Password</label>
+          <input class="input mono" id="acct-esx-secret" name="secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" data-secret>
+          <span class="help"><span data-secret-state></span>A local user with the Administrator role. Standalone ESXi can't limit it to some VMs; Slipway's markers are what protect the others.</span>
+        </div>
+        <div class="field">
+          <label for="acct-esx-datastore">Datastore</label>
+          <input class="input mono" id="acct-esx-datastore" name="datastore" required placeholder="datastore1" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="acct-esx-pool">Resource pool <span class="subtle">(optional)</span></label>
+          <input class="input mono" id="acct-esx-pool" name="resource_pool" placeholder="Resources" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field span-2">
+          <label for="acct-esx-seed">Seed VM</label>
+          <input class="input mono" id="acct-esx-seed" name="source_vm" required placeholder="ubuntu-2404-seed" autocomplete="off" spellcheck="false">
+          <span class="help">The powered-off Ubuntu cloud image VM Slipway copies for each new VM.</span>
+        </div>
+        {{ networks_table("esxi") }}
+        {% endif %}
+      </div>
+      {{ check_results() }}
+    </div>
+    <div class="modal-foot">
+      {% if provider == "digitalocean" %}
+      <button class="btn" type="button" data-account-test>{{ icon("sync", "i-sm") }} Test</button>
+      {% else %}
+      <button class="btn" type="button" data-account-test data-saved-only hidden title="Tests the saved settings">{{ icon("sync", "i-sm") }} Test</button>
+      {% endif %}
+      <span class="spacer" style="flex: 1"></span>
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button>
+    </div>
+  </form>
+</dialog>
+{%- endmacro %}
+
+{{ account_dialog("digitalocean", "DigitalOcean") }}
+{{ account_dialog("proxmox", "Proxmox") }}
+{{ account_dialog("esxi", "VMware ESXi") }}
+
+<dialog class="modal" id="account-trust" data-trust-dialog style="width: min(620px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-trust-form>
+    <div class="modal-head"><h2>Trust this certificate?</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body">
+      <p style="margin: 0"><span data-slot="where"></span> presents this certificate. Slipway connects only while it stays the same.</p>
+      <p class="callout warning" data-show-if="note" hidden><span data-slot="note"></span></p>
+      <dl class="kv">
+        <dt>{{ icon("fingerprint", "i-sm") }} Fingerprint (SHA-256)</dt><dd class="mono" data-slot="fingerprint_sha256"></dd>
+        <dt>Subject</dt><dd data-slot="subject"></dd>
+        <dt>Issuer</dt><dd data-slot="issuer"></dd>
+        <dt>Expires</dt><dd data-slot="not_after"></dd>
+        <dt>Names</dt><dd class="mono" data-slot="sans"></dd>
+      </dl>
+      <p class="help" data-trust-hint="proxmox" hidden>Compare the fingerprint with the one Proxmox shows under Node › System › Certificates.</p>
+      <p class="help" data-trust-hint="esxi" hidden>Compare the fingerprint with "openssl x509 -in /etc/vmware/ssl/rui.crt -noout -fingerprint -sha256" in the ESXi Shell.</p>
+    </div>
+    <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit" data-trust-confirm>{{ icon("check") }} Trust it</button></div>
+  </form>
+</dialog>
+
+{% for card in cards %}{% for v in card.accounts if not v.a.removed %}
+<dialog class="modal" id="remove-account-{{ v.a.id }}">
+  <form method="post" action="/js-required" data-form="DELETE /api/v1/provider-accounts/{{ v.a.id }}" data-then="reload" data-success="Account removed">
+    <div class="modal-head"><h2>Remove {{ v.a.name }}?</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body">
+      <p style="margin: 0">Slipway forgets {{ v.a.name }} and its {{ "token" if card.provider != "esxi" else "password" }}. Nothing at {{ card.title }} is changed. The name stays taken, so old logs can still name it.</p>
+      {% if v.vms %}<p class="callout warning" style="margin: 0">It has VMs: {{ v.vms|map(attribute="name")|join(", ") }}. Slipway refuses until their environments are deleted.</p>
+      {% elif v.envs %}<p class="callout warning" style="margin: 0">{{ "Environments " ~ v.envs|join(", ") ~ " use" if v.envs|length > 1 else "Environment " ~ v.envs[0] ~ " uses" }} it: Slipway refuses until {{ "they are" if v.envs|length > 1 else "it is" }} deleted.</p>{% endif %}
+      <div class="field">
+        <label for="remove-account-{{ v.a.id }}-confirm">Type <strong>{{ v.a.name }}</strong> to confirm</label>
+        <input class="input" id="remove-account-{{ v.a.id }}-confirm" name="confirm" data-must-equal="{{ v.a.name }}" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit" disabled>{{ icon("trash") }} Remove</button></div>
+  </form>
+</dialog>
+{% endfor %}{% endfor %}

@@ -45,14 +45,17 @@ async def _deploys(instance_id: str, statuses: list[str], start: int = 0, live: 
 
 
 async def _world(admin_client) -> dict:
-    """alpha: eight deployments, the latest failed. beta: one. gamma: building, with a newer one queued."""
+    """alpha: eight deployments, the latest failed. beta: one. gamma: an older one still building under a newer one.
+
+    An instance has at most one deployment queued or building (a unique index), so gamma's busy one is older.
+    """
     repo_id = await _add_repo(51, "shop-front")
     host = (await admin_client.post("/api/v1/hosts", json={
         "name": "rack-07", "hostname": "10.1.2.3", "username": "deploy"})).json()
     ids = {name: await _instance(admin_client, name, host, repo_id) for name in ("alpha", "beta", "gamma")}
     ids["alpha-deps"] = await _deploys(ids["alpha"], ["succeeded"] * 7 + ["failed"], live=_sha(6))
     ids["beta-deps"] = await _deploys(ids["beta"], ["succeeded"], start=20)
-    ids["gamma-deps"] = await _deploys(ids["gamma"], ["succeeded", "running", "queued"], start=2)
+    ids["gamma-deps"] = await _deploys(ids["gamma"], ["succeeded", "running", "succeeded"], start=2)
     ids["repo"], ids["host"] = repo_id, host["id"]
     return ids
 
@@ -99,10 +102,10 @@ async def test_anything_else_building_or_queued_stays_in_view(admin_client):
     page = (await admin_client.get("/deployments")).text
     fold = f"dep-earlier-{ids['gamma']}"
     group, earlier = (b for b in _tbodies(page) if f'"{fold}"' in b)
-    queued, running, succeeded = reversed(ids["gamma-deps"])
-    assert f"/deployments/{queued}" in group and "Queued" in group
+    newest, running, oldest = reversed(ids["gamma-deps"])
+    assert f"/deployments/{newest}" in group
     assert "Also building" in group and f"/deployments/{running}" in group
-    assert f"/deployments/{succeeded}" in earlier and f"/deployments/{running}" not in earlier
+    assert f"/deployments/{oldest}" in earlier and f"/deployments/{running}" not in earlier
     assert "All 3 in History" in earlier
 
 

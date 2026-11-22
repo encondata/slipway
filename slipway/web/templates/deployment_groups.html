@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, empty %}
-{#- /deployments: one group per instance. Every deployment, flat, is the History page (deployments.html). #}
+{#- /deployments: one group per instance, and one per environment for its own jobs (activate, teardown...: no
+    instance). Every deployment, flat, is the History page (deployments.html). #}
 {% block title %}Deployments{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -13,11 +14,12 @@
   </div>
 </div>
 
-{% macro cells(d, can_hosts, first) -%}
-  <td>{{ badge("deployment", d.status) }}</td>
+{% macro cells(d, can_hosts, can_envs, env_col, first) -%}
+  {% if env_col %}<td>{% if d.environment %}{% if can_envs %}<a href="/environments/{{ d.environment.id }}">{{ d.environment.name }}</a>{% else %}{{ d.environment.name }}{% endif %}{% if d.instance and d.instance.slot %} <span class="subtle">· {{ d.instance.slot }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>{% endif %}
+  <td>{{ badge("deployment", d.status, d.kind) }}{% if d.environment_id %}<div class="subtle">{{ d|dep_label }}</div>{% elif d.kind and d.kind != "deploy" %}<div class="subtle">{{ d.kind|kind_label }}</div>{% endif %}</td>
   <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span><div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div>
-    {%- if first and d.status != "succeeded" and d.instance.current_commit_sha and d.instance.current_commit_sha != d.commit_sha %}<div class="subtle">Live: <span class="mono">{{ d.instance.current_commit_sha[:7] }}</span></div>{% endif %}</td>
-  {% if can_hosts %}<td class="muted nowrap">{{ d.instance.host.name if first else "" }}</td>{% endif %}
+    {%- if first and d.instance and d.status != "succeeded" and d.instance.current_commit_sha and d.instance.current_commit_sha != d.commit_sha %}<div class="subtle">Live: <span class="mono">{{ d.instance.current_commit_sha[:7] }}</span></div>{% endif %}</td>
+  {% if can_hosts %}<td class="muted nowrap">{% if first %}{{ d.instance.host.name if d.instance else "—" }}{% endif %}</td>{% endif %}
   <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>
   <td class="muted nowrap" title="{{ d.created_at|dt }}">{{ d.created_at|timeago }}</td>
   <td class="muted">{{ d.duration_seconds|duration }}</td>
@@ -27,26 +29,34 @@
 <section class="card">
   {% if groups %}
   {% set can_hosts, can_repos, can_instances = auth.can(Perm.HOSTS_READ), auth.can(Perm.REPOS_READ), auth.can(Perm.INSTANCES_READ) %}
-  {% set cols = 8 if can_hosts else 7 %}
+  {% set can_envs = auth.can(Perm.ENVIRONMENTS_READ) %}
+  {#- The Environment column shows when a listed job belongs to one (phase 3 §12.5). #}
+  {% set env_col = any_env %}
+  {% set cols = 7 + (1 if can_hosts else 0) + (1 if env_col else 0) %}
   <div class="table-wrap"><table class="table dep-table">
-    <thead><tr><th>Instance</th><th>Status</th><th>Commit</th>{% if can_hosts %}<th>Host</th>{% endif %}<th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
+    <thead><tr><th>Instance</th>{% if env_col %}<th>Environment</th>{% endif %}<th>Status</th><th>Commit</th>{% if can_hosts %}<th>Host</th>{% endif %}<th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
     {% for g in groups %}
-    {% set inst, d = g.instance, g.latest %}
+    {% set inst, env, d = g.instance, g.environment, g.latest %}
+    {% set label = inst.name if inst else env.name if env else "Deleted" %}
     {% set fold = g.earlier or g.more > 0 %}
-    {% set fold_id = "dep-earlier-" ~ inst.id %}
+    {% set fold_id = "dep-earlier-" ~ g.key %}
     <tbody class="dep-group">
       <tr class="dep-row" {% if fold %}data-expand="{{ fold_id }}" aria-expanded="false"{% endif %}>
         <td><div class="primary-cell">
-          {%- if fold %}<button type="button" class="icon-btn dep-toggle" data-expand="{{ fold_id }}" aria-controls="{{ fold_id }}" aria-expanded="false" aria-label="Show earlier deployments of {{ inst.name }}">{{ icon("chevron-right", "i-sm expand-chevron") }}</button>
+          {%- if fold %}<button type="button" class="icon-btn dep-toggle" data-expand="{{ fold_id }}" aria-controls="{{ fold_id }}" aria-expanded="false" aria-label="Show earlier deployments of {{ label }}">{{ icon("chevron-right", "i-sm expand-chevron") }}</button>
           {%- else %}<span class="dep-toggle" aria-hidden="true"></span>{% endif %}
+          {% if inst %}
           <span class="dep-name">{% if can_instances %}<a href="/instances/{{ inst.id }}"><strong>{{ inst.name }}</strong></a>{% else %}<strong>{{ inst.name }}</strong>{% endif %}{% if can_repos %}<small class="subtle">{{ inst.repository.full_name }}</small>{% endif %}</span>
+          {% else %}
+          <span class="dep-name">{% if env and can_envs %}<a href="/environments/{{ env.id }}"><strong>{{ label }}</strong></a>{% else %}<strong>{{ label }}</strong>{% endif %}<small class="subtle">Environment jobs{% if can_repos and env %} · {{ env.repository.full_name }}{% endif %}</small></span>
+          {% endif %}
         </div></td>
-        {{ cells(d, can_hosts, true) }}
+        {{ cells(d, can_hosts, can_envs, env_col, true) }}
       </tr>
       {% for a in g.active %}
       <tr class="dep-also">
         <td class="nowrap"><span class="subtle">{{ "Also building" if a.status == "running" else "Also queued" }}</span></td>
-        {{ cells(a, can_hosts, false) }}
+        {{ cells(a, can_hosts, can_envs, env_col, false) }}
       </tr>
       {% endfor %}
     </tbody>
@@ -55,11 +65,11 @@
       {% for e in g.earlier %}
       <tr>
         <td>{% if loop.first %}<span class="subtle">Earlier</span>{% endif %}</td>
-        {{ cells(e, can_hosts, false) }}
+        {{ cells(e, can_hosts, can_envs, env_col, false) }}
       </tr>
       {% endfor %}
       <tr class="dep-more">
-        <td colspan="{{ cols }}"><a class="link-more" href="/deployments/history?instance={{ inst.id }}">{% if g.more > 0 %}{{ g.more }} more{% else %}All {{ g.total }}{% endif %} in History {{ icon("arrow-right", "i-sm") }}</a></td>
+        <td colspan="{{ cols }}"><a class="link-more" href="/deployments/history?{{ 'instance' if inst else 'environment' }}={{ g.key }}">{% if g.more > 0 %}{{ g.more }} more{% else %}All {{ g.total }}{% endif %} in History {{ icon("arrow-right", "i-sm") }}</a></td>
       </tr>
     </tbody>
     {% endif %}

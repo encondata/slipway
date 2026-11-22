@@ -2,94 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 
 import httpx
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from slipway.db.session import get_sessionmaker
 from slipway.models import AppSetting, Deployment, Host, Instance, Repository
 from slipway.services import deployer, switchyard
 from tests.conftest import login, make_user
+from tests.fake_switchyard import KEY, FakeSwitchyard
 from tests.test_deployer import FakeGitHub, FakeRemote, _connect, _instance, _seed
-
-KEY = "sy_" + "T3stK3y" * 6 + "x"  # sy_ and 43 characters, like a real key
-
-
-class FakeSwitchyard:
-    """Enough of Switchyard's API: hosts with ids, 409 on a used domain, staged changes, preview and apply."""
-
-    def __init__(self) -> None:
-        self.hosts: dict[int, dict] = {}
-        self.next_id = 1
-        self.version: int | None = 1  # last applied config version (None: never applied)
-        self.changes = 0  # audit-log edits since that version, by anyone
-        self.drift = False
-        self.apply_fails = False
-        self.applies: list[str] = []
-        self.calls: list[str] = []
-        self.denied: set[str] = set()  # "METHOD /path" prefixes answered with 403
-
-    def someone_edits(self) -> None:
-        """An edit made in Switchyard's UI and not applied."""
-        self.changes += 1
-
-    def add(self, **host) -> dict:
-        host = {"id": self.next_id, "type": "proxy", "enabled": True, "upstreams": [], "tls_mode": "auto",
-                "force_https": True, "notes": "", "policy_ids": [], **host}
-        self.hosts[self.next_id] = host
-        self.next_id += 1
-        return host
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        call = f"{request.method} {request.url.path}"
-        self.calls.append(call)
-        if request.headers.get("Authorization") != f"Bearer {KEY}":
-            return httpx.Response(401, json={"error": "invalid_api_key", "message": "The API key is wrong."})
-        if any(call.startswith(d) for d in self.denied):
-            return httpx.Response(403, json={"error": "missing_permission", "message": "This key lacks the operation."})
-        path = request.url.path.removeprefix("/api")
-        body = json.loads(request.content) if request.content else None
-        if path == "/hosts" and request.method == "GET":
-            return httpx.Response(200, json=list(self.hosts.values()))
-        if path == "/hosts" and request.method == "POST":
-            if any(d in h["domains"] for h in self.hosts.values() for d in body["domains"]):
-                return httpx.Response(409, json={"error": "conflict", "message": "A domain is already used."})
-            self._changed()
-            return httpx.Response(201, json=self.add(**body))
-        if path.startswith("/hosts/"):
-            hid = int(path.split("/")[2])
-            if hid not in self.hosts:
-                return httpx.Response(404, json={"error": "not_found", "message": "No such host."})
-            if request.method == "GET":
-                return httpx.Response(200, json=self.hosts[hid])
-            if request.method == "PUT":
-                self.hosts[hid] = {**body, "id": hid}
-                self._changed()
-                return httpx.Response(200, json=self.hosts[hid])
-            if request.method == "DELETE":
-                del self.hosts[hid]
-                self._changed()
-                return httpx.Response(204)
-        if path == "/config/preview":
-            pending = self.changes > 0 or self.version is None
-            last = {"n": self.version, "result": "ok"} if self.version else None
-            return httpx.Response(200, json={"pending": pending, "drift": self.drift,
-                                             "changes": max(self.changes, int(pending)), "last_applied": last})
-        if path == "/config/apply":
-            if self.apply_fails:
-                return httpx.Response(422, json={"error": "caddy_rejected", "message": "Caddy said no."})
-            self.applies.append(body.get("note", ""))
-            self.version = (self.version or 0) + 1
-            self.changes = 0
-            return httpx.Response(200, json={"n": self.version, "result": "ok", "applied_by": "api:slipway"})
-        return httpx.Response(404, json={"error": "not_found", "message": path})
-
-    def _changed(self) -> None:
-        self.calls.append("changed")
-        self.changes += 1
 
 
 @pytest.fixture
@@ -366,7 +290,10 @@ async def test_settings_need_settings_write(client, make_client):
     await make_user("dev@example.com", roles=["maintainer"])
     await login(client, "dev@example.com")
     assert (await client.get("/api/v1/settings/switchyard")).status_code == 403
-    assert (await client.get("/settings/integrations")).status_code in (403, 404)
+    # Phase 4 opens the page to providers:read (a maintainer's), but the Switchyard card still needs settings:write.
+    page = await client.get("/settings/integrations")
+    assert page.status_code == 200
+    assert 'PUT /api/v1/settings/switchyard' not in page.text and "<h2>Switchyard</h2>" not in page.text
 
 
 async def test_instance_routes_api(admin_client, fake_sy):
@@ -417,3 +344,184 @@ async def test_sync_endpoint_and_delete_remove_the_hosts(client, fake_sy):
     r = await admin_client.delete(f"/api/v1/instances/{inst_id}?purge=false")
     assert r.status_code == 204, r.text
     assert fake_sy.hosts == {} and fake_sy.applies[-1] == "Slipway: web"
+
+
+# --------------------------------------------------------------------- owners
+
+
+ENV_ID = uuid.UUID("00000000-0000-0000-0000-0000000000e1")
+
+
+class _Env:
+    """Stands in for an Environment row: Owner.of only needs its table name, id and name."""
+
+    __tablename__ = "environments"
+
+    def __init__(self, id_: uuid.UUID = ENV_ID, name: str = "uat") -> None:
+        self.id, self.name = id_, name
+
+
+TARGET = switchyard.Target("app.example.com", "auto", "10.0.0.12", 8000)
+
+
+def test_instance_marker_is_unchanged():
+    inst = _instance()
+    assert switchyard.marker(inst) == (
+        "Managed by Slipway: instance web (00000000-0000-0000-0000-000000000001). "
+        "Domains, upstreams and TLS mode are set from Slipway on every deploy."
+    )
+    assert switchyard._marker is switchyard.marker and switchyard.Owner.of(inst) == switchyard.Owner("instance", inst.id, "web")
+    # The helpers traffic.py shares with the instance sync are the same objects under both names.
+    assert switchyard._lock is switchyard.lock and switchyard._blocker is switchyard.blocker
+    assert switchyard._load_edits is switchyard.load_edits and switchyard._save_edits is switchyard.save_edits
+    assert switchyard._desired is switchyard.desired and switchyard._differs is switchyard.differs
+
+
+def test_owners():
+    inst, env = _instance(), _Env()
+    other_env = _Env(uuid.UUID("00000000-0000-0000-0000-0000000000e2"), "prod")
+    assert switchyard.marker(env) == (
+        f"Managed by Slipway: environment uat ({ENV_ID}). "
+        "Domains, upstreams and TLS mode are set from Slipway when traffic moves."
+    )
+
+    # An environment's host is the environment's only, even when its notes mention an instance.
+    env_host = {"id": 4, **switchyard.desired(None, TARGET, env)}
+    env_host["notes"] += f"\nOps: moved here from Managed by Slipway instance {inst.id}"
+    assert switchyard.owned_by(env_host, env) and switchyard.owned_by(env_host, switchyard.Owner.of(env))
+    assert not switchyard.owned_by(env_host, other_env)
+    assert not switchyard.owned_by(env_host, inst) and not switchyard.owned_by(env_host, inst.id)
+    assert switchyard.describe_owner(env_host) == "environment uat"
+
+    # A host an instance made before environments existed stays its instance's.
+    legacy = {"id": 5, "notes": switchyard.marker(inst) + "\nOps: keep the geo policy"}
+    assert switchyard.owned_by(legacy, inst) and switchyard.owned_by(legacy, inst.id)
+    assert not switchyard.owned_by(legacy, env)
+    assert switchyard.describe_owner(legacy) == "instance web"
+
+    # No marker, or a marker naming someone else: nobody's in Slipway.
+    for notes in ("", "Made by hand", f"Managed by Slipway, they said ({ENV_ID})"):
+        host = {"id": 6, "notes": notes}
+        assert not switchyard.owned_by(host, env) and not switchyard.owned_by(host, inst)
+        assert switchyard.describe_owner(host) == "someone else"
+
+    with pytest.raises(TypeError):
+        switchyard.Owner.of(object())
+
+
+def test_desired_for_an_environment_keeps_switchyards_fields():
+    env = _Env()
+    theirs = {"id": 3, "type": "proxy", "enabled": False, "domains": ["app.example.com"], "policy_ids": [7],
+              "upstreams": [{"scheme": "https", "skip_tls_verify": True, "host": "10.0.0.11", "port": 8000}],
+              "tls_mode": "auto", "force_https": True, "notes": "", "created_at": "x", "updated_at": "y"}
+    theirs["notes"] = switchyard.marker(env) + "\nOps: geo policy"
+    body = switchyard.desired(theirs, TARGET, env)
+    assert body["upstreams"] == [{"scheme": "https", "skip_tls_verify": True, "host": "10.0.0.12", "port": 8000}]
+    assert body["policy_ids"] == [7] and body["enabled"] is False and body["notes"] == theirs["notes"]
+    assert "id" not in body and "created_at" not in body and switchyard.differs(theirs, body)
+    assert not switchyard.differs({**body, "id": 3}, switchyard.desired({**body, "id": 3}, TARGET, env))
+    # A host of nobody's gets the environment's marker on top of its notes.
+    adopted = switchyard.desired({**theirs, "notes": "Made by hand"}, TARGET, env)
+    assert adopted["notes"] == switchyard.marker(env) + "\nMade by hand" and switchyard.owned_by(adopted, env)
+
+
+async def test_an_instance_hostname_held_by_an_environment_names_it(fake_sy):
+    await _configure()
+    env_host = fake_sy.add(**switchyard.desired(None, switchyard.Target("app.example.com", "auto", "10.0.0.12", 8000), _Env()))
+    dep_id = await _seed_routes([ROUTE])
+    await deployer.run_deployment(dep_id, connect=_connect(FakeRemote()), github=FakeGitHub)
+    dep = await _get(Deployment, dep_id)
+    assert dep.status == "succeeded", dep.log
+    (entry,) = dep.instance.proxy_entries
+    assert entry["state"] == "error"
+    assert f"Switchyard host #{env_host['id']}, which belongs to environment uat; remove it there" in entry["message"]
+    assert fake_sy.hosts[env_host["id"]]["upstreams"][0]["host"] == "10.0.0.12" and fake_sy.applies == []
+
+
+async def test_own_edits_count_from_the_last_apply(fake_sy):
+    await _configure()
+    async with switchyard.lock:
+        state = await switchyard.own_edits({"last_applied": {"n": 4}})
+        assert state == {"version": 4, "edits": 0}
+        state["edits"] += 2
+        await switchyard.save_edits(state)
+        assert await switchyard.own_edits({"last_applied": {"n": 4}}) == {"version": 4, "edits": 2}
+        # Applied since (by anyone): Slipway's edits went live with it.
+        assert await switchyard.own_edits({"last_applied": {"n": 5}}) == {"version": 5, "edits": 0}
+    assert switchyard.applied_edits({"n": 6}, 5) == {"version": 6, "edits": 0}
+    assert switchyard.applied_edits(None, 5) == {"version": 5, "edits": 0}
+    assert switchyard.blocker({"last_applied": {"n": 4}, "pending": True, "changes": 2}, 2) is None
+    assert switchyard.blocker({"last_applied": {"n": 4}, "pending": True, "changes": 3}, 2) == "other changes were waiting in Switchyard"
+
+
+# ---------------------------------------------------------------- traffic address
+
+
+async def test_load_config_returns_the_traffic_address(admin_client, fake_sy):
+    async with get_sessionmaker()() as db:
+        assert await switchyard.load_config(db) is None
+    await _configure()
+    async with get_sessionmaker()() as db:
+        assert (await switchyard.load_config(db)).traffic_address == ""
+        row = await db.scalar(select(AppSetting).where(AppSetting.key == switchyard.SETTING_KEY))
+        row.value = {**row.value, "traffic_address": "192.168.1.5:443"}
+        await db.commit()
+    async with get_sessionmaker()() as db:
+        config = await switchyard.load_config(db)
+    assert (config.url, config.api_key, config.traffic_address) == ("https://sy.example.test", KEY, "192.168.1.5:443")
+    # Saving a new API key (and the URL with it) keeps the traffic address.
+    other = "sy_" + "n" * 43
+    r = await admin_client.put("/api/v1/settings/switchyard", json={"url": "https://sy2.example.test", "api_key": other})
+    assert r.status_code == 200, r.text
+    async with get_sessionmaker()() as db:
+        config = await switchyard.load_config(db)
+    assert (config.url, config.api_key, config.traffic_address) == ("https://sy2.example.test", other, "192.168.1.5:443")
+
+
+@pytest.mark.parametrize("value, ok", [
+    ("", ""), ("  ", ""), ("192.168.1.5", "192.168.1.5"), ("192.168.1.5:8443", "192.168.1.5:8443"),
+    ("Proxy.Example.com.", "proxy.example.com"), ("proxy.example.com:443", "proxy.example.com:443"),
+    ("[FD00::1]:443", "[fd00::1]:443"), ("fd00::1", "fd00::1"), ("[fd00::1]", "fd00::1"),
+    ("proxy.example.com:", None), ("proxy.example.com:0", None), ("proxy.example.com:70000", None),
+    ("https://proxy.example.com", None), ("proxy.example.com/x", None), ("a b", None), ("[fd00::1]x", None),
+    ("proxy.example.com:44a", None), ("fd00::1:443:x", None),
+])
+def test_clean_traffic_address(value, ok):
+    if ok is not None:
+        assert switchyard.clean_traffic_address(value) == ok
+    else:
+        with pytest.raises(ValueError, match="is not a traffic address"):
+            switchyard.clean_traffic_address(value)
+
+
+# ------------------------------------------------------------------- the fake
+
+
+async def test_the_fakes_seams(monkeypatch):
+    from tests import fake_switchyard
+
+    fake = fake_switchyard.install(monkeypatch)
+    await fake_switchyard.configure(traffic_address="10.0.0.2")
+    async with get_sessionmaker()() as db:
+        config = await switchyard.load_config(db)
+    assert config.traffic_address == "10.0.0.2"
+    fake.fail_on = {("PUT", 2): 500}
+    fake.someone_edits_after("POST /api/hosts", lambda f: f.hosts[1].update(enabled=False))
+    async with switchyard.SwitchyardClient(config) as sy:
+        one = await sy.create_host({"domains": ["a.example.com"], "notes": ""})
+        assert fake.hosts[1]["enabled"] is False and fake.changes == 2  # Slipway's create and the foreign edit
+        await sy.update_host(one["id"], {**one, "enabled": True})
+        with pytest.raises(switchyard.SwitchyardError) as exc:
+            await sy.update_host(one["id"], {**one, "enabled": True})
+        assert exc.value.status_code == 500 and fake.changes == 3
+        fake.apply_fails_once()
+        with pytest.raises(switchyard.SwitchyardError):
+            await sy.apply("first")
+        assert (await sy.apply("second"))["n"] == 2 and fake.applies == ["second"]
+        fake.delete_id_then_reuse(1)
+        assert switchyard.describe_owner(await sy.get_host(1)) == "someone else"
+        assert list(fake.hosts_by_domain()) == ["other-1.example.net"]
+        assert (await sy.preview())["pending"] is False
+    assert fake.api_calls()[0] == "POST /api/hosts" and fake.api_calls()[0].body["domains"] == ["a.example.com"]
+    assert [c.method for c in fake.api_calls()] == ["POST", "PUT", "PUT", "POST", "POST", "GET", "GET"]
+    assert "changed" in fake.calls
