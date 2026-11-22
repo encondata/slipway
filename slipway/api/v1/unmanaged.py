@@ -17,12 +17,12 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from slipway.api.deps import DB, not_found, require
-from slipway.api.v1.instances import _check_folder, queue_deployment
+from slipway.api.v1.instances import _check_folder, _check_slug_free, queue_deployment
 from slipway.core.permissions import Perm
 from slipway.db.base import utcnow
 from slipway.models import BuildSource, Host, Instance, InstanceStatus, Repository
 from slipway.schemas import BRANCH_MAX, ClaimIn, ClaimOut, InstanceOut, PortMapping, VolumeMapping
-from slipway.services import audit, deployer, discovery, ssh
+from slipway.services import audit, data, deployer, discovery, hosts, ssh
 from slipway.services.auth import AuthContext
 
 router = APIRouter(prefix="/hosts", tags=["hosts"])
@@ -47,7 +47,7 @@ async def _host(db: DB, host_id: uuid.UUID) -> Host:
 async def _claimed(db: DB, host: Host) -> tuple[set[str], set[str]]:
     """Compose project names and standalone container ids the host's instances already stand for."""
     instances = (await db.scalars(select(Instance).where(Instance.host_id == host.id))).all()
-    projects = {i.compose_project for i in instances}
+    projects = {i.compose_project for i in instances} | {p for i in instances for p in deployer.app_known_projects(i)}
     containers = {i.claimed_container for i in instances if i.claimed_container}
     return projects, containers
 
@@ -56,15 +56,28 @@ def _ssh_error(exc: ssh.SSHError) -> HTTPException:
     return HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
 
 
+def _not_built(exc: ssh.HostNotBuilt) -> HTTPException:
+    """A host a provider hasn't built yet (phase 4 §3.3): nothing to list or claim on, so 409 with its text."""
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+
 @router.get("/{host_id}/unmanaged")
 async def list_unmanaged(host_id: uuid.UUID, ctx: Lister, db: DB) -> list[discovery.Group]:
     """Compose projects and standalone containers on the host that no instance manages."""
+    host = await db.get(Host, host_id)
+    if host is not None and not ssh.host_is_built(host):
+        try:
+            ssh.SSHTarget.from_host(host)
+        except ssh.HostNotBuilt as exc:
+            raise _not_built(exc) from exc
     host = await _host(db, host_id)
     projects, containers = await _claimed(db, host)
     await db.commit()  # release the DB connection during SSH
     try:
         async with open_session(ssh.SSHTarget.from_host(host)) as remote:
             _, output = await remote.run(discovery.DISCOVER_COMMAND, timeout=120)
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     return discovery.parse(output, claimed_projects=projects, claimed_containers=containers)
@@ -124,6 +137,12 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
     if body.deploy and not ctx.can(Perm.DEPLOYMENTS_CREATE):
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing permission: {Perm.DEPLOYMENTS_CREATE}")
     key = _check_group(body)
+    found = await db.get(Host, host_id)
+    if found is not None:
+        # Only an environment's slots run on a host it made (phase 4 §3.3, phase 5 §10.4).
+        problem = await hosts.owned_host_problem(db, found, action="claim")
+        if problem:
+            raise HTTPException(status.HTTP_409_CONFLICT, problem)
     host = await _host(db, host_id)
     repo = await db.get(Repository, body.repository_id)
     if repo is None:
@@ -132,6 +151,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
         slug = deployer.slugify(body.name)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await _check_slug_free(db, slug)  # <env>-blue, -green and -data belong to environments (phase 3 §3.2)
     if not body.branch and not repo.default_branch_usable:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -154,6 +174,8 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
             if group is not None and body.import_env:
                 command = discovery.env_command([c.id for c in group.containers], group.env_files)
                 _, env_output = await remote.run(command, timeout=300)
+    except ssh.HostNotBuilt as exc:
+        raise _not_built(exc) from exc
     except ssh.SSHError as exc:
         raise _ssh_error(exc) from exc
     if group is None:
@@ -192,6 +214,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
     # Checked again after SSH: another request may have claimed the group or taken the name meanwhile.
     if await db.scalar(select(Instance).where(Instance.slug == slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"An instance named '{slug}' already exists")
+    await _check_slug_free(db, slug)
     projects, containers = await _claimed(db, host)
     if group.project in projects or group.container_id in containers:
         raise HTTPException(status.HTTP_409_CONFLICT, f"{group.name} on {host.name} was claimed meanwhile")
@@ -272,7 +295,7 @@ async def claim(host_id: uuid.UUID, body: ClaimIn, ctx: Claimer, request: Reques
                      summary=f"Deploy {instance.name}@{instance.branch}", request=request)
     await db.commit()
     if dep is not None:
-        deployer.runner.submit(dep.id, instance.id)
+        deployer.runner.submit(dep.id, data.job_keys(dep, instance))
     return ClaimOut(
         **InstanceOut.of(instance).model_dump(),
         deployment_id=dep.id if dep else None, env_imported=sorted(env), env_skipped=skipped,

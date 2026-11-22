@@ -1,8 +1,9 @@
 """Regression tests for the final data review: unreadable env vars, NUL in input, long branch names,
-and the host key pinning race."""
+the host key pinning race, and migration 0008 (data safety)."""
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,7 @@ import asyncssh
 import httpx
 import pytest
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from sqlalchemy import Text, event, select, type_coerce
 from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_connection, PGDialect_asyncpg
 from sqlalchemy.exc import DBAPIError
@@ -22,8 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from slipway.api.deps import DB
 from slipway.api.v1 import repositories as repositories_api
-from slipway.core.config import get_settings
+from slipway.core.config import Settings, get_settings
 from slipway.core.crypto import reset_crypto_cache
+from slipway.core.permissions import SYSTEM_ROLES, has_permission
 from slipway.db.session import get_engine, get_sessionmaker
 from slipway.main import create_app
 from slipway.models import AuditEvent, Deployment, Host, Instance, OAuthAccount, Repository, User
@@ -481,3 +484,128 @@ async def test_key_pinned_while_the_host_was_being_edited_is_cleared(admin_clien
     # The audit trail says which key was cleared, although the edit loaded the host before it was pinned.
     resets = (await admin_client.get("/api/v1/audit?action=host.key_reset")).json()
     assert len(resets) == 1 and pinned[0] in resets[0]["summary"], resets
+
+
+# ------------------------------------------------------- migration 0008: data safety (test 40)
+
+
+def _alembic(db: Path, *args: str) -> None:
+    env = {**os.environ, "SLIPWAY_DATABASE_URL": f"sqlite+aiosqlite:///{db}", "SLIPWAY_ENV_FILE": "", "PYTHONPATH": str(ROOT)}
+    done = subprocess.run([sys.executable, "-m", "alembic", *args], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert done.returncode == 0, (args, done.stderr)
+
+
+def _seed_0007(conn: sqlite3.Connection) -> dict[str, str]:
+    """A host, a repository and two instances with jobs left queued and running by a stopped Slipway, as
+    stored at revision 0007 (UUIDs as 32 hex digits, JSON as text: what SQLAlchemy writes on SQLite)."""
+    ids = {k: uuid.uuid4().hex for k in ("host", "repo", "busy", "idle", "queued", "running", "done", "other")}
+    conn.execute("INSERT INTO hosts (id, name, hostname, port, username, environment, description, deploy_root, "
+                 "auth_method, status, metrics) VALUES (?, 'h', '10.0.0.1', 22, 'deploy', '', '', '/opt/slipway', "
+                 "'key', 'healthy', '{}')", (ids["host"],))
+    conn.execute("INSERT INTO repositories (id, github_id, full_name, owner, name, description, visibility, "
+                 "default_branch, html_url, archived, detected_config) VALUES (?, 1, 'acme/web', 'acme', 'web', '', "
+                 "'private', 'main', 'https://github.com/acme/web', 0, '{}')", (ids["repo"],))
+    for key, status in (("busy", "deploying"), ("idle", "running")):
+        conn.execute("INSERT INTO instances (id, name, slug, repository_id, host_id, branch, build_source, "
+                     "dockerfile_path, build_context, compose_file, ports, volumes, status) VALUES "
+                     "(?, ?, ?, ?, ?, 'main', 'app', 'Dockerfile', '.', 'docker-compose.yml', '[]', '[]', ?)",
+                     (ids[key], key, key, ids["repo"], ids["host"], status))
+    steps = '[{"key": "fetch", "status": "done"}, {"key": "build", "status": "running"}, {"key": "start", "status": "pending"}]'
+    # Two active rows for one instance: the new unique index can only be built once they are failed.
+    for key, instance, status in (("queued", "busy", "queued"), ("running", "busy", "running"),
+                                  ("done", "busy", "succeeded"), ("other", "idle", "queued")):
+        conn.execute("INSERT INTO deployments (id, instance_id, status, branch, log, steps) VALUES (?, ?, ?, 'main', '', ?)",
+                     (ids[key], ids[instance], status, steps if status == "running" else "[]"))
+    return ids
+
+
+def test_migration_0008_fails_leftover_jobs_adds_the_one_active_index_and_downgrades(tmp_path):
+    db = tmp_path / "m.db"
+    _alembic(db, "upgrade", "0007")
+    with sqlite3.connect(db) as conn:
+        ids = _seed_0007(conn)
+
+    _alembic(db, "upgrade", "head")
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        deps = {r["id"]: r for r in conn.execute("SELECT * FROM deployments")}
+        for key in ("queued", "running", "other"):
+            row = deps[ids[key]]
+            assert (row["status"], row["error"]) == ("failed", "Interrupted by a Slipway restart")
+            assert row["finished_at"] is not None
+        assert deps[ids["done"]]["status"] == "succeeded" and deps[ids["done"]]["error"] is None
+        # A step that was running is marked as interrupted, as recover_interrupted does.
+        assert json.loads(deps[ids["running"]]["steps"]) == [
+            {"key": "fetch", "status": "done"},
+            {"key": "build", "status": "failed", "note": "Interrupted"},
+            {"key": "start", "status": "pending"},
+        ]
+        assert {(r["kind"], r["options"], r["backup_id"]) for r in deps.values()} == {("deploy", "{}", None)}
+        instances = {r["id"]: r for r in conn.execute("SELECT * FROM instances")}
+        # Only an instance left deploying becomes failed; the other one keeps running its old release.
+        assert instances[ids["busy"]]["status"] == "failed" and instances[ids["idle"]]["status"] == "running"
+        assert {(r["keep_backups"], r["seed_content"], r["content_pending"], r["data_dirty"]) for r in instances.values()} == {
+            (5, 1, 0, None)
+        }
+        assert {"backups", "snapshots", "first_admins"} <= {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+
+        # The partial unique index: one queued or running job per instance, any number of finished ones.
+        (index_sql,) = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'ux_deployments_one_active'").fetchone()
+        assert "UNIQUE" in index_sql and "WHERE status IN ('queued', 'running')" in index_sql
+        insert = "INSERT INTO deployments (id, instance_id, status, branch, log, steps) VALUES (?, ?, ?, 'main', '', '[]')"
+        conn.execute(insert, (uuid.uuid4().hex, ids["busy"], "failed"))
+        conn.execute(insert, (uuid.uuid4().hex, ids["busy"], "queued"))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (uuid.uuid4().hex, ids["busy"], "running"))
+        conn.execute(insert, (uuid.uuid4().hex, ids["idle"], "running"))  # another instance may run its own
+
+    _alembic(db, "downgrade", "0007")
+    with sqlite3.connect(db) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert not {"backups", "snapshots", "first_admins"} & tables
+        assert conn.execute("SELECT count(*) FROM sqlite_master WHERE name = 'ux_deployments_one_active'").fetchone() == (0,)
+        dep_columns = {r[1] for r in conn.execute("PRAGMA table_info(deployments)")}
+        inst_columns = {r[1] for r in conn.execute("PRAGMA table_info(instances)")}
+        assert not {"kind", "options", "previous_sha", "backup_id", "restore_backup_id", "snapshot_id"} & dep_columns
+        assert not {"keep_backups", "seed_snapshot_id", "live_identity", "data_dirty", "fresh_data"} & inst_columns
+        assert conn.execute("SELECT count(*) FROM deployments").fetchone() == (7,)  # the rows themselves are kept
+
+    # Upgrading again fails the jobs queued above and matches the models exactly.
+    _alembic(db, "upgrade", "head")
+    _alembic(db, "check")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM deployments WHERE status IN ('queued', 'running')").fetchone() == (0,)
+
+
+# ------------------------------------------------- data safety permissions and settings
+
+
+def test_data_permissions_by_role():
+    """§14.1: who may read, back up, restore, reset, upload and download data."""
+    def granted(role: str) -> set[str]:
+        return {str(p) for p in SYSTEM_ROLES[role]["permissions"]}
+
+    data = ["data:read", "data:backup", "data:restore", "data:reset", "snapshots:upload", "snapshots:download"]
+    expected = {
+        "viewer": ["data:read"],
+        "developer": ["data:read", "data:backup", "data:restore"],
+        "maintainer": ["data:read", "data:backup", "data:restore", "data:reset", "snapshots:upload"],
+        "admin": data,
+    }
+    for role, perms in expected.items():
+        assert [p for p in data if has_permission(granted(role), p)] == perms, role
+    # A data wildcard never reaches the privileged snapshot permissions.
+    assert not has_permission({"data:*"}, "snapshots:upload") and not has_permission({"data:*"}, "snapshots:download")
+
+
+def test_snapshot_limits_are_range_checked(monkeypatch):
+    settings = Settings()
+    assert (settings.snapshot_max_bytes, settings.snapshot_total_bytes) == (20 * 1024**3, 100 * 1024**3)
+    assert (settings.snapshot_transfers, settings.snapshot_kdf_slots, settings.manual_backups_max) == (2, 2, 10)
+    for name, value in (("SLIPWAY_SNAPSHOT_TRANSFERS", "9"), ("SLIPWAY_SNAPSHOT_KDF_SLOTS", "0")):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValidationError):
+            Settings()
+        monkeypatch.delenv(name)

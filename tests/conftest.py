@@ -15,12 +15,14 @@ os.environ.update(
     SLIPWAY_SECRET_KEY="test-secret-key-that-is-long-enough-1234567890",
     SLIPWAY_HOST_POLL_INTERVAL="0",
     SLIPWAY_METRICS_RETENTION_INTERVAL="0",
+    SLIPWAY_CERT_RENEW_INTERVAL="0",  # no certificate renewal loop in tests
     SLIPWAY_UPDATE_CHECK_INTERVAL="0",
     SLIPWAY_UPDATE_RECONCILE_INTERVAL="0",
     SLIPWAY_GITHUB_CLIENT_ID="test-client",
     SLIPWAY_GITHUB_CLIENT_SECRET="test-secret",
     SLIPWAY_BASE_URL="http://testserver",
     SLIPWAY_ALLOW_SIGNUP="false",
+    SLIPWAY_STORAGE_DIR=str(_tmp / "storage"),  # stored snapshots stay inside the test run's temp folder
 )
 
 import httpx  # noqa: E402
@@ -33,7 +35,22 @@ from slipway.main import create_app  # noqa: E402
 from slipway.models import User  # noqa: E402
 from slipway.services.users import bootstrap, create_user  # noqa: E402
 
+# The guard against real outside systems (DigitalOcean, Spaces, ACME, Cloudflare, Switchyard, the
+# public check, Proxmox, ESXi, Terraform, TCP probes). Every test gets it; see below.
+pytest_plugins = ["tests.hypervisor_guard"]
+
 PASSWORD = "correct-horse-battery"
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line("markers", "own_guard: the test installs its own hypervisor guard, so the autouse one stays off")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_outside_systems(request) -> None:
+    """Every test runs under ``no_real_hypervisors`` (tests/hypervisor_guard.py), asked for or not."""
+    if request.node.get_closest_marker("own_guard") is None:
+        request.getfixturevalue("no_real_hypervisors")
 
 
 @pytest.fixture(scope="session")

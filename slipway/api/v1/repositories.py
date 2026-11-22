@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import or_, select
@@ -14,7 +14,7 @@ from slipway.db.base import utcnow
 from slipway.models import Repository
 from slipway.models.repository import DEFAULT_BRANCH_TOO_LONG
 from slipway.schemas import BRANCH_MAX, RepoOut, SyncOut
-from slipway.services import audit
+from slipway.services import audit, deployer, manifest
 from slipway.services.auth import AuthContext
 from slipway.services.github import GitHubClient, GitHubError
 from slipway.services.repos import GitHubNotLinked, github_token_for, sync_repositories
@@ -23,6 +23,10 @@ router = APIRouter(prefix="/repositories", tags=["repositories"])
 
 Reader = Annotated[AuthContext, require(Perm.REPOS_READ)]
 Syncer = Annotated[AuthContext, require(Perm.REPOS_SYNC)]
+# Reading a manifest reads a file of the repository (its errors quote it): only for those who set up instances
+# or environments (the New environment flow reads it too, phase 3 §12.3), who can deploy the repository's code
+# anyway.
+ManifestReader = Annotated[AuthContext, require(Perm.REPOS_READ)]
 
 
 async def _get(db: DB, repo_id: uuid.UUID) -> Repository:
@@ -82,6 +86,38 @@ async def branches(repo_id: uuid.UUID, ctx: Reader, db: DB) -> list[str]:
         return sorted(names)
     # Default branch first.
     return sorted(names, key=lambda n: (n != repo.default_branch, n))
+
+
+@router.get("/{repo_id}/manifest")
+async def get_manifest(
+    repo_id: uuid.UUID, ctx: ManifestReader, db: DB,
+    branch: Annotated[str, Query(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._/-]+$")],
+    path: Annotated[str, Query(max_length=255)] = manifest.DEFAULT_FILE,
+) -> dict[str, Any]:
+    """The repository's slipway.yml on ``branch``, checked: ``{found, manifest?, error?}``."""
+    if not (ctx.can(Perm.INSTANCES_WRITE) or ctx.can(Perm.ENVIRONMENTS_WRITE)):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing permission: {Perm.INSTANCES_WRITE}")
+    repo = await _get(db, repo_id)
+    try:
+        path = manifest.clean_manifest_file(deployer.clean_relative_path(path))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    token, _ = github_token_for(ctx.user)
+    try:
+        async with GitHubClient(token) as gh:
+            text = await gh.get_file(repo.github_id, path, branch)
+            if text is None:
+                # GitHub answers 404 for a repository or branch this token can't see too: only call the file
+                # missing when the branch itself is there (else this raises, and the form keeps what it has).
+                await gh.get_commit(repo.github_id, branch)
+    except GitHubError as exc:
+        raise _gh_error(exc) from exc
+    if text is None:
+        return {"found": False, "path": path}
+    try:
+        return {"found": True, "path": path, "manifest": manifest.parse(text).to_json()}
+    except manifest.ManifestError as exc:
+        return {"found": True, "path": path, "error": str(exc)}
 
 
 @router.get("/{repo_id}/readme")

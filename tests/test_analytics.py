@@ -69,7 +69,7 @@ async def seeded() -> dict:
         "d7": _dep(web, "cancelled", at(16, 10), 5, alice),
         "d8": _dep(api, "failed", at(17, 8), 10, bob),
         "d9": _dep(api, "running", at(17, 11)),
-        "d10": _dep(api, "queued", at(17, 11, 30)),
+        "d10": _dep(web, "queued", at(17, 11, 30)),  # an instance has one deploy queued or running at most
     }
     async with get_sessionmaker()() as db:
         db.add_all(deps.values())
@@ -128,12 +128,13 @@ async def test_by_instance(seeded):
     assert (web["deploys"], web["failed"]) == (5, 2)
     assert web["success_rate"] == pytest.approx(0.5)
     assert web["median_seconds"] == 180
-    assert web["last_deploy"] == {"id": seeded["deps"]["d7"].id, "status": "cancelled", "at": at(16, 10, 5)}
-    assert web["recovering"] is False  # its latest outcome succeeded; the cancel after it says nothing
+    # Still queued: the time is when it was created.
+    assert web["last_deploy"] == {"id": seeded["deps"]["d10"].id, "status": "queued", "at": at(17, 11, 30)}
+    assert web["recovering"] is False  # its latest outcome succeeded; the cancel and the queued one say nothing
 
     assert (api["deploys"], api["failed"], api["success_rate"], api["median_seconds"]) == (1, 1, 0.0, 600)
-    # Still queued: the time is when it was created.
-    assert api["last_deploy"] == {"id": seeded["deps"]["d10"].id, "status": "queued", "at": at(17, 11, 30)}
+    # Still running: the time is when it was created.
+    assert api["last_deploy"] == {"id": seeded["deps"]["d9"].id, "status": "running", "at": at(17, 11)}
     assert api["recovering"] is True
 
 

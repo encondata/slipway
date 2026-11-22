@@ -1,7 +1,72 @@
 {% extends "settings/_layout.html" %}
 {% from "_macros.html" import icon %}
 {% block title %}Integrations{% endblock %}
+
+{#- One account list for the three providers (P4 §17.1, P5 §12.1): the rows need providers:read, the buttons
+    providers:write. ``card`` is one of pages.account_cards; each row is pages.account_view. -#}
+{% macro account_list(card) -%}
+{%- set p = card.provider -%}
+{%- set can_write = auth.can(Perm.PROVIDERS_WRITE) -%}
+<section class="card account-card" id="{{ p }}-accounts" data-provider="{{ p }}">
+  <div class="card-head"><span class="head-icon accent">{{ icon("cloud" if p == "digitalocean" else "hosts", "i-lg") }}</span>
+    <div><h2>{{ card.title }}</h2><p>{{ card.lede }}</p></div>
+    <span class="spacer"></span>
+    {% if can_write %}<button class="btn btn-sm btn-primary" type="button" data-account-open="{{ p }}">{{ icon("plus", "i-sm") }} Add account</button>{% endif %}
+  </div>
+  {% if card.accounts %}
+  <div class="table-wrap"><table class="table accounts">
+    <thead><tr><th>Name</th>
+      {%- if p == "digitalocean" %}<th>Region</th><th>Team</th><th>Estimate</th><th>Environments</th>
+      {%- else %}<th>URL</th><th>Networks</th><th>VMs</th>{% endif %}
+      <th>Status</th>{% if can_write %}<th class="num">Actions</th>{% endif %}</tr></thead>
+    <tbody>
+    {%- for v in card.accounts %}{% set a = v.a %}
+      <tr data-account-row="{{ a.id }}"{% if a.removed %} class="removed"{% endif %}>
+        <td><strong>{{ a.name }}</strong>
+          {%- if a.production %} <span class="chip account-chip production">Production</span>{% endif %}
+          {%- if a.removed %} <span class="badge plain" title="Removed {{ v.removed_at|dt }}; the name stays taken so old logs can still name it">Removed</span>{% endif %}
+          {%- if not a.removed %}<small class="subtle mono">{% if a.has_secret %}{{ "Token" if p != "esxi" else "Password" }} set{% if a.secret_hint and a.secret_hint != "set" %} (…{{ a.secret_hint }}){% endif %}{% else %}No {{ "token" if p != "esxi" else "password" }}{% endif %}</small>{% endif %}</td>
+        {%- if p == "digitalocean" %}
+        <td class="mono">{{ a.region or "—" }}</td>
+        <td>{{ a.team_name or "—" }}</td>
+        <td class="nowrap">About {{ v.estimate }} a month{% if v.limit %}<small class="subtle">Limit {{ v.limit }}</small>{% endif %}</td>
+        <td>{% for e in v.envs %}<span class="chip">{{ e }}</span> {% else %}<span class="subtle">None</span>{% endfor %}
+          {%- if a.ssh_open %}<div><span class="badge warning" title="An SSH source is 0.0.0.0/0 or ::/0">SSH open to the internet</span></div>{% endif %}</td>
+        {%- else %}
+        <td class="mono">{{ a.url or "—" }}
+          {%- if v.untrusted %}<div><span class="badge warning" title="Slipway doesn't connect until a person compares and trusts its certificate">Certificate not trusted</span></div>
+          {%- elif a.tls %}<small class="subtle mono" title="The pinned certificate">{{ a.tls.fingerprint_sha256[:23] }}…</small>{% endif %}</td>
+        <td>{% for n in v.networks %}<span class="chip mono">{{ n }}</span> {% else %}<span class="subtle">None</span>{% endfor %}</td>
+        <td>{% for vm in v.vms %}<span class="chip mono" title="{{ vm.environment }} {{ vm.slot }}">{{ vm.name }}</span> {% else %}<span class="subtle">None</span>{% endfor %}</td>
+        {%- endif %}
+        <td>{% if a.removed %}<span class="subtle">—</span>{% else %}<span class="badge {{ v.status[1] }}" title="{{ v.status_title }}">{{ v.status[0] }}</span>
+          {%- if v.checked_at %}<small class="subtle">{{ v.checked_at|timeago }}</small>{% endif %}
+          {%- if v.checks %}
+          <details class="account-checks"><summary>Checks</summary><ul class="check-list">
+            {%- for c in v.checks %}<li><span class="badge {{ c.badge[1] }}">{{ c.badge[0] }}</span> <span>{{ c.text }}</span></li>{% endfor %}
+          </ul></details>{% endif %}{% endif %}</td>
+        {%- if can_write %}
+        <td class="actions-cell">{% if not a.removed %}
+          <button class="btn btn-sm" type="button" data-api="POST /api/v1/provider-accounts/{{ a.id }}/test" data-success="Test finished" data-then="reload">{{ icon("sync", "i-sm") }} Test</button>
+          {%- if p != "digitalocean" %}
+          <button class="btn btn-sm" type="button" data-account-trust="{{ a.id }}" data-provider="{{ p }}" data-where="{{ a.url or a.name }}">{{ icon("fingerprint", "i-sm") }} Trust…</button>
+          {%- endif %}
+          <button class="btn btn-sm" type="button" data-account-open="{{ p }}" data-account='{{ v.edit|tojson }}'>{{ icon("edit", "i-sm") }} Edit</button>
+          <button class="btn btn-sm btn-danger" type="button" data-open="remove-account-{{ a.id }}">Remove…</button>
+        {%- endif %}</td>
+        {%- endif %}
+      </tr>
+    {%- endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <div class="card-body"><p class="muted" style="margin: 0">No {{ card.title }} accounts yet.{% if can_write %} Add one to make {{ "droplets" if p == "digitalocean" else "VMs" }} for environments.{% endif %}</p></div>
+  {% endif %}
+</section>
+{%- endmacro %}
+
 {% block settings %}
+{% if can_settings %}
 <section class="card">
   <div class="card-head"><span class="head-icon accent">{{ icon("globe", "i-lg") }}</span>
     <div><h2>Switchyard</h2><p>The reverse proxy that publishes instances' hostnames. Slipway creates and updates a proxy host for each hostname after every successful deploy.</p></div>
@@ -22,6 +87,11 @@
           pattern="sy_[A-Za-z0-9_\-]{20,200}" title="A Switchyard API key: sy_ followed by the rest of the key"
           placeholder="{{ 'Saved; leave empty to keep it' if sy_has_key else 'sy_…' }}" {{ '' if sy_has_key else 'required' }}>
         <span class="help">{% if sy_key_prefix %}Saved key: <code>{{ sy_key_prefix }}…</code>, the same prefix Switchyard lists under API keys. {% endif %}Encrypted at rest and never shown again.</span>
+      </div>
+      <div class="field span-2">
+        <label for="sy-traffic">Traffic address</label>
+        <input class="input mono" id="sy-traffic" name="traffic_address" value="{{ sy.traffic_address or '' }}" placeholder="10.0.0.2 or proxy.lan:443" data-keep-empty autocomplete="off" spellcheck="false">
+        <span class="help">Where Switchyard serves the hostnames, as host or host:port. After a switch, Slipway checks each name through it from this server. Empty: the check is skipped with a warning.</span>
       </div>
       <div class="field">
         <label for="sy-tls">Default certificate for new hostnames</label>
@@ -45,4 +115,49 @@
     </div>
   </form>
 </section>
+
+<section class="card" id="cloudflare-card">
+  <div class="card-head"><span class="head-icon accent">{{ icon("cloud", "i-lg") }}</span>
+    <div><h2>Cloudflare</h2><p>DNS records for environments' public names. Slipway publishes an A record for each name, at a fixed address, and changes only records it made or claimed.</p></div>
+    <span class="spacer"></span>
+    {% if cf.configured %}<span class="badge success">Connected</span>{% else %}<span class="badge">Not set up</span>{% endif %}
+  </div>
+  <form class="card-body stack" style="gap: 16px" method="post" action="/js-required"
+        data-form="PUT /api/v1/settings/cloudflare" data-success="Cloudflare settings saved" data-then="reload">
+    <div class="form-grid">
+      <div class="field">
+        <label for="cf-zone">Zone</label>
+        <input class="input mono" id="cf-zone" name="zone" value="{{ cf.zone }}" placeholder="example.com" required autocomplete="off" spellcheck="false">
+        <span class="help">The domain whose records Slipway manages{% if cf.zone_id %} (zone <code>{{ cf.zone_id }}</code>){% endif %}.</span>
+      </div>
+      <div class="field">
+        <label for="cf-ip">Public IP</label>
+        <input class="input mono" id="cf-ip" name="public_ip" value="{{ cf.public_ip }}" placeholder="203.0.113.10" autocomplete="off" spellcheck="false">
+        <span class="help">The WAN address published records point at.</span>
+      </div>
+      <div class="field">
+        <label for="cf-token">API token</label>
+        <input class="input mono" id="cf-token" name="token" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+          placeholder="{{ ('Set (…' ~ cf.token_hint ~ '); leave empty to keep it') if cf.has_token else 'A Cloudflare API token' }}" {{ '' if cf.has_token else 'required' }}>
+        <span class="help">{% if cf.has_token %}Set (…{{ cf.token_hint }}). {% endif %}It needs Zone DNS Edit and Zone Read on this zone. Encrypted at rest and never shown again.</span>
+      </div>
+      <label class="check" style="align-self: end"><input type="checkbox" name="proxied" {{ 'checked' if cf.proxied }}><span><strong>Proxied by default</strong><br><span class="subtle">New records go through Cloudflare's proxy unless an environment says otherwise.</span></span></label>
+    </div>
+    <div class="row" style="gap: 8px; flex-wrap: wrap">
+      <button class="btn btn-primary" type="submit">{{ icon("check") }} Save</button>
+      {% if cf.configured %}
+      <button class="btn" type="button" data-api="POST /api/v1/settings/cloudflare/test" data-success-field="message">{{ icon("sync", "i-sm") }} Test</button>
+      <button class="btn btn-danger" type="button" data-api="PUT /api/v1/settings/cloudflare" data-body='{"clear": true}'
+        data-confirm="Remove the Cloudflare integration? Records already in Cloudflare stay there; Slipway stops managing them." data-success="Cloudflare removed" data-then="reload"
+        {% if cf_users %}disabled title="Environments {{ cf_users|join(', ') }} publish DNS records through Cloudflare; turn that off on them first"{% endif %}>Remove</button>
+      {% endif %}
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% if can_accounts %}
+{% for card in cards %}{{ account_list(card) }}{% endfor %}
+{% if auth.can(Perm.PROVIDERS_WRITE) %}{% include "_account_dialogs.html" %}{% endif %}
+{% endif %}
 {% endblock %}

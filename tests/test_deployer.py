@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import tarfile
 import uuid
@@ -142,16 +143,21 @@ class FakeRemote:
     """``responses`` maps a command substring to its output (a callable gets the remote and the command).
 
     ``docker compose config`` prints a compose file with no services unless a response says otherwise.
+    ``inputs`` records what was sent on stdin as (command, sha256 of the input, its length), never the input;
+    ``files`` holds what was written, and is what ``read_stream`` serves.
     """
 
     def __init__(self, fail_on: str | None = None, responses: dict | None = None):
         self.commands: list[str] = []
+        self.inputs: list[tuple[str, str, int]] = []
         self.files: dict[str, str | bytes] = {}
         self.fail_on = fail_on
         self.responses = responses or {}
 
-    async def run(self, command, *, check=True, on_line=None, timeout=None):
+    async def run(self, command, *, check=True, on_line=None, timeout=None, input=None, scrub=None):
         self.commands.append(command)
+        if input is not None:
+            self.inputs.append((command, hashlib.sha256(input.encode()).hexdigest(), len(input)))
         if on_line and "docker build" in command:
             await on_line("Step 1/3 : FROM node:22")
         if self.fail_on and self.fail_on in command:
@@ -163,11 +169,22 @@ class FakeRemote:
             return 0, '{"services": {}}'
         return 0, ""
 
-    async def put(self, local, remote):
+    async def put(self, local, remote, mode=None):
         self.files[remote] = Path(local).read_bytes()
 
     async def write_text(self, remote, content, mode=0o600):
         self.files[remote] = content
+
+    async def read_stream(self, path, chunk=None):
+        if path not in self.files:
+            raise ssh.SSHError(f"Could not read {path}: no such file")
+        content = self.files[path]
+        yield content.encode() if isinstance(content, str) else content
+
+    async def write_stream(self, path, chunks, mode=0o600):
+        parts = [bytes(c) async for c in chunks] if hasattr(chunks, "__aiter__") else [bytes(c) for c in chunks]
+        self.files[path] = b"".join(parts)
+        return len(self.files[path])
 
 
 async def _seed(env: dict[str, str]) -> uuid.UUID:

@@ -52,16 +52,17 @@ async def test_previous_window_is_as_long_as_this_one():
 
 
 async def test_by_day_adds_up_to_the_deploy_count_while_deploys_run():
-    web, _ = await _seed_instances()
+    web, api = await _seed_instances()
     async with get_sessionmaker()() as db:
-        db.add_all([_dep(web, "succeeded", at(17, 8), 2), _dep(web, "running", at(17, 10)), _dep(web, "queued", at(17, 11))])
+        db.add_all([_dep(web, "succeeded", at(17, 8), 2), _dep(web, "running", at(17, 10)),
+                    _dep(api, "queued", at(17, 11))])  # one active deploy per instance
         await db.commit()
     stats = await _stats()
     t = stats["totals"]
     assert sum(d["succeeded"] + d["failed"] + d["cancelled"] for d in stats["by_day"]) == t["deploys"] == 1
     assert (t["running"], t["queued"]) == (1, 1)
     assert sum(r["deploys"] for r in stats["by_instance"]) == 1
-    assert stats["by_instance"][0]["last_deploy"]["status"] == "queued"
+    assert {r["name"]: r["last_deploy"]["status"] for r in stats["by_instance"]} == {"web": "running", "api": "queued"}
 
 
 async def test_deploys_by_a_deleted_user_are_not_called_automatic():
@@ -374,3 +375,20 @@ def test_forced_colours_keep_the_outcomes_apart():
         colours[key] = m.group(1)
     assert len(set(colours.values())) == 3
     assert not re.search(r"\.chart-seg, \.chart-swatch \{", block)
+
+
+async def test_only_deploys_count_not_data_jobs():
+    """The deployments table also holds data jobs (backup, restore, reset...): they are not deploys."""
+    web, _ = await _seed_instances()
+    async with get_sessionmaker()() as db:
+        db.add_all([
+            _dep(web, "succeeded", at(17, 8), 2),
+            _dep(web, "failed", at(17, 9), 1, kind="backup"),
+            _dep(web, "succeeded", at(17, 10), 1, kind="restore"),
+        ])
+        await db.commit()
+    stats = await _stats()
+    t = stats["totals"]
+    assert (t["deploys"], t["failed"], t["success_rate"]) == (1, 0, 1.0)
+    assert stats["recent_failures"] == []
+    assert stats["by_instance"][0]["last_deploy"]["status"] == "succeeded"

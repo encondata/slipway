@@ -338,7 +338,7 @@ def _alembic(url: str, *args: str) -> None:
     assert done.returncode == 0, (args, done.stderr)
 
 
-def test_migration_0006b_on_sqlite(tmp_path):
+def test_migration_0014_on_sqlite(tmp_path):
     url = f"sqlite+aiosqlite:///{tmp_path}/m.db"
     _alembic(url, "upgrade", "head")
     with sqlite3.connect(tmp_path / "m.db") as conn:
@@ -349,18 +349,18 @@ def test_migration_0006b_on_sqlite(tmp_path):
         fks = {(row[2], row[6]) for row in conn.execute("PRAGMA foreign_key_list(host_samples_hourly)")}
         assert fks == {("hosts", "CASCADE")}
     _alembic(url, "check")
-    _alembic(url, "downgrade", "0006")
+    _alembic(url, "downgrade", "0013")
     with sqlite3.connect(tmp_path / "m.db") as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert not tables & {"host_samples", "host_samples_hourly"}
-        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == ("0006",)
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == ("0013",)
     _alembic(url, "upgrade", "head")
     _alembic(url, "check")
 
 
 @pytest.mark.skipif(not os.environ.get("SLIPWAY_TEST_DATABASE_URL", "").startswith("postgresql"),
                     reason="needs SLIPWAY_TEST_DATABASE_URL pointing at PostgreSQL")
-async def test_migration_0006b_on_postgresql():
+async def test_migration_0014_on_postgresql():
     base = make_url(os.environ["SLIPWAY_TEST_DATABASE_URL"])
     name = f"slipway_migration_{uuid.uuid4().hex[:12]}"
     admin_dsn = base.set(drivername="postgresql").render_as_string(hide_password=False)
@@ -372,7 +372,7 @@ async def test_migration_0006b_on_postgresql():
         pytest.skip("the test database user cannot create databases")
     try:
         url = base.set(database=name).render_as_string(hide_password=False)
-        for args in (["upgrade", "head"], ["check"], ["downgrade", "0006"], ["upgrade", "head"], ["check"]):
+        for args in (["upgrade", "head"], ["check"], ["downgrade", "0013"], ["upgrade", "head"], ["check"]):
             await asyncio.to_thread(_alembic, url, *args)
     finally:
         await conn.execute(f'DROP DATABASE IF EXISTS "{name}"')

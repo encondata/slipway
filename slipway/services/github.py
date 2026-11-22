@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,11 @@ COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "dock
 
 # A repository is addressed by its immutable GitHub id (preferred) or by "owner/name".
 RepoRef = int | str
+
+Transport = httpx.AsyncBaseTransport | None
+# Used when a caller passes no ``transport``. Tests swap it for an httpx.MockTransport; the test guard makes the
+# real one refuse every request.
+transport_factory: Callable[[], Transport] = lambda: None  # noqa: E731
 
 
 class GitHubError(RuntimeError):
@@ -72,6 +78,7 @@ def authorize_url(state: str) -> str:
 async def exchange_code(code: str, *, transport: httpx.AsyncBaseTransport | None = None) -> tuple[str, str]:
     """Exchange an OAuth code for (access_token, granted_scopes)."""
     s = get_settings()
+    transport = transport if transport is not None else transport_factory()
     try:
         async with httpx.AsyncClient(timeout=15, transport=transport) as client:
             resp = await client.post(
@@ -117,7 +124,7 @@ class GitHubClient:
             base_url=get_settings().github_api_url,
             headers=headers,
             timeout=30,
-            transport=transport,
+            transport=transport if transport is not None else transport_factory(),
             follow_redirects=True,
         )
 
@@ -213,8 +220,24 @@ class GitHubClient:
         return {
             "dockerfile": "Dockerfile" in names,
             "compose_file": next((n for n in COMPOSE_FILENAMES if n in names), None),
+            "manifest": "slipway.yml" in names,
             "files": sorted(names)[:50],
         }
+
+    async def get_file(self, repo: RepoRef, path: str, ref: str, *, limit: int = 256 * 1024) -> str | None:
+        """The text of ``path`` at ``ref`` (None when there is no such file or it is too big)."""
+        url = f"{_repo_path(repo)}/contents/{quote(path, safe='/')}"
+        try:
+            resp = await self._client.get(url, params={"ref": ref}, headers={"Accept": "application/vnd.github.raw+json"})
+        except httpx.HTTPError as exc:
+            raise _failed(f"GitHub API {url}", exc) from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise GitHubError(f"GitHub API {url}: {resp.text[:200] or resp.reason_phrase}", resp.status_code)
+        if len(resp.content) > limit or resp.headers.get("content-type", "").startswith("application/json"):
+            return None  # a directory listing, or too big
+        return resp.content.decode("utf-8", "replace")
 
     async def get_readme(self, repo: RepoRef) -> str | None:
         path = f"{_repo_path(repo)}/readme"

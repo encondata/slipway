@@ -1,0 +1,1682 @@
+{
+ "single": {
+  "after": {
+   "active": "blue",
+   "data_mode": "slot",
+   "deleted": false,
+   "hostnames": [
+    {
+     "container": 8000,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "api.uat.example.com",
+     "service": "api"
+    },
+    {
+     "container": 8090,
+     "follows": "active",
+     "health": "/",
+     "hostname": "kiosk.uat.example.com",
+     "service": "kiosk"
+    },
+    {
+     "container": 8092,
+     "follows": "active",
+     "health": "/",
+     "hostname": "learn.uat.example.com",
+     "service": "learn"
+    },
+    {
+     "container": 8091,
+     "follows": "active",
+     "health": "/",
+     "hostname": "portal.uat.example.com",
+     "service": "portal"
+    },
+    {
+     "container": 9000,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "spaces.uat.example.com",
+     "service": "spaces"
+    },
+    {
+     "container": 8095,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "status.uat.example.com",
+     "service": "status"
+    },
+    {
+     "container": 8096,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "wiki.uat.example.com",
+     "service": "wiki"
+    }
+   ],
+   "members": {
+    "blue": {
+     "host": "h-blue",
+     "slug": "one-blue",
+     "status": "running"
+    }
+   },
+   "notice": null,
+   "secrets_version": 0,
+   "status": "live",
+   "traffic": {
+    "dns": null,
+    "switch": "switchyard"
+   }
+  },
+  "after_chain": {
+   "active": "blue",
+   "data_mode": "slot",
+   "deleted": false,
+   "hostnames": [
+    {
+     "container": 8000,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "api.uat.example.com",
+     "service": "api"
+    },
+    {
+     "container": 8090,
+     "follows": "active",
+     "health": "/",
+     "hostname": "kiosk.uat.example.com",
+     "service": "kiosk"
+    },
+    {
+     "container": 8092,
+     "follows": "active",
+     "health": "/",
+     "hostname": "learn.uat.example.com",
+     "service": "learn"
+    },
+    {
+     "container": 8091,
+     "follows": "active",
+     "health": "/",
+     "hostname": "portal.uat.example.com",
+     "service": "portal"
+    },
+    {
+     "container": 9000,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "spaces.uat.example.com",
+     "service": "spaces"
+    },
+    {
+     "container": 8095,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "status.uat.example.com",
+     "service": "status"
+    },
+    {
+     "container": 8096,
+     "follows": "active",
+     "health": "/healthz",
+     "hostname": "wiki.uat.example.com",
+     "service": "wiki"
+    }
+   ],
+   "members": {
+    "blue": {
+     "host": "h-blue",
+     "slug": "one-blue",
+     "status": "running"
+    }
+   },
+   "notice": null,
+   "secrets_version": 0,
+   "status": "live",
+   "traffic": {
+    "dns": null,
+    "switch": "switchyard"
+   }
+  },
+  "backup": {
+   "checked": [],
+   "cloudflare": [],
+   "error": "",
+   "hosts": {
+    "blue": {
+     "app": [
+      "has-data a1b2c3d4e5f6-<redeploy-blue>",
+      "data a1b2c3d4e5f6-<redeploy-blue>",
+      "revision a1b2c3d4e5f6-<redeploy-blue>",
+      "pgdump a1b2c3d4e5f6-<redeploy-blue>",
+      "verify-dump a1b2c3d4e5f6-<redeploy-blue>"
+     ]
+    }
+   },
+   "kind": "backup",
+   "options": {
+    "restop": false
+   },
+   "queued": [
+    [
+     "release",
+     "Check the live release"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "release",
+     "Check the live release",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": []
+  },
+  "chain": [
+   {
+    "checked": [
+     "api.uat.example.com",
+     "kiosk.uat.example.com",
+     "learn.uat.example.com",
+     "portal.uat.example.com",
+     "spaces.uat.example.com",
+     "status.uat.example.com",
+     "wiki.uat.example.com"
+    ],
+    "cloudflare": [],
+    "error": "",
+    "hosts": {
+     "blue": {
+      "app": [
+       "seed a1b2c3d4e5f6-<deploy-blue>"
+      ],
+      "smoke": [
+       "api.uat.example.com",
+       "kiosk.uat.example.com",
+       "learn.uat.example.com",
+       "portal.uat.example.com",
+       "spaces.uat.example.com",
+       "status.uat.example.com",
+       "wiki.uat.example.com"
+      ]
+     }
+    },
+    "kind": "activate",
+    "options": {
+     "after": "<deploy-blue>",
+     "chain": true,
+     "from_slot": null,
+     "slot": "blue",
+     "switch": {
+      "applied": true,
+      "apply_n": 2,
+      "backend": "switchyard",
+      "before": {},
+      "changed": [],
+      "created": [
+       {
+        "hostname": "api.uat.example.com",
+        "id": "1"
+       },
+       {
+        "hostname": "kiosk.uat.example.com",
+        "id": "2"
+       },
+       {
+        "hostname": "learn.uat.example.com",
+        "id": "3"
+       },
+       {
+        "hostname": "portal.uat.example.com",
+        "id": "4"
+       },
+       {
+        "hostname": "spaces.uat.example.com",
+        "id": "5"
+       },
+       {
+        "hostname": "status.uat.example.com",
+        "id": "6"
+       },
+       {
+        "hostname": "wiki.uat.example.com",
+        "id": "7"
+       }
+      ],
+      "deleted": [],
+      "from_slot": null,
+      "to_slot": "blue"
+     }
+    },
+    "queued": [
+     [
+      "check",
+      "Check one"
+     ],
+     [
+      "smoke",
+      "Check blue on h-blue"
+     ],
+     [
+      "switch",
+      "Switch traffic to blue"
+     ],
+     [
+      "seed",
+      "Add starter content"
+     ]
+    ],
+    "status": "succeeded",
+    "steps": [
+     [
+      "check",
+      "Check one",
+      "succeeded",
+      ""
+     ],
+     [
+      "smoke",
+      "Check blue on h-blue",
+      "succeeded",
+      ""
+     ],
+     [
+      "switch",
+      "Switch traffic to blue",
+      "succeeded",
+      ""
+     ],
+     [
+      "seed",
+      "Add starter content",
+      "succeeded",
+      ""
+     ]
+    ],
+    "submitted": [],
+    "switchyard": [
+     {
+      "body": null,
+      "call": "GET /api/config/preview"
+     },
+     {
+      "body": null,
+      "call": "GET /api/hosts"
+     },
+     {
+      "body": null,
+      "call": "GET /api/config/preview"
+     },
+     {
+      "body": null,
+      "call": "GET /api/hosts"
+     },
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "api.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8000,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "kiosk.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8090,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "learn.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8092,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "portal.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8091,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "spaces.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 9000,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "status.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8095,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": {
+       "compression": true,
+       "domains": [
+        "wiki.uat.example.com"
+       ],
+       "enabled": true,
+       "force_https": true,
+       "hsts": false,
+       "notes": "Managed by Slipway: environment one (<env-one>). Domains, upstreams and TLS mode are set from Slipway when traffic moves.",
+       "tls_mode": "auto",
+       "type": "proxy",
+       "upstreams": [
+        {
+         "host": "10.0.0.11",
+         "port": 8096,
+         "scheme": "http",
+         "skip_tls_verify": false
+        }
+       ]
+      },
+      "call": "POST /api/hosts"
+     },
+     "changed",
+     {
+      "body": null,
+      "call": "GET /api/config/preview"
+     },
+     {
+      "body": {
+       "note": "Slipway: one \u2192 blue"
+      },
+      "call": "POST /api/config/apply"
+     }
+    ]
+   }
+  ],
+  "create": {
+   "ok": true,
+   "plan": {
+    "hostnames": [
+     {
+      "container": 8000,
+      "follows": "active",
+      "health": "/healthz",
+      "hostname": "api.uat.example.com",
+      "service": "api"
+     },
+     {
+      "container": 8091,
+      "follows": "active",
+      "health": "/",
+      "hostname": "portal.uat.example.com",
+      "service": "portal"
+     },
+     {
+      "container": 9000,
+      "follows": "active",
+      "health": "/healthz",
+      "hostname": "spaces.uat.example.com",
+      "service": "spaces"
+     },
+     {
+      "container": 8090,
+      "follows": "active",
+      "health": "/",
+      "hostname": "kiosk.uat.example.com",
+      "service": "kiosk"
+     },
+     {
+      "container": 8096,
+      "follows": "active",
+      "health": "/healthz",
+      "hostname": "wiki.uat.example.com",
+      "service": "wiki"
+     },
+     {
+      "container": 8092,
+      "follows": "active",
+      "health": "/",
+      "hostname": "learn.uat.example.com",
+      "service": "learn"
+     },
+     {
+      "container": 8095,
+      "follows": "active",
+      "health": "/healthz",
+      "hostname": "status.uat.example.com",
+      "service": "status"
+     }
+    ],
+    "secrets": [
+     "POSTGRES_PASSWORD",
+     "SPACES_SECRET_KEY",
+     "SS_JWT_SECRET",
+     "SS_PASSWORD_PEPPER",
+     "SS_TOTP_ENCRYPTION_KEY",
+     "SS_WIKI_SERVICE_TOKEN"
+    ],
+    "slots": {
+     "blue": {
+      "host": "h-blue",
+      "host_id": "<host-blue>",
+      "role": "app",
+      "slug": "one-blue"
+     }
+    },
+    "traffic": {
+     "dns": null,
+     "switch": "switchyard"
+    }
+   },
+   "warnings": []
+  },
+  "deploy_blue": {
+   "checked": [],
+   "cloudflare": [],
+   "env_file": "STACK_ENV=one-blue\nSTACK_DOMAIN=uat.example.com\nSTACK_PROXY_IP=10.0.0.2\nSTACK_REPO_DIR=<TMP>/hosts/host-blue/root/one-blue/releases/a1b2c3d4e5f6-<deploy-blue>\nSTACK_IMAGE_TAG=a1b2c3d4e5f6\nSTACK_APPS=kiosk,wiki,learn,status,mailpit\nSS_LOG_LEVEL=INFO\nPOSTGRES_PASSWORD=pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\nSPACES_SECRET_KEY=ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\nSS_JWT_SECRET=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj\nSS_TOTP_ENCRYPTION_KEY=ttttttttttttttttttttttttttttttttttttttttttt=\nSS_PASSWORD_PEPPER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nSS_WIKI_SERVICE_TOKEN=wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n# Set by Slipway\nSTACK_API_PORT=8000\nSTACK_PORTAL_PORT=8091\nSTACK_SPACES_PORT=9000\nSTACK_KIOSK_PORT=8090\nSTACK_WIKI_PORT=8096\nSTACK_LEARN_PORT=8092\nSTACK_STATUS_PORT=8095\nSTACK_MAILPIT_PORT=8025\n",
+   "error": "",
+   "hosts": {
+    "blue": {
+     "admin": [
+      "args=--email ada@example.com --first-name Ada --last-name Lovelace --role super_admin --link-minutes 240 --password-stdin pwlen=21"
+     ],
+     "app": [
+      "build a1b2c3d4e5f6-<deploy-blue>",
+      "has-data a1b2c3d4e5f6-<deploy-blue>",
+      "up a1b2c3d4e5f6-<deploy-blue>",
+      "admin a1b2c3d4e5f6-<deploy-blue>"
+     ],
+     "docker": [
+      "ps -aq --filter label=com.docker.compose.project=ss-one-blue-db",
+      "volume ls -q --filter label=com.docker.compose.project=ss-one-blue-db",
+      "ps -aq --filter label=com.docker.compose.project=ss-one-blue-storage",
+      "volume ls -q --filter label=com.docker.compose.project=ss-one-blue-storage",
+      "ps -aq --filter label=com.docker.compose.project=ss-one-blue-api",
+      "volume ls -q --filter label=com.docker.compose.project=ss-one-blue-api",
+      "ps -aq --filter label=com.docker.compose.project=ss-one-blue-web",
+      "volume ls -q --filter label=com.docker.compose.project=ss-one-blue-web",
+      "ps -aq --filter label=com.docker.compose.project=ss-one-blue-status",
+      "volume ls -q --filter label=com.docker.compose.project=ss-one-blue-status",
+      "ps --format docker\t{{.Label \"slipway.instance\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.Ports}}",
+      "image ls --format {{.Repository}}:{{.Tag}} slipway/one-blue",
+      "image prune -f --filter label=slipway.instance=<one-blue>",
+      "image prune -f --filter label=com.docker.compose.project=slipway-one-blue"
+     ],
+     "smoke": [
+      "api.uat.example.com",
+      "kiosk.uat.example.com",
+      "learn.uat.example.com",
+      "portal.uat.example.com",
+      "spaces.uat.example.com",
+      "status.uat.example.com",
+      "wiki.uat.example.com"
+     ]
+    }
+   },
+   "kind": "deploy",
+   "options": {
+    "chain": true,
+    "go_live": true,
+    "slot": "blue",
+    "started_empty": true
+   },
+   "queued": [
+    [
+     "resolve",
+     "Resolve the commit"
+    ],
+    [
+     "source",
+     "Download the source"
+    ],
+    [
+     "upload",
+     "Upload the release"
+    ],
+    [
+     "manifest",
+     "Read slipway.yml"
+    ],
+    [
+     "ports",
+     "Check host ports"
+    ],
+    [
+     "settings",
+     "Write the settings"
+    ],
+    [
+     "build",
+     "Build"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ],
+    [
+     "start",
+     "Start"
+    ],
+    [
+     "finish",
+     "Switch to the new release"
+    ],
+    [
+     "smoke",
+     "Check blue on h-blue"
+    ],
+    [
+     "traffic",
+     "Update Switchyard"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "resolve",
+     "Resolve the commit",
+     "succeeded",
+     ""
+    ],
+    [
+     "source",
+     "Download the source",
+     "succeeded",
+     ""
+    ],
+    [
+     "upload",
+     "Upload the release",
+     "succeeded",
+     ""
+    ],
+    [
+     "manifest",
+     "Read slipway.yml",
+     "succeeded",
+     ""
+    ],
+    [
+     "ports",
+     "Check host ports",
+     "succeeded",
+     ""
+    ],
+    [
+     "settings",
+     "Write the settings",
+     "succeeded",
+     ""
+    ],
+    [
+     "build",
+     "Build",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "skipped",
+     "No data yet: commands.has_data found none"
+    ],
+    [
+     "start",
+     "Start",
+     "succeeded",
+     ""
+    ],
+    [
+     "finish",
+     "Switch to the new release",
+     "succeeded",
+     ""
+    ],
+    [
+     "first_admin",
+     "Create the first admin",
+     "succeeded",
+     ""
+    ],
+    [
+     "smoke",
+     "Check blue on h-blue",
+     "succeeded",
+     ""
+    ],
+    [
+     "traffic",
+     "Update Switchyard",
+     "skipped",
+     "Nothing is live yet; Activate follows"
+    ]
+   ],
+   "submitted": [
+    "<new>"
+   ],
+   "switchyard": []
+  },
+  "redeploy_blue": {
+   "checked": [],
+   "cloudflare": [],
+   "env_file": "STACK_ENV=one-blue\nSTACK_DOMAIN=uat.example.com\nSTACK_PROXY_IP=10.0.0.2\nSTACK_REPO_DIR=<TMP>/hosts/host-blue/root/one-blue/releases/a1b2c3d4e5f6-<redeploy-blue>\nSTACK_IMAGE_TAG=a1b2c3d4e5f6\nSTACK_APPS=kiosk,wiki,learn,status,mailpit\nSS_LOG_LEVEL=INFO\nPOSTGRES_PASSWORD=pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\nSPACES_SECRET_KEY=ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\nSS_JWT_SECRET=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj\nSS_TOTP_ENCRYPTION_KEY=ttttttttttttttttttttttttttttttttttttttttttt=\nSS_PASSWORD_PEPPER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nSS_WIKI_SERVICE_TOKEN=wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n# Set by Slipway\nSTACK_API_PORT=8000\nSTACK_PORTAL_PORT=8091\nSTACK_SPACES_PORT=9000\nSTACK_KIOSK_PORT=8090\nSTACK_WIKI_PORT=8096\nSTACK_LEARN_PORT=8092\nSTACK_STATUS_PORT=8095\nSTACK_MAILPIT_PORT=8025\n",
+   "error": "",
+   "hosts": {
+    "blue": {
+     "app": [
+      "build a1b2c3d4e5f6-<redeploy-blue>",
+      "has-data a1b2c3d4e5f6-<deploy-blue>",
+      "data a1b2c3d4e5f6-<deploy-blue>",
+      "revision a1b2c3d4e5f6-<deploy-blue>",
+      "pgdump a1b2c3d4e5f6-<deploy-blue>",
+      "verify-dump a1b2c3d4e5f6-<deploy-blue>",
+      "up a1b2c3d4e5f6-<redeploy-blue>"
+     ],
+     "docker": [
+      "ps --format docker\t{{.Label \"slipway.instance\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.Ports}}",
+      "system df -v --format {{range .Volumes}}{{.Name}} {{.Size}}{{\"",
+      "\"}}{{end}}",
+      "image ls --format {{.Repository}}:{{.Tag}} slipway/one-blue",
+      "image prune -f --filter label=slipway.instance=<one-blue>",
+      "image prune -f --filter label=com.docker.compose.project=slipway-one-blue"
+     ],
+     "smoke": [
+      "api.uat.example.com",
+      "kiosk.uat.example.com",
+      "learn.uat.example.com",
+      "portal.uat.example.com",
+      "spaces.uat.example.com",
+      "status.uat.example.com",
+      "wiki.uat.example.com"
+     ]
+    }
+   },
+   "kind": "deploy",
+   "options": {
+    "go_live": false,
+    "slot": "blue"
+   },
+   "queued": [
+    [
+     "resolve",
+     "Resolve the commit"
+    ],
+    [
+     "source",
+     "Download the source"
+    ],
+    [
+     "upload",
+     "Upload the release"
+    ],
+    [
+     "manifest",
+     "Read slipway.yml"
+    ],
+    [
+     "ports",
+     "Check host ports"
+    ],
+    [
+     "settings",
+     "Write the settings"
+    ],
+    [
+     "build",
+     "Build"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ],
+    [
+     "start",
+     "Start"
+    ],
+    [
+     "finish",
+     "Switch to the new release"
+    ],
+    [
+     "smoke",
+     "Check blue on h-blue"
+    ],
+    [
+     "traffic",
+     "Update Switchyard"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "resolve",
+     "Resolve the commit",
+     "succeeded",
+     ""
+    ],
+    [
+     "source",
+     "Download the source",
+     "succeeded",
+     ""
+    ],
+    [
+     "upload",
+     "Upload the release",
+     "succeeded",
+     ""
+    ],
+    [
+     "manifest",
+     "Read slipway.yml",
+     "succeeded",
+     ""
+    ],
+    [
+     "ports",
+     "Check host ports",
+     "succeeded",
+     ""
+    ],
+    [
+     "settings",
+     "Write the settings",
+     "succeeded",
+     ""
+    ],
+    [
+     "build",
+     "Build",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "succeeded",
+     ""
+    ],
+    [
+     "start",
+     "Start",
+     "succeeded",
+     ""
+    ],
+    [
+     "finish",
+     "Switch to the new release",
+     "succeeded",
+     ""
+    ],
+    [
+     "smoke",
+     "Check blue on h-blue",
+     "succeeded",
+     ""
+    ],
+    [
+     "traffic",
+     "Update Switchyard",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": [
+    {
+     "body": null,
+     "call": "GET /api/config/preview"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts"
+    }
+   ]
+  },
+  "restore": {
+   "checked": [],
+   "cloudflare": [],
+   "error": "",
+   "hosts": {
+    "blue": {
+     "app": [
+      "has-data a1b2c3d4e5f6-<redeploy-blue>",
+      "data a1b2c3d4e5f6-<redeploy-blue>",
+      "revision a1b2c3d4e5f6-<redeploy-blue>",
+      "pgdump a1b2c3d4e5f6-<redeploy-blue>",
+      "verify-dump a1b2c3d4e5f6-<redeploy-blue>",
+      "down a1b2c3d4e5f6-<redeploy-blue>",
+      "data a1b2c3d4e5f6-<redeploy-blue>",
+      "restore a1b2c3d4e5f6-<redeploy-blue>",
+      "up a1b2c3d4e5f6-<redeploy-blue>"
+     ],
+     "docker": [
+      "image inspect --format . serversherpa-api:a1b2c3d4e5f6 serversherpa-portal:a1b2c3d4e5f6 serversherpa-kiosk:a1b2c3d4e5f6 serversherpa-wiki:a1b2c3d4e5f6 serversherpa-learn:a1b2c3d4e5f6 serversherpa-status:a1b2c3d4e5f6",
+      "ps -q --filter label=com.docker.compose.project=ss-one-blue-db",
+      "ps -q --filter label=com.docker.compose.project=ss-one-blue-storage",
+      "ps -q --filter label=com.docker.compose.project=ss-one-blue-api",
+      "ps -q --filter label=com.docker.compose.project=ss-one-blue-web",
+      "ps -q --filter label=com.docker.compose.project=ss-one-blue-status",
+      "image ls --format {{.Repository}}:{{.Tag}} slipway/one-blue",
+      "image prune -f --filter label=slipway.instance=<one-blue>",
+      "image prune -f --filter label=com.docker.compose.project=slipway-one-blue"
+     ]
+    }
+   },
+   "kind": "restore",
+   "options": {
+    "prev_status": "running"
+   },
+   "queued": [
+    [
+     "release",
+     "Check the live release"
+    ],
+    [
+     "manifest",
+     "Read slipway.yml"
+    ],
+    [
+     "settings",
+     "Write the settings"
+    ],
+    [
+     "build",
+     "Build"
+    ],
+    [
+     "check",
+     "Check the backup"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ],
+    [
+     "stop",
+     "Stop the app"
+    ],
+    [
+     "restore",
+     "Restore the database"
+    ],
+    [
+     "start",
+     "Start"
+    ],
+    [
+     "finish",
+     "Switch to the new release"
+    ],
+    [
+     "traffic",
+     "Update Switchyard"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "release",
+     "Check the live release",
+     "succeeded",
+     ""
+    ],
+    [
+     "manifest",
+     "Read slipway.yml",
+     "succeeded",
+     ""
+    ],
+    [
+     "settings",
+     "Write the settings",
+     "succeeded",
+     ""
+    ],
+    [
+     "build",
+     "Build",
+     "skipped",
+     "Reusing the images from deployment <redeploy-blue>"
+    ],
+    [
+     "check",
+     "Check the backup",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "succeeded",
+     ""
+    ],
+    [
+     "stop",
+     "Stop the app",
+     "succeeded",
+     ""
+    ],
+    [
+     "restore",
+     "Restore the database",
+     "succeeded",
+     ""
+    ],
+    [
+     "start",
+     "Start",
+     "succeeded",
+     ""
+    ],
+    [
+     "finish",
+     "Switch to the new release",
+     "succeeded",
+     ""
+    ],
+    [
+     "traffic",
+     "Update Switchyard",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": [
+    {
+     "body": null,
+     "call": "GET /api/config/preview"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts"
+    }
+   ]
+  }
+ },
+ "standalone": {
+  "backup": {
+   "checked": [],
+   "cloudflare": [],
+   "error": "",
+   "hosts": {
+    "solo": {
+     "app": [
+      "has-data a1b2c3d4e5f6-<deploy-2>",
+      "data a1b2c3d4e5f6-<deploy-2>",
+      "revision a1b2c3d4e5f6-<deploy-2>",
+      "pgdump a1b2c3d4e5f6-<deploy-2>",
+      "verify-dump a1b2c3d4e5f6-<deploy-2>"
+     ]
+    }
+   },
+   "kind": "backup",
+   "options": {
+    "restop": false
+   },
+   "queued": [
+    [
+     "release",
+     "Check the live release"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "release",
+     "Check the live release",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": []
+  },
+  "deploy1": {
+   "checked": [],
+   "cloudflare": [],
+   "env_file": "STACK_ENV=solo-prod\nSTACK_DOMAIN=solo.example.com\nSTACK_PROXY_IP=10.0.0.2\nSTACK_REPO_DIR=<TMP>/hosts/host-solo/root/solo-prod/releases/a1b2c3d4e5f6-<deploy-1>\nSTACK_IMAGE_TAG=a1b2c3d4e5f6\nSTACK_APPS=kiosk,wiki,learn,status,mailpit\nSS_LOG_LEVEL=INFO\nPOSTGRES_PASSWORD=pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\nSPACES_SECRET_KEY=ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\nSS_JWT_SECRET=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj\nSS_TOTP_ENCRYPTION_KEY=ttttttttttttttttttttttttttttttttttttttttttt=\nSS_PASSWORD_PEPPER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nSS_WIKI_SERVICE_TOKEN=wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n# Set by Slipway\nSTACK_API_PORT=8000\nSTACK_PORTAL_PORT=8091\nSTACK_SPACES_PORT=9000\nSTACK_KIOSK_PORT=8090\nSTACK_WIKI_PORT=8096\nSTACK_LEARN_PORT=8092\nSTACK_STATUS_PORT=8095\nSTACK_MAILPIT_PORT=8025\n",
+   "error": "",
+   "hosts": {
+    "solo": {
+     "app": [
+      "build a1b2c3d4e5f6-<deploy-1>",
+      "has-data a1b2c3d4e5f6-<deploy-1>",
+      "up a1b2c3d4e5f6-<deploy-1>",
+      "seed a1b2c3d4e5f6-<deploy-1>"
+     ],
+     "docker": [
+      "ps -aq --filter label=com.docker.compose.project=ss-solo-prod-db",
+      "volume ls -q --filter label=com.docker.compose.project=ss-solo-prod-db",
+      "ps -aq --filter label=com.docker.compose.project=ss-solo-prod-storage",
+      "volume ls -q --filter label=com.docker.compose.project=ss-solo-prod-storage",
+      "ps -aq --filter label=com.docker.compose.project=ss-solo-prod-api",
+      "volume ls -q --filter label=com.docker.compose.project=ss-solo-prod-api",
+      "ps -aq --filter label=com.docker.compose.project=ss-solo-prod-web",
+      "volume ls -q --filter label=com.docker.compose.project=ss-solo-prod-web",
+      "ps -aq --filter label=com.docker.compose.project=ss-solo-prod-status",
+      "volume ls -q --filter label=com.docker.compose.project=ss-solo-prod-status",
+      "ps --format docker\t{{.Label \"slipway.instance\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.Ports}}",
+      "image ls --format {{.Repository}}:{{.Tag}} slipway/solo-prod",
+      "image prune -f --filter label=slipway.instance=<solo>",
+      "image prune -f --filter label=com.docker.compose.project=slipway-solo-prod"
+     ]
+    }
+   },
+   "kind": "deploy",
+   "options": {
+    "started_empty": true
+   },
+   "queued": [
+    [
+     "resolve",
+     "Resolve the commit"
+    ],
+    [
+     "source",
+     "Download the source"
+    ],
+    [
+     "upload",
+     "Upload the release"
+    ],
+    [
+     "manifest",
+     "Read slipway.yml"
+    ],
+    [
+     "ports",
+     "Check host ports"
+    ],
+    [
+     "settings",
+     "Write the settings"
+    ],
+    [
+     "build",
+     "Build"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ],
+    [
+     "start",
+     "Start"
+    ],
+    [
+     "finish",
+     "Switch to the new release"
+    ],
+    [
+     "proxy",
+     "Update Switchyard"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "resolve",
+     "Resolve the commit",
+     "succeeded",
+     ""
+    ],
+    [
+     "source",
+     "Download the source",
+     "succeeded",
+     ""
+    ],
+    [
+     "upload",
+     "Upload the release",
+     "succeeded",
+     ""
+    ],
+    [
+     "manifest",
+     "Read slipway.yml",
+     "succeeded",
+     ""
+    ],
+    [
+     "ports",
+     "Check host ports",
+     "succeeded",
+     ""
+    ],
+    [
+     "settings",
+     "Write the settings",
+     "succeeded",
+     ""
+    ],
+    [
+     "build",
+     "Build",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "skipped",
+     "No data yet: commands.has_data found none"
+    ],
+    [
+     "start",
+     "Start",
+     "succeeded",
+     ""
+    ],
+    [
+     "finish",
+     "Switch to the new release",
+     "succeeded",
+     ""
+    ],
+    [
+     "seed",
+     "Add starter content",
+     "succeeded",
+     ""
+    ],
+    [
+     "proxy",
+     "Update Switchyard",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": [
+    {
+     "body": null,
+     "call": "GET /api/config/preview"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts"
+    },
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "api.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8000,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "portal.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8091,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "spaces.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 9000,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "kiosk.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8090,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "wiki.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8096,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "learn.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8092,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "compression": true,
+      "domains": [
+       "status.solo.example.com"
+      ],
+      "enabled": true,
+      "force_https": true,
+      "hsts": false,
+      "notes": "Managed by Slipway: instance solo (<solo>). Domains, upstreams and TLS mode are set from Slipway on every deploy.",
+      "tls_mode": "auto",
+      "type": "proxy",
+      "upstreams": [
+       {
+        "host": "10.0.0.21",
+        "port": 8095,
+        "scheme": "http",
+        "skip_tls_verify": false
+       }
+      ]
+     },
+     "call": "POST /api/hosts"
+    },
+    "changed",
+    {
+     "body": {
+      "note": "Slipway: solo"
+     },
+     "call": "POST /api/config/apply"
+    }
+   ]
+  },
+  "deploy2": {
+   "checked": [],
+   "cloudflare": [],
+   "env_file": "STACK_ENV=solo-prod\nSTACK_DOMAIN=solo.example.com\nSTACK_PROXY_IP=10.0.0.2\nSTACK_REPO_DIR=<TMP>/hosts/host-solo/root/solo-prod/releases/a1b2c3d4e5f6-<deploy-2>\nSTACK_IMAGE_TAG=a1b2c3d4e5f6\nSTACK_APPS=kiosk,wiki,learn,status,mailpit\nSS_LOG_LEVEL=INFO\nPOSTGRES_PASSWORD=pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\nSPACES_SECRET_KEY=ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\nSS_JWT_SECRET=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj\nSS_TOTP_ENCRYPTION_KEY=ttttttttttttttttttttttttttttttttttttttttttt=\nSS_PASSWORD_PEPPER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nSS_WIKI_SERVICE_TOKEN=wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n# Set by Slipway\nSTACK_API_PORT=8000\nSTACK_PORTAL_PORT=8091\nSTACK_SPACES_PORT=9000\nSTACK_KIOSK_PORT=8090\nSTACK_WIKI_PORT=8096\nSTACK_LEARN_PORT=8092\nSTACK_STATUS_PORT=8095\nSTACK_MAILPIT_PORT=8025\n",
+   "error": "",
+   "hosts": {
+    "solo": {
+     "app": [
+      "build a1b2c3d4e5f6-<deploy-2>",
+      "has-data a1b2c3d4e5f6-<deploy-1>",
+      "data a1b2c3d4e5f6-<deploy-1>",
+      "revision a1b2c3d4e5f6-<deploy-1>",
+      "pgdump a1b2c3d4e5f6-<deploy-1>",
+      "verify-dump a1b2c3d4e5f6-<deploy-1>",
+      "up a1b2c3d4e5f6-<deploy-2>"
+     ],
+     "docker": [
+      "ps --format docker\t{{.Label \"slipway.instance\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.Ports}}",
+      "system df -v --format {{range .Volumes}}{{.Name}} {{.Size}}{{\"",
+      "\"}}{{end}}",
+      "image ls --format {{.Repository}}:{{.Tag}} slipway/solo-prod",
+      "image prune -f --filter label=slipway.instance=<solo>",
+      "image prune -f --filter label=com.docker.compose.project=slipway-solo-prod"
+     ]
+    }
+   },
+   "kind": "deploy",
+   "options": {},
+   "queued": [
+    [
+     "resolve",
+     "Resolve the commit"
+    ],
+    [
+     "source",
+     "Download the source"
+    ],
+    [
+     "upload",
+     "Upload the release"
+    ],
+    [
+     "manifest",
+     "Read slipway.yml"
+    ],
+    [
+     "ports",
+     "Check host ports"
+    ],
+    [
+     "settings",
+     "Write the settings"
+    ],
+    [
+     "build",
+     "Build"
+    ],
+    [
+     "backup",
+     "Back up the data"
+    ],
+    [
+     "start",
+     "Start"
+    ],
+    [
+     "finish",
+     "Switch to the new release"
+    ],
+    [
+     "proxy",
+     "Update Switchyard"
+    ]
+   ],
+   "status": "succeeded",
+   "steps": [
+    [
+     "resolve",
+     "Resolve the commit",
+     "succeeded",
+     ""
+    ],
+    [
+     "source",
+     "Download the source",
+     "succeeded",
+     ""
+    ],
+    [
+     "upload",
+     "Upload the release",
+     "succeeded",
+     ""
+    ],
+    [
+     "manifest",
+     "Read slipway.yml",
+     "succeeded",
+     ""
+    ],
+    [
+     "ports",
+     "Check host ports",
+     "succeeded",
+     ""
+    ],
+    [
+     "settings",
+     "Write the settings",
+     "succeeded",
+     ""
+    ],
+    [
+     "build",
+     "Build",
+     "succeeded",
+     ""
+    ],
+    [
+     "backup",
+     "Back up the data",
+     "succeeded",
+     ""
+    ],
+    [
+     "start",
+     "Start",
+     "succeeded",
+     ""
+    ],
+    [
+     "finish",
+     "Switch to the new release",
+     "succeeded",
+     ""
+    ],
+    [
+     "proxy",
+     "Update Switchyard",
+     "succeeded",
+     ""
+    ]
+   ],
+   "submitted": [],
+   "switchyard": [
+    {
+     "body": null,
+     "call": "GET /api/config/preview"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/1"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/2"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/3"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/4"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/5"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/6"
+    },
+    {
+     "body": null,
+     "call": "GET /api/hosts/7"
+    }
+   ]
+  }
+ }
+}

@@ -34,6 +34,9 @@ services:
         SLIPWAY_BUILT_AT: ${SLIPWAY_BUILT_AT:-}
     image: slipway:latest
     restart: unless-stopped
+    # Time to stop cleanly: a running Terraform gets 30 s to save its state after being asked to
+    # stop. With Docker's 10 s default, a half-made VM is left for the next deploy to clean up.
+    stop_grace_period: 60s
     depends_on:
       db:
         condition: service_healthy
@@ -43,6 +46,10 @@ services:
       # To use another database, override SLIPWAY_DATABASE_URL; a password written in that URL wins.
       SLIPWAY_DATABASE_URL: postgresql+asyncpg://slipway@db:5432/slipway
       SLIPWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-slipway}
+    volumes:
+      # Stored snapshots, encrypted with SLIPWAY_ENCRYPTION_KEY. Back this folder up with data/postgres (and
+      # keep the key): without it the snapshots can't be opened. It must belong to uid 10001 with mode 700.
+      - ${SLIPWAY_DATA_DIR:-./data}/files:/var/lib/slipway
     # Behind a reverse proxy: set SLIPWAY_FORWARDED_ALLOW_IPS in .env to the address or CIDR the proxy connects
     # from (as seen inside this container). Otherwise every client shares the proxy's IP, so failed logins
     # from anyone rate-limit everyone. Never use "*" (any client could forge its IP). If the proxy runs on

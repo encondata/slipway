@@ -23,9 +23,12 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Permissions | Role-based: built-in `admin`, `maintainer`, `developer`, `viewer` + custom roles; users can hold several roles; no privilege escalation (you can only grant, remove or manage what you hold: `users:write` only reaches users whose every permission you also have); last-admin protection; the UI only shows what your roles allow |
 | Repositories | Sync from GitHub (owner, collaborator, org repos), detect `Dockerfile` / compose file, README preview, branch picker. Repositories are addressed by their GitHub id, so renames and transfers are followed and a repository re-created under an old name is never deployed |
 | Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
-| Instances | Repo + branch + host + Dockerfile *or* docker compose; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
+| Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
 | Analytics | Over the last 7, 30 or 90 days: deploy count, success rate, median and p90 deploy time and time to recover, each against the previous period; deploys per day by outcome; per instance (with the ones still failing marked), recent failures with their first error line, and who deployed. Per host: CPU load, memory and Docker disk use over time, from a sample stored at every successful health check (raw samples kept 8 days, hourly averages and peaks 400 days; `SLIPWAY_METRICS_RETENTION_INTERVAL` sets how often old samples are rolled up, 0 turns it off). Charts are drawn by Slipway itself, with tooltips and a table view; `GET /api/v1/analytics/deploys` and `/hosts` return the same numbers |
+| Environments | An app from one branch in one slot or in Blue/Green slots that share a data server, on your SSH hosts: deploys go to the idle slot, Activate moves the names in Switchyard after a smoke test and puts them back if a check fails, Switch back, Discard, Cloudflare DNS records ([docs/environments.md](docs/environments.md)) |
+| DigitalOcean | An environment's slots on droplets Slipway makes, with managed PostgreSQL, a Spaces bucket, a load balancer with Let's Encrypt certificates and a cloud firewall; a confirmed monthly cost, production safeguards, and backups kept on the Slipway server ([docs/digitalocean.md](docs/digitalocean.md)) |
+| VMs | An environment's slots and data server on VMs Slipway makes on Proxmox (Terraform) or standalone ESXi (pyvmomi), with static addresses, resizes at the next deploy, VM snapshots and revert ([docs/machines.md](docs/machines.md)) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
 | UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
 
@@ -39,11 +42,11 @@ curl -fsSL https://raw.githubusercontent.com/encondata/slipway/main/install.sh |
 
 It asks where to install (default `~/slipway`, or `/mnt/user/slipway` on Unraid) and the address people
 will use, clones the repository, writes `.env` with fresh secrets and an administrator account, builds the
-image and starts Slipway with PostgreSQL. The database lives in `data/postgres` inside the install folder
-(set `SLIPWAY_DATA_DIR` in `.env` to move it). Run the same command again to update: it keeps `.env` and the
-data, and only prints the admin password while it still works. Or upgrade from Slipway itself: an admin can
-see the running version and start an upgrade under Updates, with a backup and automatic roll back (see
-[docs/updates.md](docs/updates.md)). `SLIPWAY_DIR`, `SLIPWAY_BASE_URL`,
+image and starts Slipway with PostgreSQL. The database lives in `data/postgres` inside the install folder and
+stored snapshots in `data/files` (set `SLIPWAY_DATA_DIR` in `.env` to move both). Run the same command again to
+update: it keeps `.env` and the data, and only prints the admin password while it still works. Or upgrade from
+Slipway itself: an admin can see the running version and start an upgrade under Updates, with a backup and
+automatic roll back (see [docs/updates.md](docs/updates.md)). `SLIPWAY_DIR`, `SLIPWAY_BASE_URL`,
 `SLIPWAY_PORT` and `SLIPWAY_ADMIN_EMAIL` answer the questions up front; `SLIPWAY_REPO` and
 `SLIPWAY_BRANCH` pick another source. Slipway serves plain HTTP on port 8000 for a TLS reverse proxy.
 GitHub sign-in needs an OAuth app: the installer's `.env` says where to put its ID and secret.
@@ -54,6 +57,7 @@ GitHub sign-in needs an OAuth app: the installer's `.env` says where to put its 
 cp .env.example .env
 docker compose run --rm --no-deps -e SLIPWAY_SKIP_MIGRATIONS=1 slipway slipway generate-secrets   # paste all three values into .env
 # edit .env: SLIPWAY_BASE_URL, SLIPWAY_ADMIN_EMAIL/PASSWORD, GitHub OAuth app
+mkdir -p data/files && sudo chown 10001:10001 data/files && sudo chmod 700 data/files   # stored snapshots
 docker compose up -d --build
 ```
 
@@ -71,6 +75,15 @@ takes the client IP from `X-Forwarded-For` for rate limiting and the audit log. 
 (`127.0.0.1`) behind a proxy and every client shares the proxy's IP, so anyone's failed logins slow
 everyone down. Never use `*`: any client could then forge its IP. If the proxy runs on the same machine,
 publish Slipway on loopback only (`"127.0.0.1:${SLIPWAY_PORT:-8000}:8000"` in docker-compose.yml).
+The proxy must also accept request bodies as large as the biggest snapshot you will upload (up to
+`SLIPWAY_SNAPSHOT_MAX_BYTES`, 20 GiB by default), for example `client_max_body_size 20g;` in nginx.
+
+**Backing up Slipway itself:** back up `data/postgres` and `data/files` together (stop the stack first, or
+dump the database with `pg_dump`), **and** keep `SLIPWAY_ENCRYPTION_KEY` somewhere safe. Stored snapshots in
+`data/files` are encrypted under keys that only the database holds, encrypted in turn with that key: without
+the key, they can't be opened. `data/files` must belong to uid 10001 with mode 700 (the installer sets this; by
+hand: `sudo chown 10001:10001 data/files && sudo chmod 700 data/files`). If it isn't writable, snapshots are
+unavailable and say why, while deploys carry on.
 
 **First admin:** whichever comes first becomes admin:
 - `SLIPWAY_ADMIN_EMAIL`/`SLIPWAY_ADMIN_PASSWORD` on an empty database. The password must be at least 10
@@ -210,6 +223,38 @@ deleted, are removed from Switchyard. A hostname is unique across instances.
 - A Switchyard problem never fails a deploy: the containers are running, and the problem is in the deploy log
   and on the instance page.
 
+### Apps (slipway.yml)
+
+A repository can describe how it is deployed in a `slipway.yml` at its root (or another path set on the
+instance). Choose **App (slipway.yml)** as the build source: the form reads the manifest from the chosen branch
+and asks for the settings it names, and shows its optional services. The manifest gives:
+
+- an **`env_file`** template (the app's own `.env.example`) that Slipway fills in and writes to
+  `<instance folder>/shared/.env` (mode 600), refusing to deploy while a value is still the manifest's
+  `placeholder`, such as `CHANGEME`;
+- **settings** asked for on the instance, and **vars** Slipway sets itself (`{slipway.slug}`,
+  `{slipway.release}`, `{slipway.sha12}`, `{slipway.env_dir}`…);
+- **secrets** Slipway generates on the first deploy (`hex`, `fernet` or `token`) and keeps, encrypted, with the
+  instance. Their names are listed on the instance page; their values are never shown. Changing one can lock an
+  app out of its own data, so Slipway never regenerates them; an environment variable of the same name
+  replaces one;
+- **services** with their default port, the variable that sets the host port and a hostname. Taken ports move to
+  the next free one and reach the app through that variable, and the hostnames are published in Switchyard like
+  any instance's;
+- the **Compose projects** the app runs (for status, logs, start/stop and delete), the **images** each release
+  builds (removed with the release unless something still uses them), and the **commands** that build, start
+  and stop it, run from the release on the host.
+
+An app's commands run on the host as trusted code, like a compose file. See
+[docs/examples/serversherpa.slipway.yml](docs/examples/serversherpa.slipway.yml) for a full manifest, and
+[docs/manifest.md](docs/manifest.md) for the whole format.
+
+Every deployment, whatever its build source, runs as numbered **steps** shown on the deployment page, each
+starting a section of the log. **Retry** runs a failed deployment's commit again (`POST
+/api/v1/deployments/{id}/retry`, needs `deployments:create`): the downloaded release and the build are reused
+when they are still on the host (a release that failed after its build is kept for that), and the settings,
+ports and start run again.
+
 ### Claiming containers Slipway did not deploy
 
 The host page lists **unmanaged containers**: compose projects (grouped by `com.docker.compose.project`) and
@@ -296,11 +341,26 @@ Interactive API docs: `/api/docs`.
 | `repos:sync`, `deployments:create`, `instances:operate` (start/stop/restart) | ✓ | ✓ | ✓ | |
 | `hosts:write`, `instances:write`, `audit:read`, `users:read`, `roles:read` | ✓ | ✓ | | |
 | `users:write`, `roles:write`, `settings:write` | ✓ | | | |
+| `data:read` (backups and snapshots: names, sizes, dates) | ✓ | ✓ | ✓ | ✓ |
+| `data:backup` (back up now, take snapshots), `data:restore` (restore same-key backups, roll back) | ✓ | ✓ | ✓ | |
+| `data:reset` (reset data, seed from snapshots, restore old keys, delete backups and snapshots, overrides), `snapshots:upload` | ✓ | ✓ | | |
+| `snapshots:download` (passphrase-encrypted downloads; seeding another repository's instances) | ✓ | | | |
+| `environments:read` | ✓ | ✓ | ✓ | ✓ |
+| `traffic:switch`, `providers:read` (DigitalOcean, Proxmox and ESXi accounts, never their secrets) | ✓ | ✓ | ✓ | |
+| `environments:write`, `environments:delete`, `providers:spend` (confirm a monthly cost), `machines:write` (make, resize and snapshot VMs) | ✓ | ✓ | | |
+| `providers:write` (add, change, test, trust and remove those accounts) | ✓ | | | |
+
+See [docs/environments.md](docs/environments.md#permissions) for what the environment, traffic, provider and machine permissions allow.
 
 `hosts:write` and `instances:write` are privileged. Whoever holds them controls SSH credentials and
 container mounts, which effectively means root on those hosts. Pinning a host key on first contact
 needs `hosts:write`; later health checks only need `hosts:read`. Through Slipway, environment variable values
 are only readable with `instances:write`.
+
+`data:*` does not include `snapshots:*`. `snapshots:upload` is privileged because a snapshot's database runs as
+SQL inside the app it seeds; `snapshots:download` because a snapshot holds a whole database and its identity
+keys. A snapshot's app name is a guard against mistakes, not against attackers: deploy access together with push
+access already means root on the host.
 
 **Compose instances run repository-defined containers as root.** Slipway runs the compose file from the
 deployed branch as is (bind mounts, `privileged`, host namespaces and so on), ignoring the instance's port

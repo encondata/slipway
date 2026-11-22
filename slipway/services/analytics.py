@@ -24,7 +24,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from slipway.models import Deployment, DeploymentStatus, Host, Instance, Repository, User
+from slipway.models import Deployment, DeploymentKind, DeploymentStatus, Host, Instance, Repository, User
 
 ALLOWED_DAYS = (7, 30, 90)
 # A deployment with no trigger: every deploy is started by a person today, so the person was deleted since.
@@ -77,8 +77,12 @@ def _count_where(condition):
     return func.count(case((condition, 1)))
 
 
+# Only deploys count: the deployments table also holds data jobs (backup, restore...) and environment jobs.
+_DEPLOYS = Deployment.kind == DeploymentKind.DEPLOY
+
+
 def _in(start: datetime, end: datetime):
-    return and_(Deployment.created_at >= start, Deployment.created_at <= end)
+    return and_(_DEPLOYS, Deployment.created_at >= start, Deployment.created_at <= end)
 
 
 async def _status_counts(db: AsyncSession, start: datetime, end: datetime) -> dict[str, int]:
@@ -117,7 +121,7 @@ async def _recovery_rows(db: AsyncSession, prev_start: datetime, end: datetime) 
     )
     anchor = (
         select(Deployment.instance_id, func.max(Deployment.created_at).label("at"))
-        .where(Deployment.status == DeploymentStatus.SUCCEEDED, Deployment.created_at < prev_start)
+        .where(_DEPLOYS, Deployment.status == DeploymentStatus.SUCCEEDED, Deployment.created_at < prev_start)
         .group_by(Deployment.instance_id)
         .subquery()
     )
@@ -125,6 +129,7 @@ async def _recovery_rows(db: AsyncSession, prev_start: datetime, end: datetime) 
         select(Deployment.instance_id, Deployment.status, Deployment.created_at, Deployment.finished_at)
         .outerjoin(anchor, anchor.c.instance_id == Deployment.instance_id)
         .where(
+            _DEPLOYS,
             Deployment.instance_id.in_(recovered),
             Deployment.status.in_(_OUTCOMES),
             Deployment.created_at <= end,
@@ -194,7 +199,7 @@ async def _latest(db: AsyncSession, ids: list[uuid.UUID], statuses=None) -> dict
     """(id, status, created_at, finished_at) of each instance's latest deployment, optionally among ``statuses``."""
     if not ids:
         return {}
-    conditions = [Deployment.instance_id.in_(ids)]
+    conditions = [_DEPLOYS, Deployment.instance_id.in_(ids)]
     if statuses:
         conditions.append(Deployment.status.in_(statuses))
     newest = (
@@ -338,7 +343,7 @@ async def deploy_stats(db: AsyncSession, *, days: int, now: datetime | None = No
         (
             await db.execute(
                 select(Deployment.status, func.count())
-                .where(Deployment.status.in_((DeploymentStatus.QUEUED, DeploymentStatus.RUNNING)))
+                .where(_DEPLOYS, Deployment.status.in_((DeploymentStatus.QUEUED, DeploymentStatus.RUNNING)))
                 .group_by(Deployment.status)
             )
         ).all()

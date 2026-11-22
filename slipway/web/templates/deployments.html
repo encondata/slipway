@@ -4,12 +4,15 @@
 {% block content %}
 <div class="page-head">
   <div>
-    <h1>Deployments</h1>
-    <p class="lede">Every build and release Slipway has run, newest first.</p>
+    {% if environment %}<div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}<span>{{ environment.name }}</span></div>{% endif %}
+    <h1>Deployments{% if environment %} of {{ environment.name }}{% endif %}</h1>
+    <p class="lede">{% if environment %}Every job of {{ environment.name }}: its slots'{{ ", its data server's" if environment.data_mode == "server" }} and its own, newest first.{% else %}Every build and release Slipway has run, newest first.{% endif %}</p>
   </div>
+  {% set env_q = ("environment=" ~ environment.id) if environment else "" %}
   <nav class="segmented" aria-label="Filter by status">
     {% for key, label in [("", "All"), ("running", "Building"), ("succeeded", "Deployed"), ("failed", "Failed")] %}
-    <a href="/deployments{% if key %}?status={{ key }}{% endif %}" class="{{ 'active' if status == key }}">{{ label }}</a>
+    {% set q = [("status=" ~ key) if key else "", env_q]|select|join("&") %}
+    <a href="/deployments{% if q %}?{{ q }}{% endif %}" class="{{ 'active' if status == key }}">{{ label }}</a>
     {% endfor %}
   </nav>
 </div>
@@ -17,15 +20,23 @@
 <section class="card">
   {% if deployments %}
   {% set can_hosts, can_repos, can_instances = auth.can(Perm.HOSTS_READ), auth.can(Perm.REPOS_READ), auth.can(Perm.INSTANCES_READ) %}
+  {% set can_envs = auth.can(Perm.ENVIRONMENTS_READ) %}
+  {#- The Environment column shows when a listed job belongs to one (phase 3 §12.5); standalone lists are as before. #}
+  {% set env_col = any_env or environment %}
   <div class="table-wrap"><table class="table">
-    <thead><tr><th>Instance</th><th>Status</th><th>Commit</th>{% if can_hosts %}<th>Host</th>{% endif %}<th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
+    <thead><tr><th>Instance</th>{% if env_col %}<th>Environment</th>{% endif %}<th>Status</th><th>Commit</th>{% if can_hosts %}<th>Host</th>{% endif %}<th>Triggered by</th><th>Started</th><th>Duration</th><th></th></tr></thead>
     <tbody>
     {% for d in deployments %}
       <tr>
+        {% if d.instance is none %}
+        <td><strong>{{ d|dep_label }}</strong>{% if can_repos and d.environment %}<div class="subtle">{{ d.environment.repository.full_name }}</div>{% endif %}</td>
+        {% else %}
         <td>{% if can_instances %}<a href="/instances/{{ d.instance.id }}"><strong>{{ d.instance.name }}</strong></a>{% else %}<strong>{{ d.instance.name }}</strong>{% endif %}{% if can_repos %}<div class="subtle">{{ d.instance.repository.full_name }}</div>{% endif %}</td>
-        <td>{{ badge("deployment", d.status) }}</td>
+        {% endif %}
+        {% if env_col %}<td>{% if d.environment %}{% if can_envs %}<a href="/environments/{{ d.environment.id }}">{{ d.environment.name }}</a>{% else %}{{ d.environment.name }}{% endif %}{% if d.instance and d.instance.slot %} <span class="subtle">· {{ d.instance.slot }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>{% endif %}
+        <td>{{ badge("deployment", d.status, d.kind) }}{% if d.environment_id %}<div class="subtle">{{ d|dep_label }}</div>{% elif d.kind and d.kind != "deploy" %}<div class="subtle">{{ d.kind|kind_label }}</div>{% endif %}</td>
         <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span><div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div></td>
-        {% if can_hosts %}<td class="muted">{{ d.instance.host.name }}</td>{% endif %}
+        {% if can_hosts %}<td class="muted">{{ d.instance.host.name if d.instance else "—" }}</td>{% endif %}
         <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>
         <td class="muted nowrap" title="{{ d.created_at|dt }}">{{ d.created_at|timeago }}</td>
         <td class="muted">{{ d.duration_seconds|duration }}</td>
