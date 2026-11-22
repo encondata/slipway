@@ -82,6 +82,7 @@ KIND_LABELS = {
     "activate": "Activate", "publish": "Publish names", "discard": "Discard", "remove_slot": "Remove slot",
     "teardown": "Delete environment", "certificate": "Renew the certificate", "deactivate": "Take off the air",
     "vm_snapshot": "Take a VM snapshot", "vm_revert": "Revert to a VM snapshot", "vm_drop": "Delete a VM snapshot",
+    "migrate": "Migrate",
 }
 # How a job is named inside a sentence ("failed deployment 1a2b3c4d").
 KIND_NOUNS = {
@@ -90,6 +91,7 @@ KIND_NOUNS = {
     "activate": "activation", "publish": "name publishing", "discard": "discard", "remove_slot": "slot removal",
     "teardown": "teardown", "certificate": "certificate renewal", "deactivate": "deactivation",
     "vm_snapshot": "VM snapshot", "vm_revert": "VM revert", "vm_drop": "VM snapshot deletion",
+    "migrate": "migration",
 }
 # Steps that replace or delete data on a data job (I1); a job that failed in one of them leaves a hold.
 REPLACING_STEPS = ("reset", "wipe", "restore", "files", "after_import")  # wipe: managed data (P4 §10.6)
@@ -1680,10 +1682,16 @@ async def seed_change_text(db: AsyncSession, instance: Instance, dep: Deployment
     return f"{started}, and {instance.name} now starts {now}: deploy the instance instead"
 
 
+MIGRATE_AGAIN = "A migration isn't retried: start a new one with Migrate on the instance page"
+
+
 async def retry_refusal(db: AsyncSession, instance: Instance, dep: Deployment) -> str | None:
     """What would refuse the job if it were started again today (§8.1): a retry never gets around a check the
     first attempt had to pass. None when nothing does."""
     kind = dep.kind or DeploymentKind.DEPLOY
+    if kind == DeploymentKind.MIGRATE:
+        # Its checks (the new host, its folder) are the Migrate dialog's: a retry would skip them.
+        return MIGRATE_AGAIN
     if kind in (DeploymentKind.DEPLOY, DeploymentKind.SNAPSHOT, DeploymentKind.ADMIN, DeploymentKind.CONTENT):
         # Deploy is off while the data is held (§8.4); the retry the hold text means is the held job's own.
         held = await hold_text(db, instance)

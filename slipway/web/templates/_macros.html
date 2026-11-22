@@ -102,3 +102,10 @@
 {%- if c -%}<span class="badge {{ 'success' if c.ok else 'error' }}" title="{{ c.title }}">{{ "OK" if c.ok else "Failed" }}</span>
 {%- else -%}<span class="subtle">Not checked</span>{%- endif -%}
 {%- endmacro %}
+
+{# A migration in a list of jobs: which hosts it went between (the names only with show_hosts). #}
+{% macro migration_chip(d, show_hosts=True) -%}
+{%- if d.is_migration -%}
+<span class="chip" title="Migration">{{ icon("hosts", "i-sm") }} {% if show_hosts %}{{ (d.migration or {}).source_host }} {{ icon("arrow-right", "i-sm") }} {{ (d.migration or {}).target_host }}{% else %}Migration{% endif %}</span>
+{%- endif -%}
+{%- endmacro %}

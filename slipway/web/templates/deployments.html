@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, badge, empty %}
+{% from "_macros.html" import icon, badge, empty, migration_chip %}
 {#- The History page (/deployments/history): every deployment, flat. /deployments itself is deployment_groups.html. #}
 {% block title %}Deployment history{% endblock %}
 {% block content %}
@@ -38,7 +38,7 @@
         {% endif %}
         {% if env_col %}<td>{% if d.environment %}{% if can_envs %}<a href="/environments/{{ d.environment.id }}">{{ d.environment.name }}</a>{% else %}{{ d.environment.name }}{% endif %}{% if d.instance and d.instance.slot %} <span class="subtle">· {{ d.instance.slot }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>{% endif %}
         <td>{{ badge("deployment", d.status, d.kind) }}{% if d.environment_id %}<div class="subtle">{{ d|dep_label }}</div>{% elif d.kind and d.kind != "deploy" %}<div class="subtle">{{ d.kind|kind_label }}</div>{% endif %}</td>
-        <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span><div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div></td>
+        <td><span class="chip">{{ icon("branch", "i-sm") }} {{ d.branch }}</span> <span class="mono subtle">{{ d.short_sha }}</span> {{ migration_chip(d, auth.can(Perm.HOSTS_READ)) }}<div class="subtle truncate" style="max-width: 300px">{{ d.commit_message or "" }}</div></td>
         {% if can_hosts %}<td class="muted">{{ d.instance.host.name if d.instance else "—" }}</td>{% endif %}
         <td class="muted">{{ d.triggered_by.display_name if d.triggered_by else "—" }}</td>
         <td class="muted nowrap" title="{{ d.created_at|dt }}">{{ d.created_at|timeago }}</td>

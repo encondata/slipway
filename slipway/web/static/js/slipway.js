@@ -43,6 +43,7 @@
  *
  * Host setup:
  *   <section data-host-setup="/api/v1/hosts/<id>/setup">  (follows Slipway setting up a new server)
+ *   <form data-migrate-form="<check url>">                (Check shows what a migration copies; Migrate sends the unticked items as skip)
  *
  * Analytics:
  *   <div class="chart-plot" data-chart='{...}'>             (chart tooltips on hover and from the keyboard)
@@ -1263,6 +1264,98 @@
     const list = btn.closest("[data-render=unmanaged]");
     const group = list && list._groups && list._groups[Number(btn.dataset.claim)];
     if (group) openClaim(group);
+  });
+
+  // ------------------------------------------------------- migrate dialog
+  // Check asks the server what the migration would copy; Migrate stays disabled until a check passes.
+  function sizeText(kb) {
+    if (kb === null || kb === undefined) return "size unknown";
+    let v = kb, unit = "KiB";
+    for (const u of ["MiB", "GiB", "TiB"]) { if (v < 1024) break; v /= 1024; unit = u; }
+    return (unit === "KiB" || v >= 100 ? Math.round(v) : v.toFixed(1)) + " " + unit;
+  }
+
+  function migrateState(form) {
+    const plan = form._plan;
+    const submit = $("[data-migrate-submit]", form);
+    if (!plan) { submit.disabled = true; return; }
+    const skip = $$("[data-migrate-item]", form).filter((c) => !c.checked).map((c) => c.value);
+    $('[name="skip"]', form).value = JSON.stringify(skip);
+    const items = plan.items.filter((i) => i.copy && !skip.includes(i.id));
+    const conflicts = items.filter((i) => i.conflict);
+    const total = items.reduce((n, i) => n + (i.size_kb || 0), 0);
+    const summary = $("[data-migrate-summary]", form);
+    if (summary) {
+      summary.textContent = plan.problems.length || conflicts.length
+        ? "Fix or untick what is marked before migrating."
+        : `${plan.running ? "It is stopped while " : "Slipway copies "}about ${sizeText(total)} ${plan.running ? "is copied, then built and started on " + plan.target + "." : "to " + plan.target + ", then builds and starts it there."}`;
+    }
+    submit.disabled = Boolean(plan.problems.length || conflicts.length);
+  }
+
+  function renderMigratePlan(form, plan) {
+    const box = $("[data-migrate-plan]", form);
+    const kindText = { folder: "Settings", volume: "Volume", bind: "Path" };
+    const rows = plan.items.map((i) => {
+      const head = `<strong>${esc(kindText[i.kind] || i.kind)}</strong> <span class="mono" style="word-break: break-all">${esc(i.name)}</span>`;
+      if (!i.copy) return `<div class="check" style="opacity: .7"><input type="checkbox" disabled><span>${head}<br><span class="subtle">${esc(i.note)}</span></span></div>`;
+      const extra = i.conflict ? `<br><span style="color: var(--error)">${esc(i.conflict)}</span>` : (i.note ? `<br><span class="subtle">${esc(i.note)}</span>` : "");
+      return `<label class="check"><input type="checkbox" data-migrate-item value="${esc(i.id)}" ${i.skipped ? "" : "checked"}><span>${head} <span class="subtle">· ${esc(sizeText(i.size_kb))}</span>${extra}</span></label>`;
+    }).join("");
+    const list = (items, cls) => items.length
+      ? `<div class="callout ${cls}"><ul style="margin: 0; padding-left: 18px">${items.map((p) => `<li>${esc(p)}</li>`).join("")}</ul></div>` : "";
+    box.innerHTML =
+      list(plan.problems, "error") +
+      `<div class="subtle">From <span class="mono">${esc(plan.source_dir)}</span> on ${esc(plan.source)} to <span class="mono">${esc(plan.target_dir)}</span> on ${esc(plan.target)}. Ticked items are copied; an unticked one is left on ${esc(plan.source)}, and the new host's own is used.</div>` +
+      `<div class="stack" style="gap: 8px">${rows}</div>` +
+      list(plan.notes, "primary") +
+      `<p class="lede" style="margin: 0" data-migrate-summary></p>`;
+    box.hidden = false;
+    form._plan = plan;
+    migrateState(form);
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("[data-migrate-check]");
+    if (!btn) return;
+    const form = btn.closest("form[data-migrate-form]");
+    const host = $('[name="host_id"]', form).value;
+    if (!host) return formError(form, "Choose the host to migrate to");
+    formError(form, "");
+    const body = { host_id: host, skip: [] };
+    const dir = $('[name="deploy_dir"]', form).value.trim();
+    if (dir) body.deploy_dir = dir;
+    setLoading(btn, true);
+    try {
+      renderMigratePlan(form, await api("POST", form.dataset.migrateForm, body));
+    } catch (err) {
+      form._plan = null;
+      migrateState(form);
+      if (!formError(form, err.message)) toast(err.message, "error");
+    } finally {
+      setLoading(btn, false);
+    }
+  });
+
+  document.addEventListener("change", (ev) => {
+    const form = ev.target.closest("form[data-migrate-form]");
+    if (!form) return;
+    if (ev.target.matches("[data-migrate-item]")) return migrateState(form);
+    if (ev.target.matches("[data-migrate-input]")) {
+      form._plan = null;
+      $("[data-migrate-plan]", form).hidden = true;
+      const opt = $('[name="host_id"]', form).selectedOptions[0];
+      if (opt && opt.dataset.root) $('[name="deploy_dir"]', form).placeholder = `${opt.dataset.root}/${form.dataset.slug || ""}`.replace(/\/$/, "/<instance>");
+      migrateState(form);
+    }
+  });
+  document.addEventListener("input", (ev) => {
+    const form = ev.target.closest("form[data-migrate-form]");
+    if (form && ev.target.matches('[name="deploy_dir"]') && form._plan) {
+      form._plan = null;
+      $("[data-migrate-plan]", form).hidden = true;
+      migrateState(form);
+    }
   });
 
   // ------------------------------------------------------- snapshot upload

@@ -161,7 +161,7 @@ async def test_failed_instance_cannot_change_host_or_build(admin_client, change)
     inst_id, host_id, other_id = await _add_instance("failed", deployment={"status": "failed", "started_at": utcnow()})
     body = {k: (str(other_id) if v == "other" else v) for k, v in change.items()}
     r = await admin_client.patch(f"/api/v1/instances/{inst_id}", json=body)
-    assert r.status_code == 400 and "Delete it" in r.json()["detail"]
+    assert r.status_code == 400 and "use Migrate" in r.json()["detail"]
     inst = await _get(Instance, inst_id)
     assert inst.host_id == host_id and inst.build_source == "dockerfile"
     # Other edits, and resending the current values (as the edit form does), still work.

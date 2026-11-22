@@ -572,6 +572,23 @@ def blocker(preview: dict[str, Any], own_edits: int) -> str | None:
 _blocker = blocker
 
 
+async def apply_blocker(config: SwitchyardConfig, *, client: SwitchyardClient | None = None) -> str | None:
+    """Why a sync now would leave its changes staged instead of applying them, or None.
+
+    A migration asks first: once the old host's containers are stopped, a staged change would leave the
+    hostnames pointing at them. Edits an environment's unresolved switch holds count against it (``blocked``).
+    """
+    sy = client or SwitchyardClient(config)
+    try:
+        preview = await sy.preview()
+    except SwitchyardError as exc:
+        return str(exc)
+    finally:
+        if client is None:
+            await sy.__aexit__(None, None, None)
+    return blocked(preview, await own_edits(preview))
+
+
 async def _sync(sy: SwitchyardClient, instance: Instance, targets: list[Target],
                 previous: dict[str, dict[str, Any]], say: Log) -> list[dict[str, Any]]:
     async with lock:

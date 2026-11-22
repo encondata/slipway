@@ -23,7 +23,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | Permissions | Role-based: built-in `admin`, `maintainer`, `developer`, `viewer` + custom roles; users can hold several roles; no privilege escalation (you can only grant, remove or manage what you hold: `users:write` only reaches users whose every permission you also have); last-admin protection; the UI only shows what your roles allow |
 | Repositories | Sync from GitHub (owner, collaborator, org repos), detect `Dockerfile` / compose file, README preview, branch picker. Repositories are addressed by their GitHub id, so renames and transfers are followed and a repository re-created under an old name is never deployed |
 | Hosts | Add Linux/Docker hosts; Slipway generates an ed25519 key (or use your own key / password); SSH host key pinned on first check (TOFU) and enforced afterwards; health: CPU, RAM, Docker version, containers; background polling (each host checked independently); list containers Slipway did not deploy and claim them as instances |
-| Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy |
+| Instances | Repo + branch + host + Dockerfile, docker compose *or* an app described by its `slipway.yml`; encrypted env vars, port and volume mappings; deploy, start/stop/restart, live `docker ps`, container logs, destroy; migrate a Dockerfile or compose instance to another host |
 | Deployments | Source tarball fetched by Slipway and uploaded over SFTP (your GitHub token never touches the host), build output streamed live into the UI, a fresh release directory per deployment with `current` switched only after a successful build, old releases plus superseded images pruned, build logs capped at about 1 MB (start and end kept) |
 | Analytics | Over the last 7, 30 or 90 days: deploy count, success rate, median and p90 deploy time and time to recover, each against the previous period; deploys per day by outcome; per instance (with the ones still failing marked), recent failures with their first error line, and who deployed. Per host: CPU load, memory and Docker disk use over time, from a sample stored at every successful health check (raw samples kept 8 days, hourly averages and peaks 400 days; `SLIPWAY_METRICS_RETENTION_INTERVAL` sets how often old samples are rolled up, 0 turns it off). Charts are drawn by Slipway itself, with tooltips and a table view; `GET /api/v1/analytics/deploys` and `/hosts` return the same numbers |
 | Environments | An app from one branch in one slot or in Blue/Green slots that share a data server, on your SSH hosts: deploys go to the idle slot, Activate moves the names in Switchyard after a smoke test and puts them back if a check fails, Switch back, Discard, Cloudflare DNS records ([docs/environments.md](docs/environments.md)) |
@@ -254,6 +254,32 @@ starting a section of the log. **Retry** runs a failed deployment's commit again
 /api/v1/deployments/{id}/retry`, needs `deployments:create`): the downloaded release and the build are reused
 when they are still on the host (a release that failed after its build is kept for that), and the settings,
 ports and start run again.
+### Migrating an instance to another host
+
+*Migrate* on the instance page (needs `instances:write` and `deployments:create`) moves a deployed Dockerfile
+or compose instance to another host added over SSH. Slots of an environment and slipway.yml apps can't be
+migrated yet: the button is shown disabled with the reason. *Check* first lists what would be copied, with sizes, and anything in the way; nothing
+changes until you start it. The migration shows up in the deployment history as a job of its own, in numbered steps:
+
+1. Slipway checks both hosts again. The instance's folder must be free on the new host, and so must each
+   volume and mounted path it copies. With hostnames, Switchyard must be able to apply right away, so the
+   hostnames never point at stopped containers.
+2. It stops the instance on the old host so the data does not change while it is copied.
+3. It copies the `shared` files of the instance's folder, every named volume the containers use and every
+   bind-mounted path outside the instance's folder (to the same path). The data streams from host to host
+   through Slipway over the two SSH connections it already has, so neither host needs access to the other.
+   Volumes and mounted paths are read and written by a throwaway `alpine` container, which keeps file owners
+   and modes. Untick an item to leave it behind and use what the new host already has there.
+4. It deploys, on the new host, the commit the old host runs (not the branch's newest commit).
+5. It points the instance at the new host and syncs Switchyard, which sends the hostnames to the new
+   host's ports.
+
+If anything fails before step 5, what was copied is removed from the new host and the instance starts
+again on the old one. After it succeeds, the old copy stays on the old host, stopped, and the instance page
+offers to remove it (containers, images, its folder and the copied volumes; mounted paths outside the folder
+are never deleted) or to keep it and stop tracking it. Not copied: anonymous volumes, volumes with another
+driver or mount options (network storage), and mounts of system paths such as the Docker socket. Ports
+Slipway moved because they were taken on the old host start from the compose file again on the new one.
 
 ### Claiming containers Slipway did not deploy
 
@@ -425,7 +451,7 @@ slipway/
   models/      users/roles/sessions/tokens, hosts, repositories, instances/deployments, audit
   services/    auth, users, github, ssh, hosts (health), repos (sync), deployer (pipeline + runner),
                ports (host port checks), discovery (unmanaged containers), analytics (deploy stats),
-               host_metrics (host history and retention)
+               host_metrics (host history and retention), migrate (moving instances between hosts)
   api/v1/      JSON API routers
   web/         page routes, GitHub OAuth flow, Jinja templates, static CSS/JS/icons
 alembic/       migrations

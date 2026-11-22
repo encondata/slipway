@@ -29,6 +29,7 @@ from slipway.models import (
     DataMode,
     Deployment,
     DeploymentKind,
+    DeploymentStatus,
     Environment,
     EnvironmentStatus,
     Instance,
@@ -258,6 +259,9 @@ def _missing_permission(user: User | None, permissions: tuple[str, ...]) -> str 
     return None
 
 
+MIGRATE_AGAIN = data.MIGRATE_AGAIN
+
+
 async def job_refusal(db: AsyncSession, *, instance: Instance | None = None, environment: Environment | None = None,
                       user: User | None, kind: str = DeploymentKind.DEPLOY, options: dict[str, Any] | None = None,
                       retry_of: Deployment | None = None, members: dict[str, Instance] | None = None,
@@ -280,6 +284,9 @@ async def job_refusal(db: AsyncSession, *, instance: Instance | None = None, env
         assert instance is not None
         if _runner_deleting((instance.id,)):
             return JobRefused(409, DELETING)
+        if retry_of is not None and retry_of.kind == DeploymentKind.MIGRATE:
+            # Its checks (the new host, its folder) are the Migrate dialog's: a retry would skip them.
+            return JobRefused(409, MIGRATE_AGAIN)
         running = await data.active_job(db, instance.id)
         if running is not None:
             return JobRefused(409, data.busy_text(running))
@@ -556,6 +563,14 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
                 source = await db.get(Deployment, data._uuid(live.get("deployment"))) if live.get("deployment") else None
                 if source is not None:
                     values.update(commit_message=source.commit_message, commit_author=source.commit_author)
+        if kind == DeploymentKind.MIGRATE:
+            # It deploys the commit the old host runs: named like the deploy that put it live.
+            values["commit_sha"] = instance.current_commit_sha
+            source = await db.scalar(select(Deployment).where(
+                Deployment.instance_id == instance.id, Deployment.commit_sha == instance.current_commit_sha,
+                Deployment.status == DeploymentStatus.SUCCEEDED).order_by(Deployment.created_at.desc()).limit(1))
+            if source is not None:
+                values.update(commit_message=source.commit_message, commit_author=source.commit_author)
         opts = values["options"]
         # The job settles the conditional steps itself when it starts; this list is what the page shows meanwhile.
         # A member gets its environment's lists (§8.4), as the deployer gives them when the job starts.
@@ -571,8 +586,9 @@ async def queue_job(db: AsyncSession, *, instance: Instance | None = None, envir
             stopped=bool(opts.get("restop")) and kind in data.DATA_ONLY_KINDS, start_over=bool(opts.get("start_over")),
             rollback_of=data._uuid(opts.get("rollback_of")), seed=bool(opts.get("seed")) and kind == DeploymentKind.RESET,
             **member,
-        ) if kind != DeploymentKind.DEPLOY else (
-            deployer.steps_for(instance, **member) if member else deployer.new_steps(instance))
+        ) if kind not in (DeploymentKind.DEPLOY, DeploymentKind.MIGRATE) else (
+            deployer.migrate_steps(instance) if kind == DeploymentKind.MIGRATE
+            else deployer.steps_for(instance, **member) if member else deployer.new_steps(instance))
         dep = Deployment(instance_id=instance.id, environment_id=env.id if env is not None else None,
                          triggered_by_id=user.id if user else None, log="",
                          retry_of_id=retry_of.id if retry_of else None, steps=steps, **values)

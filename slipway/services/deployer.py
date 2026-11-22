@@ -57,8 +57,8 @@ import unicodedata
 import uuid
 import zlib
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Iterable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Iterable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -344,6 +344,21 @@ def instance_dir(instance: Instance, host: Host | None = None) -> str:
 
 def paths_for(instance: Instance) -> InstancePaths:
     return InstancePaths.of(instance_dir(instance))
+
+
+@contextmanager
+def placed(instance: Instance, host: Host, deploy_dir: str | None) -> Iterator[Instance]:
+    """Treat ``instance`` as if it ran on ``host`` in ``deploy_dir`` until the block ends.
+
+    For an instance no session tracks: a migration builds the commands for both hosts from the one instance.
+    Nothing here is saved.
+    """
+    saved = instance.host, instance.host_id, instance.deploy_dir
+    instance.host, instance.host_id, instance.deploy_dir = host, host.id, deploy_dir
+    try:
+        yield instance
+    finally:
+        instance.host, instance.host_id, instance.deploy_dir = saved
 
 
 MARKER_FILE = ".slipway-instance"
@@ -1443,6 +1458,11 @@ STEP_NAMES = {
     "restart": "Start the app again",
     "restop": "Stop the data services again",
     "proxy": "Update Switchyard",
+    # A migration to another host (services/migrate.py): these around a Dockerfile or compose deploy's steps.
+    "migrate_check": "Check both hosts",
+    "migrate_stop": "Stop on the old host",
+    "migrate_copy": "Copy the data",
+    "migrate_switch": "Switch to the new host",
     # Phase 3 (§8.3): the steps of environment members' jobs.
     "smoke": "Check the slot",
     "traffic": "Update Switchyard",
@@ -1794,6 +1814,13 @@ def _with_provider_steps(rows: list[dict[str, Any]], provider: ProviderSteps) ->
 def new_steps(instance: Instance) -> list[dict[str, Any]]:
     """A deploy's steps as queued (the job settles the conditional ones when it starts)."""
     return steps_for(instance)
+
+
+def migrate_steps(instance: Instance) -> list[dict[str, Any]]:
+    """A migration's steps: check, stop and copy, a deploy on the new host, then the switch and Switchyard."""
+    keys = ["migrate_check", "migrate_stop", "migrate_copy",
+            *(k for k in step_keys(instance) if k != "proxy"), "migrate_switch", "proxy"]
+    return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in keys]
 
 
 # Options a retry never copies: each needs its own typed confirmation, ``prev_status`` is what the instance
@@ -2183,6 +2210,8 @@ async def _start(deployment_id: uuid.UUID) -> _Job | None:
                 dep.steps = await vm_jobs.job_steps(db, instance, kind, options, STEP_NAMES)
             dep.options = dict(options)
             _hide_instance_values(job.hide, owner, env, secrets)
+        elif kind == DeploymentKind.MIGRATE:
+            dep.steps = migrate_steps(instance)
         else:
             dep.steps = new_steps(instance)
         job.steps = dep.steps
@@ -6754,7 +6783,7 @@ async def _pipeline(
     repo, host = instance.repository, instance.host
     if job.kind in data.RESTORE_KINDS:
         return await _live_pipeline(deployment_id, job, sink, steps, connect)
-    if job.kind != DeploymentKind.DEPLOY:
+    if job.kind not in (DeploymentKind.DEPLOY, DeploymentKind.MIGRATE):  # a migration deploys on the new host
         raise DeployError(f"Slipway can't run {data.kind_label(job.kind)} jobs this way")
     if job.env is None:
         raise DeployError(_env_unreadable(job))
@@ -6770,7 +6799,8 @@ async def _pipeline(
                 what = f"{repo.full_name}@{ref[:12] if job.retry is not None or pinned else ref}"
                 await sink.line(f"Resolving {what} using {source}"
                                 + (f" (the commit of deployment {job.retry.id.hex[:8]})" if job.retry else "")
-                                + (" (the commit the refused deploy was of)" if pinned else ""))
+                                + ((" (the commit the old host runs)" if job.kind == DeploymentKind.MIGRATE
+                                    else " (the commit the refused deploy was of)") if pinned else ""))
                 await _check_repository(gh, repo, sink)
                 commit = await gh.get_commit(repo.github_id, ref)
                 if not _SHA_RE.match(commit.sha or ""):
@@ -7390,6 +7420,11 @@ async def run_deployment(
     if job is None:
         return
     job.connect = connect
+    if job.kind == DeploymentKind.MIGRATE:
+        from slipway.services import migrate  # it builds on this module
+
+        await migrate.run_migration(deployment_id, job, connect=connect, github=github)
+        return
 
     sink = LogSink(deployment_id, hide=job.hide)
     steps = Steps(deployment_id, job.steps, sink)
@@ -7617,6 +7652,8 @@ class DeployRunner:
                 dep.steps = [{**r, "status": "failed", "note": "Interrupted"} if r.get("status") == "running" else r
                              for r in dep.steps or []]
                 dep.error = "Interrupted by a Slipway restart"
+                if dep.kind == DeploymentKind.MIGRATE and dep.started_at is not None:
+                    dep.error += _migration_cut_text(dep)
                 dep.finished_at = utcnow()
                 if dep.kind in vm_jobs.KINDS:
                     # Its pending VM snapshot rows fail, and a revert cut off in its disk's change holds the data
@@ -7656,6 +7693,16 @@ class DeployRunner:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+def _migration_cut_text(dep: Deployment) -> str:
+    """What a restart leaves of a migration: the instance still belongs to the old host, and may be stopped there;
+    copies on the new host stay for the user to remove."""
+    m = dep.migration or {}
+    name = dep.instance.name if dep.instance is not None else "The instance"
+    return (f" during a migration. {name} still belongs to {m.get('source_host') or 'its host'}, but it may be "
+            f"stopped there: start it if it is. Anything copied to {m.get('target_host') or 'the new host'} was "
+            "left there; remove it before migrating again.")
 
 
 async def _recover_provider_step(db: Any, dep: Deployment, cut: str) -> tuple[uuid.UUID, uuid.UUID] | None:

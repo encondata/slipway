@@ -36,6 +36,9 @@ TAIL_LINES = 15
 # A line longer than the SSH receive window (2 MiB) arrives in pieces; they are joined before the
 # line is scrubbed, and at most this much of one line is kept (only its start is ever shown).
 LONG_LINE_CHARS = 4 * 1024 * 1024
+# Copying between hosts (RemoteSession.pipe_to): bytes read at a time, and how long the copy may stall.
+PIPE_CHUNK = 256 * 1024
+PIPE_IDLE_TIMEOUT = 600.0
 _SEP = "::slipway::"
 _UNSAFE_COMMENT = re.compile(r"[^A-Za-z0-9@._-]+")
 CREDENTIALS_UNREADABLE = "No usable SSH credentials are stored for this host (missing or could not be decrypted); re-enter them on the host page"
@@ -494,6 +497,80 @@ class RemoteSession:
             raise SSHError(f"The transfer {direction} {self.host} stalled for {_duration(stall)}") from exc
         except (asyncssh.Error, OSError) as exc:
             raise SSHError(f"Could not {verb} {path}: {exc}") from exc
+    async def pipe_to(
+        self,
+        target: RemoteSession,
+        read_command: str,
+        write_command: str,
+        *,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
+        idle_timeout: float = PIPE_IDLE_TIMEOUT,
+    ) -> int:
+        """Run ``read_command`` here and feed its output to ``write_command`` on ``target``.
+
+        The bytes pass through Slipway, so neither host has to reach or trust the other. Returns how
+        many were copied. Raises ``CommandFailed`` naming the command that failed (this side's first),
+        and ``SSHError`` when no data moves for ``idle_timeout`` seconds.
+        """
+        errors: dict[str, deque[str]] = {"read": deque(maxlen=TAIL_LINES), "write": deque(maxlen=TAIL_LINES)}
+
+        async def collect(stream: asyncssh.SSHReader[bytes], key: str) -> None:
+            async for raw in stream:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n").replace("\x00", "")
+                if line:
+                    errors[key].append(clip_line(line))
+
+        total = 0
+        writer_ended = False
+        try:
+            async with self.conn.create_process(
+                "exec /bin/sh -c " + shlex.quote(read_command), stdin=asyncssh.DEVNULL, encoding=None,
+            ) as reader, target.conn.create_process(
+                "exec /bin/sh -c " + shlex.quote(write_command), encoding=None,
+            ) as writer:
+                side = [
+                    asyncio.create_task(collect(reader.stderr, "read")),
+                    asyncio.create_task(collect(writer.stderr, "write")),
+                    asyncio.create_task(collect(writer.stdout, "write")),
+                ]
+                try:
+                    while True:
+                        chunk = await asyncio.wait_for(reader.stdout.read(PIPE_CHUNK), idle_timeout)
+                        if not chunk:
+                            break
+                        writer.stdin.write(chunk)
+                        await asyncio.wait_for(writer.stdin.drain(), idle_timeout)
+                        total += len(chunk)
+                        if on_progress is not None:
+                            await on_progress(total)
+                    writer.stdin.write_eof()
+                    await asyncio.wait_for(reader.wait(), idle_timeout)
+                    await asyncio.wait_for(writer.wait(), idle_timeout)
+                except TimeoutError as exc:
+                    for proc in (reader, writer):
+                        with suppress(asyncssh.Error, OSError):
+                            proc.kill()
+                    raise SSHError(f"The copy stalled: no data moved for {idle_timeout:.0f}s") from exc
+                except (BrokenPipeError, ConnectionResetError, asyncssh.Error, OSError):
+                    # The writing side ended early (it failed); its exit status says why below.
+                    writer_ended = True
+                    with suppress(asyncssh.Error, OSError):
+                        reader.kill()
+                    with suppress(TimeoutError, asyncssh.Error, OSError):
+                        await asyncio.wait_for(writer.wait(), 30)
+                finally:
+                    await asyncio.gather(*side, return_exceptions=True)
+                read_status = reader.exit_status if reader.exit_status is not None else -1
+                write_status = writer.exit_status if writer.exit_status is not None else -1
+        except (asyncssh.Error, OSError) as exc:
+            raise SSHError(f"SSH copy failed: {exc}") from exc
+        # A failed read usually makes the write fail too (a cut-off archive), so it is named first,
+        # unless the writing side ended on its own and the reader was stopped because of it.
+        if read_status != 0 and not writer_ended:
+            raise CommandFailed(read_command, read_status, "\n".join(errors["read"]))
+        if write_status != 0:
+            raise CommandFailed(write_command, write_status, "\n".join(errors["write"]))
+        return total
 
     def server_host_key(self) -> str:
         key = self.conn.get_server_host_key()
