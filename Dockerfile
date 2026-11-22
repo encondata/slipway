@@ -71,7 +71,11 @@ RUN pip install .
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY docker/entrypoint.sh /usr/local/bin/slipway-entrypoint
-RUN chmod +x /usr/local/bin/slipway-entrypoint
+# COPY keeps each file's mode from the build folder, and the folder may hold files only root can read: the
+# upgrade script used to check out with umask 077, so a file new in a commit was 600 there, and Slipway (uid
+# 10001) crashed on start reading it (a new migration). Everything Slipway reads is made readable here:
+# alembic/, and /app/slipway too, since alembic.ini puts /app on sys.path.
+RUN chmod -R a+rX /app /etc/slipway && chmod 755 /usr/local/bin/slipway-entrypoint
 
 # Stored snapshots (encrypted). docker-compose.yml mounts data/files here; Slipway runs as uid 10001.
 # Terraform's working folders are made under it at run time (<storage_dir>/terraform, mode 700).

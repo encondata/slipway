@@ -171,3 +171,15 @@ def test_compose_gives_terraform_time_to_stop():
     grace = seconds(compose["services"]["slipway"]["stop_grace_period"])
     assert grace >= 60
     assert grace > terraform.SIGINT_GRACE + 15  # Terraform's SIGINT grace plus a margin to shut down
+
+
+# ------------------------------------------------------------------------- file modes
+
+
+def test_files_slipway_reads_are_made_readable_after_the_last_copy():
+    # COPY keeps the build folder's modes; a file only root can read there crashed Slipway (uid 10001) on start.
+    steps = instructions()
+    final = steps[max(i for i, s in enumerate(steps) if s.startswith("FROM ")):]
+    chmod = final.index("RUN chmod -R a+rX /app /etc/slipway && chmod 755 /usr/local/bin/slipway-entrypoint")
+    copies = [i for i, s in enumerate(final) if s.startswith("COPY ") and not s.startswith("COPY --from=")]
+    assert copies and max(copies) < chmod < final.index("USER slipway")

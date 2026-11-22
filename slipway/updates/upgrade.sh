@@ -359,11 +359,16 @@ git_supports_eoo() { # --end-of-options came in git 2.24
 
 # ------------------------------------------------------------------------------------------ putting back
 
+# git_checkout <args>: git checkout with umask 022. The script's umask 077 is for its own files (the backup);
+# the checkout is the build folder, and a file only root can read there ends up unreadable in the image.
+git_checkout() { (umask 022 && git checkout "$@"); }
+
+
 restore_checkout() { # restore_checkout <commit>: back on the branch it was on (or detached) at <commit>
   if [ -n "$OLD_BRANCH" ]; then
-    git checkout -q -f -B "$OLD_BRANCH" ${EOO:+"$EOO"} "$1" || return 1
+    git_checkout -q -f -B "$OLD_BRANCH" ${EOO:+"$EOO"} "$1" || return 1
   else
-    git checkout -q -f ${EOO:+"$EOO"} "$1" || return 1
+    git_checkout -q -f ${EOO:+"$EOO"} "$1" || return 1
   fi
   log "The checkout is back at $(short "$1")."
 }
@@ -617,7 +622,7 @@ build() {
   BEFORE_STAMP=$(image_stamp "slipway:before-$ID")
   log "Tagged the running image as slipway:before-$ID (built from ${BEFORE_STAMP:-an unrecorded commit})."
   CHECKED_OUT=1
-  git checkout -q -f -B "$BRANCH" ${EOO:+"$EOO"} "$TARGET" || undo_and_fail "Could not check out $(short "$TARGET")."
+  git_checkout -q -f -B "$BRANCH" ${EOO:+"$EOO"} "$TARGET" || undo_and_fail "Could not check out $(short "$TARGET")."
   db_hash_matches || undo_and_fail "This version changes the database container. Run install.sh by hand."
   limit "$T_BUILD" env SLIPWAY_COMMIT="$TARGET" SLIPWAY_BRANCH="$BRANCH" SLIPWAY_BUILT_AT="$(utc_now)" \
     docker compose build slipway < /dev/null \
