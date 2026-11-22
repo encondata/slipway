@@ -663,6 +663,29 @@ def test_previous_version_failing_at_rollback_keeps_its_output(rig: Rig):
     assert "    | old version trouble" in rig.log
 
 
+def test_checkout_is_readable_by_everyone_despite_the_script_umask(rig: Rig):
+    # The image copies alembic/ and slipway/ with these modes, and Slipway runs as uid 10001: a new migration
+    # checked out as 600 crashed it on start.
+    (rig.src / "alembic" / "versions").mkdir(parents=True)
+    (rig.src / "alembic" / "versions" / "0099_new.py").write_text("revision = '0099'\n")
+    (rig.src / "README.md").write_text("three\n")
+    c3 = rig.commit("a new migration")
+    git(rig.src, "push", "-q", "origin", "main")
+    r = rig.run(target=c3)
+    assert r.returncode == 0, rig.log
+    for path in (rig.dir / "alembic" / "versions" / "0099_new.py", rig.dir / "README.md"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644, path
+    assert stat.S_IMODE((rig.dir / "alembic").stat().st_mode) == 0o755
+    assert stat.S_IMODE((rig.state / f"{RUN_ID}.json").stat().st_mode) == 0o600  # its own files stay private
+
+
+def test_rolled_back_checkout_is_readable_too(rig: Rig):
+    rig.control(f"health_fail_{rig.c2}")
+    r = rig.run()
+    assert r.returncode == 2, rig.log
+    assert stat.S_IMODE((rig.dir / "README.md").stat().st_mode) == 0o644
+
+
 # --------------------------------------------------------------------------------- snapshot folder
 
 MOUNTED = COMPOSE + "        volumes:\n          - ${SLIPWAY_DATA_DIR:-./data}/files:/var/lib/slipway\n"
