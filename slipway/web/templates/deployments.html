@@ -1,20 +1,23 @@
 {% extends "base.html" %}
 {% from "_macros.html" import icon, badge, empty %}
-{% block title %}Deployments{% endblock %}
+{#- The History page (/deployments/history): every deployment, flat. /deployments itself is deployment_groups.html. #}
+{% block title %}Deployment history{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
-    {% if environment %}<div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}<span>{{ environment.name }}</span></div>{% endif %}
-    <h1>Deployments{% if environment %} of {{ environment.name }}{% endif %}</h1>
+    <div class="breadcrumb"><a href="/deployments">Deployments</a>{{ icon("chevron-right", "i-sm") }}<span>History</span></div>
+    <h1>{% if environment %}Deployments of {{ environment.name }}{% else %}History{% endif %}</h1>
     <p class="lede">{% if environment %}Every job of {{ environment.name }}: its slots'{{ ", its data server's" if environment.data_mode == "server" }} and its own, newest first.{% else %}Every build and release Slipway has run, newest first.{% endif %}</p>
   </div>
-  {% set env_q = ("environment=" ~ environment.id) if environment else "" %}
+  <div class="actions">
+  {% if instance %}<a class="chip filter-chip" href="{{ url(instance='') }}" title="Show every instance">{{ instance.name }} {{ icon("x", "i-sm") }}</a>{% endif %}
+  {% if environment %}<a class="chip filter-chip" href="{{ url(environment='') }}" title="Show every environment">{{ environment.name }} {{ icon("x", "i-sm") }}</a>{% endif %}
   <nav class="segmented" aria-label="Filter by status">
     {% for key, label in [("", "All"), ("running", "Building"), ("succeeded", "Deployed"), ("failed", "Failed")] %}
-    {% set q = [("status=" ~ key) if key else "", env_q]|select|join("&") %}
-    <a href="/deployments{% if q %}?{{ q }}{% endif %}" class="{{ 'active' if status == key }}">{{ label }}</a>
+    <a href="{{ url(status=key) }}" class="{{ 'active' if status == key }}">{{ label }}</a>
     {% endfor %}
   </nav>
+  </div>
 </div>
 
 <section class="card">
@@ -45,8 +48,17 @@
     {% endfor %}
     </tbody>
   </table></div>
+  {% if pages > 1 %}
+  <nav class="card-foot pager" aria-label="Pages">
+    <span class="muted">{{ first }}–{{ first + deployments|length - 1 }} of {{ total }}</span>
+    <span class="actions">
+      {% if page > 1 %}<a class="btn btn-sm" href="{{ url(page=page - 1) }}" rel="prev">Newer</a>{% endif %}
+      {% if page < pages %}<a class="btn btn-sm" href="{{ url(page=page + 1) }}" rel="next">Older</a>{% endif %}
+    </span>
+  </nav>
+  {% endif %}
   {% else %}
-    {{ empty("rocket", "No deployments" ~ (" with this status" if status else " yet"), "Deploy an instance and its build output will show up here.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) and not status else None, "Create instance") }}
+    {{ empty("rocket", "No deployments" ~ (" with this status" if status else " for this instance" if instance else " for this environment" if environment else " yet"), "Deploy an instance and its build output will show up here.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) and not (status or instance or environment) else None, "Create instance") }}
   {% endif %}
 </section>
 {% endblock %}

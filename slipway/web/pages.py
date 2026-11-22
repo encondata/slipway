@@ -12,6 +12,7 @@ from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -1750,21 +1751,103 @@ async def edit_environment(request: Request, db: DB, ctx: PageAuth, env_id: uuid
     )
 
 
+GROUP_EARLIER = 5  # earlier deployments folded under each group on /deployments; the rest are in History
+HISTORY_PAGE_SIZE = 50
+ACTIVE_DEPLOYMENTS = (DeploymentStatus.QUEUED, DeploymentStatus.RUNNING)
+
+
 @router.get("/deployments")
-async def deployments_page(request: Request, db: DB, ctx: PageAuth, status: str = "",
-                           environment: str = "") -> HTMLResponse:
+async def deployments_page(
+    request: Request, db: DB, ctx: PageAuth, status: str = "", environment: str = "",
+) -> HTMLResponse:
+    """One group per instance, and one per environment for its own jobs (no instance: activate, teardown...): the
+    latest deployment, anything else still queued or building, and a few earlier ones.
+
+    With ``?status=`` or ``?environment=`` this is the flat list History shows, so those links keep working.
+    """
     need(ctx, Perm.DEPLOYMENTS_READ)
-    stmt = select(Deployment).options(NO_LOG).order_by(Deployment.created_at.desc()).limit(100)
+    if status or environment:
+        return await deployment_history(request, db, ctx, status=status, environment=environment)
+    subject = func.coalesce(Deployment.instance_id, Deployment.environment_id)
+    rank = func.row_number().over(
+        partition_by=subject, order_by=(Deployment.created_at.desc(), Deployment.id.desc())
+    ).label("rank")
+    ranked = select(Deployment.id, rank).subquery()
+    rows = (await db.execute(
+        select(Deployment, ranked.c.rank).options(NO_LOG).join(ranked, ranked.c.id == Deployment.id)
+        .where(or_(ranked.c.rank <= 1 + GROUP_EARLIER, Deployment.status.in_(ACTIVE_DEPLOYMENTS)))
+        .order_by(subject, ranked.c.rank)
+    )).all()
+    totals = dict((await db.execute(select(subject, func.count()).group_by(subject))).all())
+    groups: dict[uuid.UUID, dict[str, Any]] = {}
+    for dep, n in rows:
+        key = dep.instance_id or dep.environment_id
+        group = groups.setdefault(key, {
+            "key": key, "instance": dep.instance, "environment": dep.environment if dep.instance is None else None,
+            "latest": dep, "active": [], "earlier": [], "total": totals.get(key, 0),
+        })
+        if n == 1:
+            continue
+        if dep.is_active:
+            group["active"].append(dep)
+        elif n <= 1 + GROUP_EARLIER:
+            group["earlier"].append(dep)
+    for group in groups.values():
+        group["more"] = group["total"] - 1 - len(group["active"]) - len(group["earlier"])
+        group["busy"] = group["latest"].is_active or bool(group["active"])
+
+    def attention(group: dict[str, Any]) -> int:
+        return 0 if group["busy"] else 1 if group["latest"].status == DeploymentStatus.FAILED else 2
+
+    # Newest first, then anything building or queued on top, then failures.
+    ordered = sorted(groups.values(), key=lambda g: g["latest"].created_at, reverse=True)
+    ordered.sort(key=attention)
+    any_env = any(d.environment_id for g in ordered for d in (g["latest"], *g["active"], *g["earlier"]))
+    return await render(request, db, "deployment_groups.html", ctx, groups=ordered, any_env=any_env)
+
+
+@router.get("/deployments/history")
+async def deployment_history(
+    request: Request, db: DB, ctx: PageAuth, status: str = "", instance: str = "", environment: str = "",
+    page: str = "1",
+) -> HTMLResponse:
+    """Every deployment, newest first, a page at a time; filter by status, by instance and by environment
+    (``?environment=<id>``: every job of one environment, its members' and its own, phase 3 §12.5)."""
+    need(ctx, Perm.DEPLOYMENTS_READ)
+    where = []
     if status:
-        stmt = stmt.where(Deployment.status == status)
-    # ?environment=<id>: every job of one environment, its members' and its own (phase 3 §12.5).
-    env_id = _uuid(environment)
-    env = await db.get(Environment, env_id) if env_id else None
-    if env is not None:
-        stmt = stmt.where(Deployment.environment_id == env.id)
-    deployments = (await db.scalars(stmt)).all()
-    return await render(request, db, "deployments.html", ctx, deployments=deployments, status=status,
-                        environment=env, any_env=any(d.environment_id for d in deployments))
+        where.append(Deployment.status == status)
+    selected = None
+    if instance:
+        selected = await db.get(Instance, inst_id) if (inst_id := _uuid(instance)) else None
+        if selected is None:
+            instance = ""
+        else:
+            where.append(Deployment.instance_id == selected.id)
+    env = await db.get(Environment, env_id) if (env_id := _uuid(environment)) else None
+    if env is None:
+        environment = ""
+    else:
+        where.append(Deployment.environment_id == env.id)
+    total = await db.scalar(select(func.count()).select_from(Deployment).where(*where)) or 0
+    pages = max(1, -(-total // HISTORY_PAGE_SIZE))
+    page_no = min(max(1, int(page) if page.isdigit() else 1), pages)
+    deployments = (await db.scalars(
+        select(Deployment).options(NO_LOG).where(*where)
+        .order_by(Deployment.created_at.desc(), Deployment.id.desc())
+        .offset((page_no - 1) * HISTORY_PAGE_SIZE).limit(HISTORY_PAGE_SIZE)
+    )).all()
+
+    def url(**changes: Any) -> str:
+        params = {"status": status, "instance": instance, "environment": environment, "page": 1} | changes
+        query = {k: v for k, v in params.items() if v and not (k == "page" and v == 1)}
+        return "/deployments/history" + (f"?{urlencode(query)}" if query else "")
+
+    return await render(
+        request, db, "deployments.html", ctx, deployments=deployments, status=status, instance=selected,
+        environment=env, any_env=any(d.environment_id for d in deployments),
+        page=page_no, pages=pages, total=total, first=(page_no - 1) * HISTORY_PAGE_SIZE + 1 if total else 0, url=url,
+    )
 
 
 @router.get("/deployments/{deployment_id}")

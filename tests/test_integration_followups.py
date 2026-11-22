@@ -144,7 +144,7 @@ async def test_list_pages_render_without_loading_build_logs(admin_client):
     async with get_sessionmaker()() as db:
         db.add(Deployment(instance_id=uuid.UUID(inst_id), status="succeeded", branch="main", commit_sha="a" * 40, log="x" * 1000))
         await db.commit()
-    for url in ("/", "/deployments", f"/instances/{inst_id}", "/api/v1/deployments"):
+    for url in ("/", "/deployments", "/deployments/history", f"/instances/{inst_id}", "/api/v1/deployments"):
         assert (await admin_client.get(url)).status_code == 200, url
 
 
