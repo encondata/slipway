@@ -56,7 +56,7 @@ DEPLOY_WAIT=${SLIPWAY_UPGRADE_DEPLOY_WAIT:-600}
 [[ $LOCK_WAIT =~ $NUM_RE ]] || LOCK_WAIT=30
 [[ $DEPLOY_WAIT =~ $NUM_RE ]] || DEPLOY_WAIT=600
 # Time limits, in seconds, for one call.
-T_QUICK=60     # ps, inspect, tag, psql, config
+T_QUICK=60     # ps, inspect, tag, psql, config, logs
 T_STOP=120     # compose stop -t 30
 T_UP=300       # compose up
 T_BUILD=3600   # compose build
@@ -75,6 +75,10 @@ CHECKED_OUT=0      # the checkout may have moved to the target
 OLD_STOPPED=0      # the current version was stopped for the backup
 SWITCHED=0         # the new version was started
 HEALTHY=0          # the new version passed its health check
+CRASHED=0          # the last health check gave up because the container kept restarting
+CRASH_LIMIT=3      # restarts during a health check that mean the container crashes on start
+LOG_LINES=60       # lines of a container's own output copied into this log when it isn't healthy
+SLIPWAY_UID=10001  # the user Slipway runs as in its image (Dockerfile)
 LOCK_KIND=""       # flock or mkdir, once held
 PROBLEMS="" DONE_PARTS=""  # what a rollback could not do, and what it did
 SLIPWAY_CID="" DB_CID="" RUNNING_IMAGE="" OLD_BRANCH="" ORIG_HEAD="" PRE_REV="" BEFORE_STAMP="" EOO="" WAIT_WHY=""
@@ -380,6 +384,7 @@ undo_before_switch() {
       OLD_STOPPED=0
     else
       log "The current version did not start again."
+      container_output "current version"
       ok=1
     fi
   fi
@@ -397,11 +402,15 @@ undo_and_fail() { # undo_and_fail <why>
 
 # health <expected commit or empty> <container id it must not be> -> 0 once healthy.
 # Healthy: the container answers its health URL from inside, carries the expected stamp, is running and has
-# not restarted, three checks in a row spanning at least STEADY seconds. Gives up after HEALTH_LIMIT seconds.
+# not restarted, three checks in a row spanning at least STEADY seconds. Gives up after HEALTH_LIMIT seconds,
+# or as soon as the container has restarted CRASH_LIMIT times (it crashes on start: waiting won't help; then
+# CRASHED=1). Docker reports a container that keeps restarting as running, so Restarting and the restart
+# count are what tell a crash loop from a slow start.
 # Each probe is limited to PROBE_TIMEOUT seconds; one that hangs counts as a failed check.
 health() {
   local want=$1 not_cid=$2 deadline now streak=0 streak_start=0 base_cid="" base_restarts="" cid st running
-  local restarts why last_why="" got
+  local restarting restarts first_cid="" first_restarts=0 crashes=0 why last_why="" got
+  CRASHED=0
   deadline=$(($(date +%s) + HEALTH_LIMIT))
   while :; do
     write_status # heartbeat
@@ -412,12 +421,20 @@ health() {
     elif [ -n "$not_cid" ] && [ "$cid" = "$not_cid" ]; then
       why="the old container is still the one running"
     else
-      st=$(limit "$PROBE_TIMEOUT" docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$cid" 2> /dev/null < /dev/null | tr -d '\r')
-      running=${st%% *} restarts=${st##* }
+      st=$(limit "$PROBE_TIMEOUT" docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' \
+        "$cid" 2> /dev/null < /dev/null | tr -d '\r')
+      read -r running restarting restarts <<< "$st"
+      [[ ${restarts:-} =~ $NUM_RE ]] || restarts=""
       if [ "$cid" != "$base_cid" ] || [ "$restarts" != "$base_restarts" ]; then
         streak=0 base_cid=$cid base_restarts=$restarts
       fi
-      if [ "$running" != true ]; then
+      if [ -n "$restarts" ]; then
+        if [ "$cid" != "$first_cid" ]; then first_cid=$cid first_restarts=$restarts; fi
+        crashes=$((restarts - first_restarts))
+      fi
+      if [ "$restarting" = true ] || [ "$crashes" -gt 0 ]; then
+        why="the container keeps stopping and Docker keeps restarting it"
+      elif [ "$running" != true ]; then
         why="the container isn't running"
       elif ! limit "$PROBE_TIMEOUT" docker compose exec -T slipway python -c \
         "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=4)" \
@@ -442,12 +459,66 @@ health() {
     fi
     [ "$why" = "$last_why" ] || log "Health: $why."
     last_why=$why
+    if [ "$crashes" -ge "$CRASH_LIMIT" ]; then
+      log "Gave up: the container restarted $crashes times, so it stops by itself soon after it starts."
+      CRASHED=1
+      return 1
+    fi
     if [ "$now" -gt "$deadline" ]; then
       log "Gave up after $HEALTH_LIMIT seconds."
       return 1
     fi
     sleep "$POLL"
   done
+}
+
+# container_output <whose>: copy the last LOG_LINES lines the slipway container printed into this log, so a
+# version that crashes on start says why. The rollback recreates the container, which loses its output.
+# Control characters other than tabs are dropped. Best effort: no output is only noted.
+container_output() {
+  local out
+  out=$(limit "$T_QUICK" docker compose logs --no-color --no-log-prefix --tail "$LOG_LINES" slipway < /dev/null 2>&1 \
+    | tr -d '\000-\010\013-\037\177')
+  if [ -z "$out" ]; then
+    log "The $1 printed nothing (or its output could not be read)."
+    return 0
+  fi
+  log "The last lines the $1 printed:"
+  printf '%s\n' "$out" | sed 's/^/    | /'
+}
+
+# The folder docker-compose.yml mounts at /var/lib/slipway, for stored snapshots: <SLIPWAY_DATA_DIR from .env,
+# default ./data>/files. install.sh makes it for Slipway (uid 10001, mode 700); an install made before that
+# has none, and Docker would make it for root, which Slipway can't write. Like install.sh: chown it here,
+# else from a throwaway container of the database image. Best effort: Slipway starts without it (only stored
+# snapshots need it), so a failure is logged with the command to run by hand.
+prepare_files() {
+  grep -q ':/var/lib/slipway' docker-compose.yml 2> /dev/null || return 0
+  local dir mu
+  dir=$(sed -n 's/^SLIPWAY_DATA_DIR=//p' .env 2> /dev/null | tail -n 1 | tr -d '\r')
+  dir=${dir#\"} dir=${dir%\"} dir=${dir#\'} dir=${dir%\'}
+  dir=${dir:-./data}
+  dir="${dir%/}/files"
+  case $dir in /*) ;; *) dir="$PWD/${dir#./}" ;; esac
+  case $dir in
+    *:* | *,* | *$'\n'*) log "Skipped making the snapshot folder: its path ($dir) has a character Docker can't mount."; return 0 ;;
+  esac
+  mu=$(mode_uid "$dir")
+  [ "$mu" = "700 $SLIPWAY_UID" ] && return 0
+  if [ ! -d "$dir" ]; then
+    if ! mkdir -p -- "$dir" 2> /dev/null; then
+      log "Could not make $dir for stored snapshots. Run: sudo mkdir -p $dir && sudo chown $SLIPWAY_UID:$SLIPWAY_UID $dir && sudo chmod 700 $dir"
+      return 0
+    fi
+    log "Made $dir for stored snapshots."
+  fi
+  if { chown "$SLIPWAY_UID:$SLIPWAY_UID" "$dir" && chmod 700 "$dir"; } 2> /dev/null \
+    || limit "$T_UP" docker compose run --rm --no-deps --user root -v "$dir:/files" --entrypoint sh db \
+      -c "chown $SLIPWAY_UID:$SLIPWAY_UID /files && chmod 700 /files" < /dev/null > /dev/null 2>&1; then
+    log "Gave $dir to Slipway (uid $SLIPWAY_UID, mode 700)."
+  else
+    log "Could not give $dir to Slipway, so stored snapshots won't work. Run: sudo chown $SLIPWAY_UID:$SLIPWAY_UID $dir && sudo chmod 700 $dir"
+  fi
 }
 
 # ------------------------------------------------------------------------------------------ steps
@@ -551,6 +622,7 @@ build() {
   limit "$T_BUILD" env SLIPWAY_COMMIT="$TARGET" SLIPWAY_BRANCH="$BRANCH" SLIPWAY_BUILT_AT="$(utc_now)" \
     docker compose build slipway < /dev/null \
     || undo_and_fail "The new version didn't build. The log has the reason."
+  prepare_files
 }
 
 backup_failed() {
@@ -644,6 +716,7 @@ rollback() { # rollback <why>
     if ! limit "$T_UP" docker compose up -d --no-build --no-deps slipway < /dev/null; then
       problem "The previous version didn't start."
     elif ! health "$BEFORE_STAMP" ""; then
+      container_output "previous version"
       problem "The previous version didn't pass its health check."
     fi
   else
@@ -748,7 +821,13 @@ main() {
   backup
   switch
   set_step health "Waits until the new version answers, steadily, from inside its container."
-  health "$TARGET" "$SLIPWAY_CID" || rollback "The new version didn't pass its health check."
+  if ! health "$TARGET" "$SLIPWAY_CID"; then
+    container_output "new version"
+    if [ "$CRASHED" = 1 ]; then
+      rollback "The new version kept crashing on start. Its last output is in the log."
+    fi
+    rollback "The new version didn't pass its health check. Its last output is in the log."
+  fi
   HEALTHY=1
   cleanup
 }

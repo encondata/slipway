@@ -78,13 +78,19 @@ The current version keeps running until the backup. The steps, in order:
 2. **fetch**: fetches the branch and checks that the target commit comes after the running one.
 3. **build**: tags the running image as `slipway:before-<id>`, checks out the target and builds it. If the
    build fails, or the new commit changes the database container, the checkout and image are put back and the
-   current version never stops.
+   current version never stops. When the new `docker-compose.yml` mounts the snapshot folder
+   (`<SLIPWAY_DATA_DIR>/files`, default `data/files`), the script makes it if needed and gives it to Slipway
+   (uid 10001, mode 700), as `install.sh` does, so Docker doesn't make it for root. If that fails the upgrade
+   goes on (only stored snapshots need it) and the log has the command to run by hand.
 4. **backup**: waits for any deployment that is still running (up to 10 minutes), then stops the current
    version and backs up the database to `.slipway-updates/<id>-before.dump`. If that fails, the current version
    starts again.
 5. **switch**: starts the new version. Slipway is offline for about a minute.
 6. **health**: waits up to 5 minutes for the new container to answer its health check three times in a row
-   over at least 15 seconds, with the new commit stamped in it, without restarting.
+   over at least 15 seconds, with the new commit stamped in it, without restarting. A container that crashes
+   on start (a failed migration, say) is restarted by Docker, which still reports it as running; after 3
+   restarts the script stops waiting and rolls back. Either way, the last 60 lines the new container printed
+   are copied into the run's log first, since the rollback replaces the container and its output with it.
 7. **cleanup** (success): removes older `slipway:before-*` tags and keeps the 3 newest backups.
 
 If the new version isn't healthy, **rollback** stops it, puts the old image and checkout back, restores the

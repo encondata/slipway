@@ -94,6 +94,12 @@ if [ "$1" = compose ]; then
       running || exit 1
       ctl "health_fail_$(cur_commit)" && exit 1
       exit 0 ;;
+    "logs --no-color --no-log-prefix --tail 60 slipway")
+      cat "$F/output_$(cur_commit)" 2>/dev/null ;;
+    "run --rm --no-deps --user root -v "*":/files --entrypoint sh db -c chown 10001:10001 /files && chmod 700 /files")
+      ctl run_fail && { echo "permission denied" >&2; exit 1; }
+      a="$*"; d=${a#run --rm --no-deps --user root -v }; d=${d%%:/files*}
+      chmod 700 "$d"; echo "$d" > "$F/files_given" ;;
     "exec -T slipway printenv SLIPWAY_COMMIT")
       running || exit 1
       c=$(cur_commit); [ "$c" != none ] || exit 1; echo "$c" ;;
@@ -134,10 +140,13 @@ case $1 in
   inspect)
     case $3 in
       '{{.Image}}') cat "$F/cont/$4.image" ;;
-      '{{.State.Running}} {{.RestartCount}}')
-        r=$(cat "$F/cont/$4.restarts")
-        if ctl "crashloop_$(img_commit "$(cat "$F/cont/$4.image")")"; then r=$((r + 1)); echo "$r" > "$F/cont/$4.restarts"; fi
-        echo "$(cat "$F/cont/$4.running") $r" ;;
+      '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}')
+        # Like Docker: a crash-looping container reads as running and restarting, its count going up.
+        r=$(cat "$F/cont/$4.restarts") restarting=false
+        if ctl "crashloop_$(img_commit "$(cat "$F/cont/$4.image")")"; then
+          r=$((r + 1)); echo "$r" > "$F/cont/$4.restarts"; restarting=true
+        fi
+        echo "$(cat "$F/cont/$4.running") $restarting $r" ;;
       *config-hash*) cat "$F/db_label_hash" ;;
       *) exit 99 ;;
     esac ;;
@@ -600,6 +609,113 @@ def test_crash_looping_new_version_is_rolled_back(rig: Rig):
     r = rig.run()
     assert r.returncode == 2, rig.log
     assert rig.status["status"] == "rolled_back"
+
+
+def test_crash_loop_gives_up_early_and_keeps_the_output(rig: Rig):
+    # Docker reports a crash-looping container as running: the restarts give it away, long before the limit.
+    rig.control(f"crashloop_{rig.c2}")
+    rig.control(f"output_{rig.c2}", "Running upgrade 0006 -> 0007\nTraceback (most recent call last):\n"
+                "sqlalchemy.exc.ProgrammingError: column \"label\" does not exist\x1b[0m\r\n")
+    started = time.monotonic()
+    r = rig.run(SLIPWAY_UPGRADE_TIMEOUT="60")
+    assert r.returncode == 2, rig.log
+    assert time.monotonic() - started < 30
+    s = rig.status
+    assert s["status"] == "rolled_back"
+    assert s["message"].startswith("The new version kept crashing on start. Its last output is in the log.")
+    log = rig.log
+    assert "Health: the container keeps stopping and Docker keeps restarting it." in log
+    assert "Gave up: the container restarted 3 times" in log
+    assert "The last lines the new version printed:" in log
+    assert '    | sqlalchemy.exc.ProgrammingError: column "label" does not exist[0m\n' in log
+    assert "\x1b" not in log and "\r" not in log
+    # The output is read before the rollback stops and replaces the container.
+    calls = rig.calls
+    logs = rig.index("compose logs --no-color --no-log-prefix --tail 60 slipway")
+    assert logs < max(i for i, c in enumerate(calls) if c == "compose stop -t 30 slipway")
+    assert rig.current_image() == OLD_IMAGE
+
+
+def test_health_failure_keeps_the_output(rig: Rig):
+    rig.control(f"health_fail_{rig.c2}")
+    rig.control(f"output_{rig.c2}", "INFO:     Waiting for application startup.\n")
+    r = rig.run()
+    assert r.returncode == 2, rig.log
+    assert rig.status["message"].startswith("The new version didn't pass its health check. Its last output is in the log.")
+    assert "    | INFO:     Waiting for application startup." in rig.log
+    assert "Gave up after 2 seconds." in rig.log
+
+
+def test_health_failure_without_output_says_so(rig: Rig):
+    rig.control(f"health_fail_{rig.c2}")
+    r = rig.run()
+    assert r.returncode == 2, rig.log
+    assert "The new version printed nothing (or its output could not be read)." in rig.log
+
+
+def test_previous_version_failing_at_rollback_keeps_its_output(rig: Rig):
+    rig.control(f"health_fail_{rig.c2}")
+    rig.control(f"health_fail_{rig.c1}")
+    rig.control(f"output_{rig.c1}", "old version trouble\n")
+    r = rig.run()
+    assert r.returncode == 3, rig.log
+    assert "The last lines the previous version printed:" in rig.log
+    assert "    | old version trouble" in rig.log
+
+
+# --------------------------------------------------------------------------------- snapshot folder
+
+MOUNTED = COMPOSE + "        volumes:\n          - ${SLIPWAY_DATA_DIR:-./data}/files:/var/lib/slipway\n"
+
+
+def _target_with_the_mount(rig: Rig) -> str:
+    (rig.src / "docker-compose.yml").write_text(MOUNTED)
+    c3 = rig.commit("mount the snapshot folder")
+    git(rig.src, "push", "-q", "origin", "main")
+    return c3
+
+
+def test_snapshot_folder_is_made_for_slipway(rig: Rig):
+    c3 = _target_with_the_mount(rig)
+    r = rig.run(target=c3)
+    assert r.returncode == 0, rig.log
+    files = rig.dir / "data" / "files"
+    assert files.is_dir() and stat.S_IMODE(files.stat().st_mode) == 0o700
+    # Not root here, so chown fails and a throwaway db container does it, after the build and before the stop.
+    assert (rig.fake / "files_given").read_text().strip() == str(files)
+    calls = rig.calls
+    run = rig.index("compose run --rm --no-deps --user root -v ")
+    assert rig.index("compose build slipway") < run < rig.index("compose stop -t 30 slipway")
+    assert f"Made {files} for stored snapshots." in rig.log
+    assert f"Gave {files} to Slipway (uid 10001, mode 700)." in rig.log
+    assert calls
+
+
+def test_snapshot_folder_follows_the_data_dir_in_env(rig: Rig, tmp_path: Path):
+    c3 = _target_with_the_mount(rig)
+    data = tmp_path / "appdata"
+    (rig.dir / ".env").write_text(f'SLIPWAY_DATA_DIR="{data}/"\n')
+    r = rig.run(target=c3)
+    assert r.returncode == 0, rig.log
+    assert (data / "files").is_dir()
+    assert (rig.fake / "files_given").read_text().strip() == str(data / "files")
+
+
+def test_snapshot_folder_failure_is_logged_and_the_upgrade_goes_on(rig: Rig):
+    c3 = _target_with_the_mount(rig)
+    rig.control("run_fail")
+    r = rig.run(target=c3)
+    assert r.returncode == 0, rig.log
+    files = rig.dir / "data" / "files"
+    assert (f"Could not give {files} to Slipway, so stored snapshots won't work. "
+            f"Run: sudo chown 10001:10001 {files} && sudo chmod 700 {files}") in rig.log
+
+
+def test_no_snapshot_folder_without_the_mount(rig: Rig):
+    r = rig.run()
+    assert r.returncode == 0, rig.log
+    assert not (rig.dir / "data").exists()
+    assert not any(c.startswith("compose run") for c in rig.calls)
 
 
 def test_switch_failure_rolls_back(rig: Rig):
