@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import shlex
 import time
 import uuid
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode
@@ -53,8 +54,9 @@ from slipway.models import (
     SnapshotStatus,
     User,
 )
+from slipway.services import analytics as deploy_analytics
 from slipway.schemas import BackupOut, SnapshotOut, provider_account_out, seeding_needs_download
-from slipway.services import cloudflare, data, deployer, do_rules, environments, machines, provisioning, snapshots, ssh, switchyard, updates
+from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, provisioning, snapshots, ssh, switchyard, updates
 from slipway.services import hosts as host_rules
 from slipway.services import provider_accounts as accounts_service
 from slipway.services.auth import AuthContext
@@ -2063,10 +2065,313 @@ async def snapshots_page(request: Request, db: DB, ctx: PageAuth) -> HTMLRespons
     )
 
 
+# --------------------------------------------------------------------- analytics
+# The page draws its charts itself (templates/_charts.html). The helpers below turn the analytics services'
+# numbers into chart models: plain numbers and fixed labels, never text from the database.
+
+ANALYTICS_DEFAULT_DAYS = 30
+
+
+def fmt_span(seconds: float | None) -> str:
+    """A length of time for people: 45s, 4m 05s, 2h 05m, 3d 4h."""
+    if seconds is None:
+        return "—"
+    s = int(round(seconds))
+    if s < 3600:
+        return fmt_duration(s)
+    if s < 86400:
+        h, rest = divmod(s, 3600)
+        return f"{h}h {rest // 60:02d}m"
+    d, rest = divmod(s, 86400)
+    return f"{d}d {rest // 3600}h"
+
+
+def fmt_pct(value: float | None) -> str:
+    """A percentage (0-100): one decimal under 10, whole numbers above. The page's script does the same."""
+    if value is None:
+        return "—"
+    return f"{value:.1f}%" if value < 10 else f"{round(value)}%"
+
+
+def fmt_rate(rate: float | None) -> str:
+    """A success rate (0-1) as a percentage, with one decimal unless it is whole. 100% means nothing failed and
+    0% nothing succeeded: anything in between stays between 0.1% and 99.9%, so one failure in 2000 never
+    shows as 100%."""
+    if rate is None:
+        return "—"
+    if rate >= 1:
+        return "100%"
+    if rate <= 0:
+        return "0%"
+    pct = rate * 100
+    if abs(pct - round(pct)) < 1e-9:
+        return f"{round(pct)}%"
+    return f"{min(99.9, max(0.1, pct)):.1f}%"
+
+
+templates.env.filters.update(span=fmt_span, pct=fmt_pct, rate=fmt_rate)
+
+
+def _day_label(day: date) -> str:
+    return f"{day:%a} {day.day} {day:%b}"
+
+
+def _short_day(day: date) -> str:
+    return f"{day.day} {day:%b}"
+
+
+def _count_axis(top_value: int) -> tuple[int, list[int]]:
+    """A round top for a count axis, and its ticks from 0 (at most 5)."""
+    if top_value <= 0:
+        return 1, [0, 1]
+    magnitude = 10 ** max(0, math.floor(math.log10(top_value / 4))) if top_value >= 4 else 1
+    step = magnitude
+    for m in (1, 2, 5, 10):
+        step = m * magnitude
+        if math.ceil(top_value / step) <= 4:
+            break
+    top = math.ceil(top_value / step) * step
+    return top, list(range(0, top + 1, step))
+
+
+def _edge(pos: float) -> str:
+    """How an axis label at ``pos`` (0..1) is anchored, so labels at the ends stay inside the chart."""
+    return "start" if pos < 0.06 else "end" if pos > 0.94 else ""
+
+
+def _delta(cur: float | None, prev: float | None, *, days: int, higher_is_better: bool, points: bool = False,
+           nothing: str, nothing_now: str = "") -> dict[str, Any]:
+    """The change of a stat tile against the previous window: text, direction and whether that is good.
+
+    ``nothing`` says why there is no change to show when the previous window has no value, ``nothing_now``
+    when this one has none."""
+    better = "Higher is better" if higher_is_better else "Lower is better"
+    if cur is None:
+        return {"note": nothing_now, "better": better}
+    if prev is None or (not points and prev == 0):
+        return {"note": nothing, "better": better}
+    if points:
+        change = (cur - prev) * 100
+        text = f"{change:+.0f} pts"
+    else:
+        change = (cur - prev) / prev * 100
+        text = f"{change:+.0f}%"
+    if round(change) == 0:
+        return {"text": "No change", "dir": "flat", "tone": "", "days": days, "better": better}
+    up = change > 0
+    return {"text": text, "dir": "up" if up else "down", "tone": "good" if up == higher_is_better else "bad",
+            "days": days, "better": better}
+
+
+def _deploy_tiles(totals: dict[str, Any], days: int) -> dict[str, Any]:
+    prev = totals["previous"]
+    return {
+        "deploys": _delta(totals["deploys"], prev["deploys"], days=days, higher_is_better=True,
+                          nothing=f"No deploys in the previous {days} days"),
+        # Cancelled deploys count for neither side of the rate, so say which deploys it needs.
+        "rate": _delta(totals["success_rate"], prev["success_rate"], days=days, higher_is_better=True, points=True,
+                       nothing=f"No deploys succeeded or failed in the previous {days} days",
+                       nothing_now=f"No deploys succeeded or failed in the last {days} days"),
+        "median": _delta(totals["median_seconds"], prev["median_seconds"], days=days, higher_is_better=False,
+                         nothing=f"Nothing finished in the previous {days} days",
+                         nothing_now="No deploys have finished yet"),
+        "mttr": _delta(totals["mttr_seconds"], prev["mttr_seconds"], days=days, higher_is_better=False,
+                       nothing=f"No recoveries in the previous {days} days",
+                       nothing_now=f"No recoveries in the last {days} days"),
+    }
+
+
+DEPLOY_SERIES = [
+    {"key": "ok", "name": "Succeeded"},
+    {"key": "fail", "name": "Failed"},
+    {"key": "cancel", "name": "Cancelled"},
+]
+
+
+def _deploy_chart(by_day: list[dict[str, Any]]) -> dict[str, Any]:
+    """The stacked bars of deploys per day: one slot per day, succeeded at the bottom."""
+    rows = [
+        {"date": r["date"], "label": _day_label(r["date"]), "values": [r["succeeded"], r["failed"], r["cancelled"]]}
+        for r in by_day
+    ]
+    n = len(rows)
+    top, ticks = _count_axis(max((sum(r["values"]) for r in rows), default=0))
+    step = 1 if n <= 7 else 7 if n <= 30 else 14
+    xlabels = []
+    for k, i in enumerate(range(n - 1, -1, -step)):  # counted back from today, so today always has a label
+        pos = (i + 0.5) / n
+        # Every other label goes on a narrow chart: 7 days of labels, or 90 days' fortnightly ones, would touch.
+        xlabels.append({"pos": pos, "text": _short_day(rows[i]["date"]), "edge": _edge(pos),
+                        "minor": (n <= 7 or n > 30) and k % 2 == 1})
+    return {
+        "n": n, "top": top, "ticks": ticks, "rows": rows, "series": DEPLOY_SERIES, "xlabels": xlabels,
+        "data": {"kind": "bars", "series": DEPLOY_SERIES, "rows": [{"label": r["label"], "values": r["values"]} for r in rows]},
+    }
+
+
+HOST_SERIES = [("cpu", "CPU load"), ("mem", "Memory"), ("disk", "Disk")]
+
+
+def _time_axis(start: datetime, end: datetime, days: int) -> list[dict[str, Any]]:
+    """Labels at UTC midnights, every day for 7 days, every week for 30 and every two weeks for 90."""
+    span = (end - start).total_seconds()
+    step = 1 if days <= 7 else 7 if days <= 30 else 14
+    first = datetime.combine(end.date(), datetime.min.time(), tzinfo=UTC)
+    labels = []
+    k = 0
+    at = first
+    while at > start:
+        pos = (at - start).total_seconds() / span
+        if 0.04 < pos < 0.96:
+            labels.append({"pos": pos, "text": _short_day(at.date()), "edge": "",
+                           "minor": (days <= 7 or days > 30) and k % 2 == 1})
+        k += 1
+        at -= timedelta(days=step)
+    return labels[::-1]
+
+
+PLOT_COLUMNS = 360
+
+
+def _thin(run: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The points of a run worth drawing: the lowest and highest of each of PLOT_COLUMNS columns, plus both
+    ends, in time order. A week of 5-minute checks is more points than the chart has pixels, and this keeps
+    every peak. The hover layer still has every point."""
+    if len(run) <= 2 * PLOT_COLUMNS:
+        return run
+    keep = {0, len(run) - 1}
+    column: list[int] = []
+    for i, (x, _) in enumerate(run):
+        if column and int(x * PLOT_COLUMNS) != int(run[column[0]][0] * PLOT_COLUMNS):
+            keep.update((min(column, key=lambda j: run[j][1]), max(column, key=lambda j: run[j][1])))
+            column = []
+        column.append(i)
+    keep.update((min(column, key=lambda j: run[j][1]), max(column, key=lambda j: run[j][1])))
+    return [run[i] for i in sorted(keep)]
+
+
+def _host_points(trend: dict[str, Any], *, start: datetime, span: float) -> dict[str, Any]:
+    """Every point of a host's series for the hover layer, shared by the host's charts: seconds since
+    ``start`` and the values (None where a check had no disk figure); hourly points add their peaks."""
+    series = trend["series"]
+    hourly = trend["resolution"] == "hour"
+    points: dict[str, Any] = {
+        "start": round(start.timestamp(), 3), "span": round(span), "hourly": hourly,
+        "t": [round((p["at"] - start).total_seconds()) for p in series],
+        "cpu": [p["cpu"] for p in series], "mem": [p["mem"] for p in series],
+    }
+    if any(p.get("disk") is not None for p in series):
+        points["disk"] = [p.get("disk") for p in series]
+    if hourly:  # an hour's disk point is its peak already
+        points["cpu_peak"] = [p.get("cpu_max", p["cpu"]) for p in series]
+        points["mem_peak"] = [p.get("mem_max", p["mem"]) for p in series]
+    return points
+
+
+def _line_chart(trend: dict[str, Any], key: str, name: str, *, points: dict[str, Any], points_id: str, days: int,
+                gap: float, xlabels: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """One host series on a 0-100% axis, split into runs wherever checks are missing (the gaps stay visible)."""
+    span = points["span"]
+    pairs = [(t, max(0.0, min(100.0, float(v)))) for t, v in zip(points["t"], points.get(key) or [], strict=False)
+             if v is not None]
+    if not pairs:
+        return None
+    runs: list[list[tuple[float, float]]] = []
+    for i, (t, v) in enumerate(pairs):
+        if not runs or t - pairs[i - 1][0] > gap:
+            runs.append([])
+        runs[-1].append((t / span, v))
+    hourly = points["hourly"]
+    # Hourly lines plot each hour's average (disk: its peak), so the headline maximum is a peak above the line.
+    value_name = name if not hourly else f"{name}, peak" if key == "disk" else f"{name}, average"
+    return {
+        "key": key, "name": name, "stats": trend["stats"].get(key), "runs": [_thin(run) for run in runs],
+        "xlabels": xlabels, "last": runs[-1][-1], "hourly": hourly,
+        "note": ("Hourly peaks" if key == "disk" else "Hourly averages") if hourly else "",
+        "max_label": "Peak" if hourly else "Max",
+        "data": {"kind": "line", "key": key, "name": name, "value_name": value_name, "points": points_id},
+        "label": f"{name} on {trend['name']}, last {days} days, 0 to 100%. The values are in the table below.",
+    }
+
+
+def _host_table(trend: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """The table view of a host's charts: hourly rows for raw samples, daily rows for hourly ones, newest first."""
+    hourly = trend["resolution"] == "hour"
+    groups: dict[datetime, list[dict[str, Any]]] = defaultdict(list)
+    for point in trend["series"]:
+        at = point["at"].astimezone(UTC)
+        key = at.replace(minute=0, second=0, microsecond=0) if not hourly else at.replace(hour=0, minute=0, second=0, microsecond=0)
+        groups[key].append(point)
+    rows = []
+    for at in sorted(groups, reverse=True):
+        points = groups[at]
+        weights = [p.get("samples", 1) for p in points]
+        row: dict[str, Any] = {"at": at, "label": _day_label(at.date()) + ("" if hourly else f", {at:%H}:00")}
+        for key in ("cpu", "mem"):
+            row[f"{key}_avg"] = sum(p[key] * w for p, w in zip(points, weights, strict=True)) / sum(weights)
+            row[f"{key}_max"] = max(p.get(f"{key}_max", p[key]) for p in points)
+        disks = [p["disk"] for p in points if p.get("disk") is not None]
+        row["disk_max"] = max(disks) if disks else None
+        rows.append(row)
+    return ("Daily" if hourly else "Hourly"), rows
+
+
+def _check_interval(seconds: int) -> str:
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return "every minute" if minutes == 1 else f"every {minutes} minutes"
+    return f"every {seconds} seconds"
+
+
+def _host_cards(trends: list[dict[str, Any]], *, now: datetime, days: int) -> list[dict[str, Any]]:
+    start = now - timedelta(days=days)
+    span = (now - start).total_seconds()
+    poll = get_settings().host_poll_interval or 300
+    xlabels = _time_axis(start, now, days)
+    cards = []
+    for trend in trends:
+        # Longer than this between two points is a gap: checks failed or Slipway was down.
+        gap = 1.5 * 3600 if trend["resolution"] == "hour" else max(2.5 * poll, poll + 60)
+        points = _host_points(trend, start=start, span=span)
+        points_id = f"points-{trend['id']}"
+        charts = [
+            chart for key, name in HOST_SERIES
+            if (chart := _line_chart(trend, key, name, points=points, points_id=points_id, days=days, gap=gap,
+                                     xlabels=xlabels))
+        ]
+        caption, rows = _host_table(trend)
+        cards.append({**trend, "charts": charts, "points": points, "points_id": points_id, "table_caption": caption,
+                      "table": rows, "has_disk": any(r["disk_max"] is not None for r in rows)})
+    return cards
+
+
 @router.get("/analytics")
-async def analytics(request: Request, db: DB, ctx: PageAuth) -> HTMLResponse:
+async def analytics(request: Request, db: DB, ctx: PageAuth, days: str = "") -> HTMLResponse:
     need(ctx, Perm.ANALYTICS_READ)
-    return await render(request, db, "coming_soon.html", ctx, page="analytics")
+    try:
+        n = int(days)
+    except ValueError:
+        n = ANALYTICS_DEFAULT_DAYS
+    if n not in deploy_analytics.ALLOWED_DAYS:
+        n = ANALYTICS_DEFAULT_DAYS
+    now = utcnow()
+    deploys = tiles = deploy_chart = None
+    if ctx.can(Perm.DEPLOYMENTS_READ):
+        deploys = deploy_analytics.hide_names(
+            await deploy_analytics.deploy_stats(db, days=n, now=now),
+            repositories=ctx.can(Perm.REPOS_READ), hosts=ctx.can(Perm.HOSTS_READ),
+        )
+        tiles = _deploy_tiles(deploys["totals"], n)
+        deploy_chart = _deploy_chart(deploys["by_day"])
+    hosts = None
+    if ctx.can(Perm.HOSTS_READ):
+        hosts = _host_cards(await host_metrics.host_trends(db, days=n, now=now), now=now, days=n)
+    poll = get_settings().host_poll_interval
+    return await render(
+        request, db, "analytics.html", ctx, days=n, ranges=deploy_analytics.ALLOWED_DAYS, deploys=deploys,
+        tiles=tiles, deploy_chart=deploy_chart, hosts=hosts,
+        check_every=_check_interval(poll) if poll > 0 else None,
+    )
 
 
 @router.get("/logs")

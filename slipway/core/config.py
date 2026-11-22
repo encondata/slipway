@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     github_web_url: str = "https://github.com"
 
     host_poll_interval: int = 300  # seconds; 0 disables background host health checks
+    # seconds between host history rollups and cleanups; 0 disables them
+    metrics_retention_interval: int = 3600
     default_deploy_root: str = "/opt/slipway"
     ssh_connect_timeout: int = 15
 

@@ -43,6 +43,9 @@
  *
  * Host setup:
  *   <section data-host-setup="/api/v1/hosts/<id>/setup">  (follows Slipway setting up a new server)
+ *
+ * Analytics:
+ *   <div class="chart-plot" data-chart='{...}'>             (chart tooltips on hover and from the keyboard)
  */
 (function () {
   "use strict";
@@ -3006,6 +3009,191 @@
     tick();
   }
 
+  // -------------------------------------------------------------- charts
+  // <div class="chart-plot" data-chart='{"kind": "bars" | "line", ...}'> (templates/_charts.html) gets a tooltip:
+  // per day slot on bars (the whole slot is the target), the nearest point with a crosshair on lines. The same
+  // shows from the keyboard once the plot has focus (arrows, Page Up/Down, Home, End; Escape hides it).
+  // Screen readers hear the keyboard's moves only, from a separate live region: the pointer's tooltip is
+  // visual and would otherwise queue an announcement on every move. Everything goes in with textContent. Without JavaScript the bars keep their SVG <title>s, and every chart
+  // has a table view.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const pad2 = (n) => String(n).padStart(2, "0");
+
+  // Same rule as the page's pct filter: one decimal under 10, whole numbers above.
+  function fmtPct(v) {
+    if (typeof v !== "number" || !isFinite(v)) return "—";
+    return (v < 10 ? v.toFixed(1) : String(Math.round(v))) + "%";
+  }
+
+  function fmtWhen(epoch, hourly) {
+    epoch = Math.round(epoch);
+    const d = new Date(epoch * 1000);
+    const day = WEEKDAYS[d.getUTCDay()] + " " + d.getUTCDate() + " " + MONTHS[d.getUTCMonth()];
+    const hm = pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
+    if (!hourly) return day + ", " + hm + " UTC";
+    return day + ", " + hm + "–" + pad2(new Date((epoch + 3600) * 1000).getUTCHours()) + ":00 UTC";
+  }
+
+  // Index in the sorted list ``ts`` closest to ``x``.
+  function nearestIndex(ts, x) {
+    let lo = 0, hi = ts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (ts[mid] <= x) lo = mid; else hi = mid;
+    }
+    return Math.abs(ts[hi] - x) < Math.abs(x - ts[lo]) ? hi : lo;
+  }
+
+  function chartEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    el.className = cls;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  }
+
+  // A line chart's points live once per host on <div id=".." data-points='{"start", "span", "hourly", "t": [..],
+  // "cpu": [..], "mem": [..], "disk"?: [..], "cpu_peak"?: [..], "mem_peak"?: [..]}'>, shared by its charts.
+  // Returns the chart's own series (points without a value left out), or null.
+  const pointSets = {};
+  function linePoints(spec) {
+    const src = typeof spec.points === "string" ? document.getElementById(spec.points) : null;
+    if (!src) return null;
+    if (!(spec.points in pointSets)) {
+      try { pointSets[spec.points] = JSON.parse(src.dataset.points); } catch (e) { pointSets[spec.points] = null; }
+    }
+    const all = pointSets[spec.points];
+    if (!all || !Array.isArray(all.t) || !Array.isArray(all[spec.key])) return null;
+    const peaks = all[spec.key + "_peak"];
+    const out = { start: all.start, span: all.span, hourly: !!all.hourly, t: [], v: [], peak: Array.isArray(peaks) ? [] : null };
+    all.t.forEach((t, i) => {
+      const v = all[spec.key][i];
+      if (typeof v !== "number") return;
+      out.t.push(t);
+      out.v.push(v);
+      if (out.peak) out.peak.push(peaks[i]);
+    });
+    return out;
+  }
+
+  function wireChart(plot) {
+    let spec;
+    try { spec = JSON.parse(plot.dataset.chart); } catch (e) { return; }
+    const bars = spec.kind === "bars";
+    if (!bars) {
+      const pts = linePoints(spec);
+      if (!pts) return;
+      spec = Object.assign({}, spec, pts);
+    }
+    const n = bars ? (spec.rows || []).length : (spec.t || []).length;
+    if (!n || (!bars && !(spec.span > 0))) return;
+    $$("title", plot).forEach((t) => t.remove());  // the tooltip replaces the browser's own
+    const tip = chartEl("div", "chart-tip");
+    tip.hidden = true;
+    tip.setAttribute("aria-hidden", "true");
+    plot.appendChild(tip);
+    const live = chartEl("div", "sr-only");
+    live.setAttribute("aria-live", "polite");
+    plot.appendChild(live);
+    let cross = null, dot = null;
+    if (!bars) {
+      cross = chartEl("div", "chart-cross");
+      dot = chartEl("span", "chart-dot");
+      cross.hidden = dot.hidden = true;
+      plot.appendChild(cross);
+      plot.appendChild(dot);
+    }
+    const marks = bars ? $$("[data-i]", plot) : [];
+    let current = -1, spoken = "";
+
+    function row(value, name, key) {
+      spoken += ", " + value + " " + name;
+      const r = chartEl("div", "chart-tip-row");
+      r.appendChild(chartEl("span", "chart-key " + key));
+      r.appendChild(chartEl("b", "", value));
+      r.appendChild(chartEl("span", "chart-tip-name", name));
+      return r;
+    }
+
+    // Whether the tip goes right of the point, left of it, or (when neither fits, as on a phone) is pinned
+    // inside the plot. Measured when the sizes are known; otherwise right of the point on the left 60%.
+    function place(pos) {
+      const width = plot.clientWidth, tipWidth = tip.offsetWidth;
+      let mode = pos > 60 ? "flip" : "";
+      if (width > 0 && tipWidth > 0) {
+        const x = pos / 100 * width;
+        mode = x + 14 + tipWidth <= width ? "" : x - 14 - tipWidth >= 0 ? "flip" : "pin";
+      }
+      tip.style.left = mode === "pin" ? Math.max(0, width - tipWidth) + "px" : pos + "%";
+      tip.classList.toggle("flip", mode === "flip");
+      tip.classList.toggle("pin", mode === "pin");
+    }
+
+    function show(i, announce) {
+      i = Math.max(0, Math.min(n - 1, i));
+      if (i === current && !tip.hidden) {  // the pointer moved within the same point: nothing changes
+        if (announce) live.textContent = spoken;
+        return;
+      }
+      current = i;
+      tip.textContent = "";
+      spoken = "";
+      let pos;
+      if (bars) {
+        const r = spec.rows[i];
+        pos = (i + 0.5) / n * 100;
+        tip.appendChild(chartEl("div", "chart-tip-head", r.label));
+        spoken = r.label;
+        spec.series.forEach((s, k) => tip.appendChild(row(String(r.values[k]), s.name, s.key)));
+        marks.forEach((m) => m.classList.toggle("is-active", Number(m.getAttribute("data-i")) === i));
+        plot.classList.toggle("has-active", true);
+      } else {
+        const v = spec.v[i];
+        pos = Math.max(0, Math.min(100, spec.t[i] / spec.span * 100));
+        spoken = fmtWhen(spec.start + spec.t[i], spec.hourly);
+        tip.appendChild(chartEl("div", "chart-tip-head", spoken));
+        tip.appendChild(row(fmtPct(v), spec.value_name || spec.name, "line"));
+        if (spec.peak) tip.appendChild(row(fmtPct(spec.peak[i]), "Peak", "line"));
+        cross.style.left = dot.style.left = pos + "%";
+        dot.style.top = (100 - Math.max(0, Math.min(100, v))) + "%";
+        cross.hidden = dot.hidden = false;
+      }
+      tip.hidden = false;
+      place(pos);
+      if (announce) live.textContent = spoken;
+    }
+
+    function hide() {
+      current = -1;
+      tip.hidden = true;
+      live.textContent = "";
+      if (cross) cross.hidden = dot.hidden = true;
+      marks.forEach((m) => m.classList.toggle("is-active", false));
+      plot.classList.toggle("has-active", false);
+    }
+
+    function indexAt(ev) {
+      const box = plot.getBoundingClientRect();
+      if (!box || !box.width) return -1;
+      const frac = Math.max(0, Math.min(1, (ev.clientX - box.left) / box.width));
+      return bars ? Math.min(n - 1, Math.floor(frac * n)) : nearestIndex(spec.t, frac * spec.span);
+    }
+
+    const follow = (ev) => { const i = indexAt(ev); if (i >= 0) show(i); };
+    plot.addEventListener("pointermove", follow);
+    plot.addEventListener("pointerdown", follow);
+    plot.addEventListener("pointerleave", () => { if (document.activeElement === plot) show(current); else hide(); });
+    plot.addEventListener("focus", () => show(current >= 0 ? current : n - 1, true));
+    plot.addEventListener("blur", hide);
+    plot.addEventListener("keydown", (ev) => {
+      const page = Math.max(1, Math.round(n / 10));
+      const at = current >= 0 ? current : n - 1;
+      const moves = { ArrowLeft: at - 1, ArrowRight: at + 1, PageUp: at - page, PageDown: at + page, Home: 0, End: n - 1 };
+      if (ev.key in moves) { ev.preventDefault(); show(moves[ev.key], true); }
+      else if (ev.key === "Escape") hide();
+    });
+  }
+
   // -------------------------------------------------------------- boot
   document.addEventListener("DOMContentLoaded", () => {
     try {
@@ -3022,6 +3210,7 @@
     $$("[data-host-setup]").forEach(followSetup);
     $$("[data-update-branches]").forEach(loadUpdateBranches);
     $$("[data-load]").forEach((el) => { if (el.dataset.lazy === undefined) load(el); });
+    $$("[data-chart]").forEach(wireChart);
     $$("select[data-fill]").forEach(wireFill);
     $$("select[data-branches]").forEach(wireBranches);
     // Before wireShowWhen: the flow keeps its computed fields (data_mode) current on every change first.

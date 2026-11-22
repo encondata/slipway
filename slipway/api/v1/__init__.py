@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from slipway.api.v1 import (
+    analytics,
     audit,
     auth,
     deployments,
@@ -21,5 +22,5 @@ from slipway.api.v1 import (
 
 api_router = APIRouter()
 for module in (system, auth, users, roles, tokens, hosts, unmanaged, repositories, instances, environments, deployments,
-               snapshots, audit, settings, provider_accounts, updates):
+               analytics, snapshots, audit, settings, provider_accounts, updates):
     api_router.include_router(module.router)

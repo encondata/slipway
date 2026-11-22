@@ -40,6 +40,7 @@ from slipway.models.machine import (
     SnapshotReason,
     TerraformState,
 )
+from slipway.models.metrics import HostSample, HostSampleHourly
 from slipway.models.provider import AccountStatus, ProviderAccount, ProviderKind
 from slipway.models.repository import Repository
 from slipway.models.setting import AppSetting
@@ -68,6 +69,8 @@ __all__ = [
     "FreshData",
     "Host",
     "HostAuthMethod",
+    "HostSample",
+    "HostSampleHourly",
     "HostOS",
     "HostSetupStatus",
     "HostStatus",

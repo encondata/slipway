@@ -215,6 +215,8 @@ ACTIVE_ACTIVATE = "status IN ('queued', 'running') AND kind = 'activate'"
 class Deployment(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "deployments"
     __table_args__ = (
+        # Analytics and the deployments list read by when a deploy was created (migration 0014).
+        Index("ix_deployments_created_at", "created_at"),
         # At most one queued or running job per instance.
         Index(
             "ux_deployments_one_active",
