@@ -8,6 +8,7 @@ import logging
 import os
 from functools import lru_cache
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 from pydantic import Field, field_validator, model_validator
@@ -49,7 +50,8 @@ class Settings(BaseSettings):
     database_password: str | None = None
     database_echo: bool = False
 
-    session_ttl_hours: int = 24 * 14
+    # Password and GitHub sign-ins. A HackSpaceLabs sign-in lasts as long as its Keycloak session instead.
+    session_ttl_hours: int = 96
     allow_signup: bool = False
     default_role: str = "viewer"
 
@@ -68,6 +70,24 @@ class Settings(BaseSettings):
     github_service_token: str | None = None
     github_api_url: str = "https://api.github.com"
     github_web_url: str = "https://github.com"
+
+    # Sign in with HackSpaceLabs (the HackSpaceLabs Keycloak, OpenID Connect). These use the unprefixed HSL_* names
+    # every HackSpaceLabs app reads. Off unless the issuer, client id and secret are all set.
+    hsl_oidc_issuer: str = Field("", validation_alias="HSL_OIDC_ISSUER")
+    hsl_oidc_client_id: str = Field("slipway", validation_alias="HSL_OIDC_CLIENT_ID")
+    hsl_oidc_client_secret: str = Field("", validation_alias="HSL_OIDC_CLIENT_SECRET")
+    # Optional origin for calls from Slipway to Keycloak (discovery, tokens, keys) when the public address
+    # isn't reachable from here. Browser redirects and the issuer check always use the public issuer.
+    hsl_oidc_internal_url: str = Field("", validation_alias="HSL_OIDC_INTERNAL_URL")
+    # Send signed-out visitors straight to HackSpaceLabs instead of showing the sign-in page.
+    hsl_oidc_auto_redirect: bool = Field(False, validation_alias="HSL_OIDC_AUTO_REDIRECT")
+    # How often a HackSpaceLabs session is rechecked with Keycloak, in seconds.
+    hsl_oidc_recheck_seconds: int = Field(60, ge=1, validation_alias="HSL_OIDC_RECHECK_SECONDS")
+    hsl_portal_url: str = Field("", validation_alias="HSL_PORTAL_URL")
+    # The portal gateway's own address (not through the proxy), for the owner check of API tokens.
+    hsl_portal_internal_url: str = Field("", validation_alias="HSL_PORTAL_INTERNAL_URL")
+    # The app switcher: id|name|url entries separated by commas.
+    hsl_suite_apps: str = Field("", validation_alias="HSL_SUITE_APPS")
 
     host_poll_interval: int = 300  # seconds; 0 disables background host health checks
     # seconds between host history rollups and cleanups; 0 disables them
@@ -118,10 +138,10 @@ class Settings(BaseSettings):
             return [v.strip().lower() for v in value.split(",") if v.strip()]
         return value
 
-    @field_validator("base_url")
+    @field_validator("base_url", "hsl_oidc_issuer", "hsl_oidc_internal_url", "hsl_portal_url", "hsl_portal_internal_url")
     @classmethod
     def _strip_slash(cls, value: str) -> str:
-        return value.rstrip("/")
+        return value.strip().rstrip("/")
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -186,6 +206,43 @@ class Settings(BaseSettings):
     def github_callback_url(self) -> str:
         return f"{self.base_url}/auth/github/callback"
 
+    def hsl_problem(self) -> str | None:
+        """Why HackSpaceLabs sign-in is half set up, or None (fully set up, or not at all)."""
+        issuer, secret = self.hsl_oidc_issuer, self.hsl_oidc_client_secret
+        if not issuer and not secret:
+            return None
+        missing = [name for name, value in (
+            ("HSL_OIDC_ISSUER", issuer), ("HSL_OIDC_CLIENT_ID", self.hsl_oidc_client_id),
+            ("HSL_OIDC_CLIENT_SECRET", secret), ("SLIPWAY_BASE_URL", self.base_url),
+        ) if not value]
+        if missing:
+            return f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set"
+        if not _http_url(issuer, path=True):
+            return "HSL_OIDC_ISSUER must be an http(s) URL without a query or fragment"
+        if self.hsl_oidc_internal_url and not _http_url(self.hsl_oidc_internal_url, path=False):
+            return "HSL_OIDC_INTERNAL_URL must be an origin (scheme://host[:port]) without a path"
+        if not _http_url(self.base_url, path=True):
+            return "SLIPWAY_BASE_URL must be an http(s) URL"
+        return None
+
+    @property
+    def hsl_enabled(self) -> bool:
+        return bool(self.hsl_oidc_issuer and self.hsl_oidc_client_secret) and self.hsl_problem() is None
+
+    @property
+    def hsl_callback_url(self) -> str:
+        return f"{self.base_url}/auth/hsl/callback"
+
+    @property
+    def hsl_apps(self) -> list[dict[str, str]]:
+        """HSL_SUITE_APPS as [{id, name, url}]; malformed entries are skipped."""
+        apps = []
+        for entry in self.hsl_suite_apps.split(","):
+            parts = [p.strip() for p in entry.split("|")]
+            if len(parts) == 3 and all(parts) and _http_url(parts[2], path=True):
+                apps.append({"id": parts[0], "name": parts[1], "url": parts[2]})
+        return apps
+
     @property
     def oauth_scopes(self) -> str:
         scopes = self.github_scopes.split()
@@ -199,6 +256,13 @@ class Settings(BaseSettings):
         # Development fallback: derive a stable key from the secret key.
         digest = hashlib.sha256(f"slipway-encryption:{self.secret_key}".encode()).digest()
         return [base64.urlsafe_b64encode(digest)]
+
+
+def _http_url(value: str, *, path: bool) -> bool:
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.query or parts.fragment:
+        return False
+    return "@" not in parts.netloc and (path or parts.path in ("", "/"))
 
 
 @lru_cache
