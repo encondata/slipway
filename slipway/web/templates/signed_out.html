@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, logo, mountains %}
+{% block title %}Signed out{% endblock %}
+{% block body %}
+<div class="auth-page">
+  {{ mountains("0 160 1200 460") }}
+  <div class="card auth-card">
+    <a class="brand" href="/">{{ logo() }}</a>
+    <h1>You're signed out of HackSpaceLabs</h1>
+    <p class="lede">You're signed out of Slipway and the other HackSpaceLabs apps.</p>
+    <a class="btn btn-primary btn-lg btn-block" href="/login">Sign in</a>
+  </div>
+</div>
+{% endblock %}

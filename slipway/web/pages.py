@@ -59,8 +59,9 @@ from slipway.schemas import BackupOut, SnapshotOut, provider_account_out, seedin
 from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, migrate, provisioning, snapshots, ssh, switchyard, updates
 from slipway.services import hosts as host_rules
 from slipway.services import provider_accounts as accounts_service
-from slipway.services.auth import AuthContext
+from slipway.services.auth import AuthContext, signed_in_recently
 from slipway.services.users import user_count
+from slipway.web import hsl as hsl_web
 from slipway.web.oauth import safe_next
 
 router = APIRouter(include_in_schema=False)
@@ -164,6 +165,21 @@ OAUTH_ERRORS: dict[str, str] = {
     "email_in_use": "A Slipway account already uses your GitHub email. Sign in with your password, then link GitHub from Settings.",
     "config": "GitHub sign-in is misconfigured on this Slipway. Ask an admin.",
     "failed": "GitHub sign-in failed. Please try again.",
+    "hsl_only": "This account signs in with HackSpaceLabs.",
+    # Sign in with HackSpaceLabs (slipway.web.hsl; PLAN.md 5.9).
+    "sso_expired": "That sign-in took too long or was already used. Try again.",
+    "sso_cancelled": "Sign-in was cancelled.",
+    "sso_failed": "Signing in with HackSpaceLabs didn't work. Try again, or ask an administrator.",
+    "sso_unavailable": "HackSpaceLabs sign-in can't be reached right now. Administrators can use a local account below.",
+    "no_access": "Your HackSpaceLabs account doesn't have access to Slipway. Ask an administrator.",
+    "account_exists": "A Slipway account already uses your HackSpaceLabs email address. Sign in the way you did "
+                      "before, then link HackSpaceLabs from Settings, Profile.",
+    "sso_linked_elsewhere": "That HackSpaceLabs account is already linked to another Slipway account.",
+    "sso_already_linked": "This Slipway account is already linked to a different HackSpaceLabs account.",
+    "sso_last_admin": "This is the last Slipway admin who can sign in without HackSpaceLabs, so it can't be linked. "
+                      "Keep another admin with a password first.",
+    "sso_reauth": "HackSpaceLabs didn't ask for your password just now. Try again.",
+    "no_admin": "Slipway has no administrator yet. Create one with slipway create-admin, then sign in again.",
 }
 
 
@@ -226,7 +242,7 @@ async def render(request: Request, db: DB, name: str, ctx: AuthContext | None, *
     settings = get_settings()
     last_sync = await db.scalar(select(func.max(Repository.synced_at))) if ctx else None
     updates_ahead = await updates_badge(db) if ctx and ctx.can(Perm.UPDATES_RUN) else 0
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         name,
         {
@@ -237,10 +253,14 @@ async def render(request: Request, db: DB, name: str, ctx: AuthContext | None, *
             "last_sync": last_sync,
             "updates_ahead": updates_ahead,
             "path": request.url.path,
+            "recent_sign_in": signed_in_recently(ctx.session) if ctx and ctx.session else False,
             **context,
         },
         status_code=status_code,
     )
+    if ctx is not None and request.cookies.get(hsl_web.TRY_COOKIE):
+        response.delete_cookie(hsl_web.TRY_COOKIE, path="/")  # signed in: the auto-redirect may try again later
+    return response
 
 
 async def updates_badge(db: DB) -> int:
@@ -309,14 +329,34 @@ async def repo_summaries(db: DB) -> dict[uuid.UUID, dict[str, Any]]:
 
 @router.get("/login")
 async def login_page(
-    request: Request, db: DB, ctx: OptionalAuth, next: str = "/", error: str = "", login: str = ""
+    request: Request, db: DB, ctx: OptionalAuth, next: str = "/", error: str = "", login: str = "", local: str = ""
 ) -> Response:
     next = safe_next(next)
     if ctx is not None:
         return RedirectResponse(next, 302)
+    settings = get_settings()
+    auto = settings.hsl_enabled and settings.hsl_oidc_auto_redirect
+    if auto and not local and not error:
+        # PLAN.md 5.9: straight to HackSpaceLabs, unless the last try came back here within 30 seconds (its session
+        # cookie didn't stick, say a Secure cookie on plain http): then show the page instead of looping.
+        if request.cookies.get(hsl_web.TRY_COOKIE):
+            error = "sso_failed"
+        else:
+            response = RedirectResponse(f"/auth/hsl/login?{urlencode({'next': next})}", 302)
+            response.set_cookie(hsl_web.TRY_COOKIE, "1", max_age=hsl_web.TRY_SECONDS, httponly=True, samesite="lax", path="/")
+            return response
     return await render(
-        request, db, "login.html", None, next=next, error=oauth_error(error, login), no_users=await user_count(db) == 0
+        request, db, "login.html", None, next=next, error=oauth_error(error, login), error_code=error,
+        no_users=await user_count(db) == 0, sso=settings.hsl_enabled,
+        # With auto-redirect on, the local form is for administrators while HackSpaceLabs is down (D6).
+        show_local=not auto or bool(local) or error == "sso_unavailable",
     )
+
+
+@router.get("/signed-out")
+async def signed_out(request: Request, db: DB) -> HTMLResponse:
+    """Where Keycloak's sign-out comes back to. It never sends anyone on by itself."""
+    return await render(request, db, "signed_out.html", None)
 
 
 @router.post("/js-required")
@@ -2447,7 +2487,7 @@ async def settings_profile(
     request: Request, db: DB, ctx: PageAuth, error: str = "", login: str = "", linked: str = ""
 ) -> HTMLResponse:
     return await render(
-        request, db, "settings/profile.html", ctx, tab="profile", error=oauth_error(error, login), linked=bool(linked)
+        request, db, "settings/profile.html", ctx, tab="profile", error=oauth_error(error, login), linked=linked
     )
 
 

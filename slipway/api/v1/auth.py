@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 
 from slipway.api.deps import DB, Auth
 from slipway.core import ratelimit
@@ -20,9 +23,10 @@ from slipway.core.ratelimit import (
 from slipway.core.security import hash_password_async, verify_password_async
 from slipway.models import UserSession
 from slipway.schemas import LoginIn, PasswordChange, ProfileUpdate, RegisterIn, SessionOut, UserOut
-from slipway.services import audit
+from slipway.services import audit, hsl
 from slipway.services.audit import client_ip
 from slipway.services.auth import (
+    OIDC,
     AuthContext,
     authenticate_password,
     clear_session_cookie,
@@ -35,6 +39,7 @@ from slipway.services.auth import (
 from slipway.services.users import FIRST_ADMIN_RESERVED, UserError, check_password_strength, create_user, user_count
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+log = logging.getLogger(__name__)
 
 TOO_MANY = "Too many attempts; try again in a few minutes"
 
@@ -56,6 +61,13 @@ async def login(body: LoginIn, request: Request, response: Response, db: DB) -> 
     if not ratelimit.acquire((login_ip_limiter, ip), (login_pair_limiter, pair), (login_email_limiter, email)):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, TOO_MANY)
     user = await authenticate_password(db, email, body.password)
+    if user is not None and user.hackspacelabs is not None:
+        # D16: an account tied to HackSpaceLabs signs in only there, or disabling someone in Keycloak would leave
+        # their password working. Counted like a wrong password; said only now that the password was right.
+        audit.record(db, "auth.login_failed", actor=user, target=user,
+                     summary="Password sign-in refused: this account signs in with HackSpaceLabs", request=request)
+        await db.commit()
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "This account signs in with HackSpaceLabs")
     if user is None:
         audit.record(db, "auth.login_failed", summary=f"Failed login for {body.email[:100]}", request=request)
         await db.commit()
@@ -71,12 +83,34 @@ async def login(body: LoginIn, request: Request, response: Response, db: DB) -> 
     return SessionOut(user=UserOut.of(user), csrf_token=session.csrf_token)
 
 
-@router.post("/logout", status_code=204)
-async def logout(ctx: Auth, response: Response, db: DB) -> None:
+@router.post(
+    "/logout", status_code=204,
+    responses={200: {"description": "A HackSpaceLabs session: also sign out at HackSpaceLabs by going to `redirect`"}},
+)
+async def logout(ctx: Auth, db: DB) -> Response:
+    """Ends this session. For a HackSpaceLabs session the answer is 200 with ``{"redirect": url}``, Keycloak's
+    sign-out address (which signs the person out of every HackSpaceLabs app); otherwise 204, as always."""
+    redirect = None
     if ctx.session is not None:
+        if ctx.session.auth_source == OIDC:
+            redirect = await _end_session_url(ctx.session.idp_tokens or {})
         await db.delete(ctx.session)
         await db.commit()
+    response: Response = JSONResponse({"redirect": redirect}) if redirect else Response(status_code=204)
     clear_session_cookie(response)
+    return response
+
+
+async def _end_session_url(stored: dict[str, str]) -> str:
+    """Keycloak's sign-out address for this session, or the signed-out page when it can't be built."""
+    client = hsl.client()
+    if client is None:
+        return "/signed-out"
+    try:
+        return await client.end_session_url(stored.get("id_token", ""), f"{get_settings().base_url}/signed-out")
+    except hsl.HslError as exc:
+        log.warning("Couldn't build the HackSpaceLabs sign-out address: %s", exc)
+        return "/signed-out"
 
 
 @router.post("/register", status_code=201)
@@ -140,7 +174,7 @@ async def change_password(body: PasswordChange, ctx: Auth, request: Request, db:
         for limiter, key in attempt:
             limiter.reset(key)
     elif not signed_in_recently(session):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, sign_in_again("set your password"))
+        raise HTTPException(status.HTTP_403_FORBIDDEN, sign_in_again("set your password", session))
     user.password_hash = await hash_password_async(body.new_password)
     await revoke_user_sessions(db, user, keep=session)
     audit.record(db, "auth.password_changed", actor=user, target=user, request=request)
@@ -153,11 +187,12 @@ async def unlink_github(ctx: Auth, request: Request, db: DB) -> None:
     account = ctx.user.github
     if account is None:
         return
-    if ctx.user.password_hash is None:
+    # With a HackSpaceLabs link the account still has a way in without GitHub.
+    if ctx.user.password_hash is None and ctx.user.hackspacelabs is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set a password before unlinking GitHub, or you'll be locked out")
     # A stolen session must not swap the owner's GitHub link for the thief's (unlink, then link another).
     if not signed_in_recently(session):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, sign_in_again("unlink GitHub"))
+        raise HTTPException(status.HTTP_403_FORBIDDEN, sign_in_again("unlink GitHub", session))
     ctx.user.oauth_accounts.remove(account)
     audit.record(db, "auth.github_unlinked", actor=ctx.user, target=ctx.user, summary=f"Unlinked @{account.login}", request=request)
     await db.commit()

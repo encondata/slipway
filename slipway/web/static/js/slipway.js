@@ -1,7 +1,8 @@
 /* Slipway front-end: small, dependency-free progressive enhancement.
  *
  * Declarative hooks used by the templates:
- *   <button data-api="POST /api/v1/..." data-confirm="..." data-then="reload|redirect:/x|redirect:/x/{id}">
+ *   <button data-api="POST /api/v1/..." data-confirm="..." data-then="reload|redirect:/x|redirect:/x/{id}|follow:/x">
+ *     (follow: goes where the answer's {redirect} says, else to /x)
  *   <form data-form="POST /api/v1/..." data-then="...">   (fields → JSON; see serialize())
  *   <form data-omit-unchanged="field ...">                 (leave those fields out of the body unless the user changed them)
  *   <button data-open="dialog-id">, <button data-close>
@@ -130,6 +131,12 @@
       if (!data || !data.url) return;
       toast(`Download started (${humanBytes(data.bytes)})`);
       return location.assign(sameOrigin(data.url));
+    }
+    if (spec.startsWith("follow:")) {
+      // Sign-out of a HackSpaceLabs session answers {redirect}: Keycloak's own sign-out page, on its own origin.
+      const target = data && typeof data.redirect === "string" ? data.redirect : "";
+      location.href = /^https?:\/\//i.test(target) ? target : sameOrigin(target || spec.slice(7));
+      return;
     }
     if (spec.startsWith("redirect:")) {
       const url = spec.slice(9).replace(/\{([\w.]+)\}/g, (_, k) => encodeURIComponent(pick(data, k) || ""));

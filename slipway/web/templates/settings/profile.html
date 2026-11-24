@@ -3,7 +3,8 @@
 {% block title %}Profile{% endblock %}
 {% block settings %}
 {% if error %}<div class="callout error">{{ icon("alert") }}<span>{{ error }}</span></div>{% endif %}
-{% if linked %}<div class="callout success">{{ icon("check") }}<span>GitHub account linked. You can now sync repositories.</span></div>{% endif %}
+{% if linked == "hackspacelabs" %}<div class="callout success">{{ icon("check") }}<span>HackSpaceLabs account linked. From now on this account signs in with HackSpaceLabs.</span></div>
+{% elif linked %}<div class="callout success">{{ icon("check") }}<span>GitHub account linked. You can now sync repositories.</span></div>{% endif %}
 
 <div class="grid grid-2">
   <section class="card">
@@ -14,6 +15,26 @@
       <div><button class="btn btn-primary" type="submit">Save</button></div>
     </form>
   </section>
+
+  {% if user.hackspacelabs or settings.hsl_enabled %}
+  <section class="card">
+    <div class="card-head"><span class="head-icon"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt=""></span><div><h2>HackSpaceLabs account</h2><p>One sign-in for Slipway and the other HackSpaceLabs apps.</p></div></div>
+    <div class="card-body stack" style="gap: 14px">
+      {% if user.hackspacelabs %}
+        <div class="row"><span class="badge success">Linked</span> <strong>{{ user.hackspacelabs.login }}</strong></div>
+        <p class="help">This account signs in only with HackSpaceLabs: password and GitHub sign-in are turned off for it. Your GitHub connection still lists repositories and downloads source.</p>
+        {% if auth.session and auth.session.auth_source == "oidc" and not recent_sign_in %}
+        <div><a class="btn" href="/auth/hsl/login?reauth=1&amp;next=%2Fsettings">{{ icon("lock") }} Confirm it's you</a></div>
+        <p class="help">Changing GitHub or setting a password needs a HackSpaceLabs sign-in from the last 15 minutes.</p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Not linked.</p>
+        <div><a class="btn btn-hsl" href="/auth/hsl/link"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt=""> Link HackSpaceLabs</a></div>
+        <p class="help">After linking, this account signs in only with HackSpaceLabs, and your roles here come from HackSpaceLabs. Linking needs a sign-in from the last 15 minutes.</p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
 
   <section class="card">
     <div class="card-head"><span class="head-icon">{{ icon("github", "i-lg") }}</span><div><h2>GitHub</h2><p>Used to sign in, list repositories and download source for deploys.</p></div></div>
