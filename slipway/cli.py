@@ -68,7 +68,7 @@ async def _ensure_admin(db: AsyncSession, args: argparse.Namespace) -> list[str]
     from slipway.core.security import hash_password
     from slipway.models import ApiToken, UserSession
     from slipway.services import audit
-    from slipway.services.auth import revoke_user_github, revoke_user_sessions
+    from slipway.services.auth import revoke_user_github, revoke_user_hackspacelabs, revoke_user_sessions
     from slipway.services.users import (
         UserError,
         check_password_strength,
@@ -95,8 +95,9 @@ async def _ensure_admin(db: AsyncSession, args: argparse.Namespace) -> list[str]
     new_password = args.password if args.reset_password else None
     if args.reset_password:
         check_password_strength(new_password or "")
-    # Deactivation unlinks GitHub, so a deactivated GitHub-only account has no way to sign in left.
-    no_way_in = new_password is None and user.password_hash is None and user.github is None
+    # Deactivation unlinks GitHub, so a deactivated GitHub-only account has no way to sign in left. A HackSpaceLabs
+    # link survives deactivation and is a way in.
+    no_way_in = new_password is None and user.password_hash is None and user.github is None and user.hackspacelabs is None
     if no_way_in and not user.is_active and args.activate:
         raise UserError(
             f"{user.email} has no password or GitHub link to sign in with; add --reset-password to reactivate it. "
@@ -106,7 +107,8 @@ async def _ensure_admin(db: AsyncSession, args: argparse.Namespace) -> list[str]
     github = f"@{user.github.login}" if user.github else "none"
     lines = [
         f"{user.email} already exists (created {user.created_at:%Y-%m-%d}, active: {'yes' if user.is_active else 'no'}, "
-        f"password: {'set' if user.password_hash else 'none'}, GitHub: {github})."
+        f"password: {'set' if user.password_hash else 'none'}, GitHub: {github}"
+        + (f", HackSpaceLabs: {user.hackspacelabs.login}" if user.hackspacelabs else "") + ")."
     ]
     changes = []
     admin = await get_role(db, "admin")
@@ -134,6 +136,13 @@ async def _ensure_admin(db: AsyncSession, args: argparse.Namespace) -> list[str]
             lines.append(
                 f"Unlinked GitHub {', '.join(f'@{login}' for login in unlinked)}; "
                 "the owner can link it again from Settings -> Profile after signing in with the new password."
+            )
+        # So is a HackSpaceLabs link: with it, the new password could not be used (it signs in only there).
+        if unlinked_hsl := await revoke_user_hackspacelabs(db, user):
+            changes.append("HackSpaceLabs unlinked")
+            lines.append(
+                f"Unlinked HackSpaceLabs {', '.join(unlinked_hsl)}; the account signs in with the new password now, "
+                "and the owner can link HackSpaceLabs again from Settings -> Profile."
             )
 
     if not user.is_active and args.activate:

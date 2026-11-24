@@ -11,8 +11,10 @@ from slipway.core.security import safe_equals
 from slipway.db.session import get_db
 from slipway.services.auth import (
     CSRF_HEADER,
+    OIDC,
     SESSION_COOKIE,
     AuthContext,
+    recheck_hsl_session,
     session_from_cookie,
     token_from_bearer,
 )
@@ -31,6 +33,11 @@ async def get_optional_auth(request: Request, db: DB) -> AuthContext | None:
         ctx = AuthContext(user=token.user, via="token", token=token)
     elif raw := request.cookies.get(SESSION_COOKIE):
         session = await session_from_cookie(db, raw)
+        if session is not None and session.auth_source == OIDC:
+            session = await recheck_hsl_session(db, session)
+            if session is None:
+                # Ended by Keycloak's answer: main.py clears the cookie on whatever response this request gets.
+                request.state.end_session_cookie = True
         if session is not None:
             ctx = AuthContext(user=session.user, via="session", session=session)
     request.state.auth = ctx

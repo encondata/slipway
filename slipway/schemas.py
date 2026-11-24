@@ -83,6 +83,8 @@ class UserOut(Out):
     roles: list[str]
     permissions: list[str]
     github_login: str | None
+    # The Keycloak username of the linked HackSpaceLabs account; such an account signs in only with HackSpaceLabs.
+    hackspacelabs_login: str | None = None
     has_password: bool
     created_at: datetime
     last_login_at: datetime | None
@@ -99,6 +101,7 @@ class UserOut(Out):
             roles=user.role_names,
             permissions=sorted(user.permissions),
             github_login=user.github.login if user.github else None,
+            hackspacelabs_login=user.hackspacelabs.login if user.hackspacelabs else None,
             has_password=user.password_hash is not None,
             created_at=user.created_at,
             last_login_at=user.last_login_at,

@@ -151,6 +151,40 @@ async def ensure_not_last_admin(db: AsyncSession, user: User) -> None:
         raise UserError("This is the last active admin; promote someone else first")
 
 
+async def ensure_not_last_local_admin(db: AsyncSession, user: User) -> None:
+    """Raise if linking ``user`` to HackSpaceLabs would leave no active admin who can sign in without it.
+
+    A linked account signs in only with HackSpaceLabs (PLAN.md D16), so with every admin linked a Keycloak outage
+    would lock everyone out. ``slipway create-admin`` stays the way back in.
+    """
+    if "admin" not in user.role_names:
+        return
+    await lock_accounts(db)
+    others = (await db.scalars(
+        select(User)
+        .join(user_roles, user_roles.c.user_id == User.id)
+        .join(Role, Role.id == user_roles.c.role_id)
+        .where(User.is_active.is_(True), Role.name == "admin", User.id != user.id)
+    )).unique().all()
+    if not any(u.hackspacelabs is None and (u.password_hash or u.github) for u in others):
+        raise UserError(
+            "This is the last active admin who can sign in without HackSpaceLabs; "
+            "keep one admin with a password and no HackSpaceLabs link"
+        )
+
+
+async def apply_claimed_roles(db: AsyncSession, user: User, roles: list[Role]) -> None:
+    """Make ``user``'s roles exactly ``roles`` (a HackSpaceLabs sign-in or recheck: the roles Keycloak gives).
+
+    Raises ``UserError`` and changes nothing when that would take admin from the last active admin.
+    """
+    if {r.id for r in user.roles} == {r.id for r in roles}:
+        return
+    if "admin" not in {r.name for r in roles}:
+        await ensure_not_last_admin(db, user)
+    user.roles = list(roles)
+
+
 async def bootstrap(db: AsyncSession) -> None:
     """Startup hook: seed roles and create the env-configured admin on an empty database."""
     await seed_system_roles(db)
