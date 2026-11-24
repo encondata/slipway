@@ -551,6 +551,10 @@ async def test_api_tokens_of_linked_owners_follow_the_portal(client, make_client
     user.disabled = False
     hsl.reset()
     assert (await api.get("/api/v1/auth/me")).status_code == 200
+    # The portal refuses the check itself (wrong address or secret): refused, not treated as an outage.
+    kc.portal_status = 404
+    hsl.reset()
+    assert (await api.get("/api/v1/auth/me")).status_code == 401
     # No Slipway role: refused.
     kc.portal_status = 200
     user.roles = []

@@ -464,9 +464,11 @@ async def _ask_portal(subject: str) -> tuple[bool, list[str]] | None:
     if response.status_code == 400:
         return False, []  # the portal can't read this id as a Keycloak user, so it is nobody it knows
     if response.status_code == 404:
+        # A refusal, not an outage: the portal answers 404 to a wrong secret, an unknown app or a proxied call,
+        # so the check can't be trusted to work. Refuse (as Harbor Master does) and say what to fix.
         log.error("The HackSpaceLabs portal refused Slipway's owner check (HTTP 404). Check HSL_PORTAL_INTERNAL_URL "
-                  "(the gateway itself, not through the proxy) and HSL_OIDC_CLIENT_SECRET; allowing the token for now")
-        return None
+                  "(the gateway itself, not through the proxy) and HSL_OIDC_CLIENT_SECRET; refusing the token")
+        return False, []
     if response.status_code != 200:
         log.warning("The HackSpaceLabs portal couldn't check an API token's owner (HTTP %d); allowing it for now",
                     response.status_code)
