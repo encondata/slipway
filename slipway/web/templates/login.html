@@ -11,9 +11,19 @@
 
     {% if error %}<div class="callout error">{{ icon("alert") }}<span>{{ error }}</span></div>{% endif %}
 
+    {% if sso %}
+    <a class="btn btn-lg btn-block btn-hsl" href="/auth/hsl/login?next={{ next|urlencode }}"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt=""> Sign in with HackSpaceLabs</a>
+    {% if error_code == "no_access" %}<a class="text-link" href="/auth/hsl/switch">Use a different HackSpaceLabs account</a>{% endif %}
+    {% if not show_local %}<a class="text-link" href="/login?local=1&amp;next={{ next|urlencode }}">Use a local account</a>{% endif %}
+    {% endif %}
+
+    {% if show_local %}
     {% if settings.github_enabled %}
+    {% if sso %}<div class="divider">or with a local account</div>{% endif %}
     <a class="btn btn-github btn-lg btn-block" href="/auth/github/login?next={{ next|urlencode }}">{{ icon("github") }} Continue with GitHub</a>
     <div class="divider">or sign in with email</div>
+    {% elif sso %}
+    <div class="divider">or with a local account</div>
     {% endif %}
 
     {# `next` was sanitized by safe_next() in pages.py. #}
@@ -28,6 +38,7 @@
       </div>
       <button class="btn btn-primary btn-lg btn-block" type="submit">Sign in</button>
     </form>
+    {% endif %}
 
     {% if no_users and settings.admin_email %}
     {# SLIPWAY_ADMIN_EMAIL reserves the first account, so GitHub sign-in and registration cannot claim it. #}

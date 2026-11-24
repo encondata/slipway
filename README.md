@@ -416,7 +416,8 @@ changing a role's other permissions.
   the unreadable values, so restoring the old key still recovers them; `--clear-unreadable` keeps that
   deploy guard for instances.
 - Sessions are opaque random tokens (only a SHA-256 hash is stored) in an `HttpOnly`, `SameSite=Lax` cookie;
-  cookie-authenticated writes must echo a per-session CSRF token. API tokens skip CSRF but cannot mint tokens,
+  a password or GitHub sign-in lasts 96 hours (`SLIPWAY_SESSION_TTL_HOURS`), a HackSpaceLabs one as long as its
+  Keycloak session (see below). Cookie-authenticated writes must echo a per-session CSRF token. API tokens skip CSRF but cannot mint tokens,
   change the password or unlink GitHub. Setting a first password on a GitHub-only account, linking or re-authorizing GitHub, and unlinking it also need a sign-in
   from the last 15 minutes.
 - An admin password reset or deactivation signs the user out everywhere, deletes their API tokens and unlinks
@@ -425,6 +426,30 @@ changing a role's other permissions.
   Changing your own password (Settings → Profile; `PATCH /api/v1/users/{your id}` refuses a password) signs
   out your other sessions but keeps your API tokens; revoke them under Settings → Tokens. Admins can list and
   revoke another user's tokens with `GET /api/v1/users/{id}/tokens` and `DELETE /api/v1/users/{id}/tokens/{token_id}`.
+- **Sign in with HackSpaceLabs** (the HackSpaceLabs Keycloak, OpenID Connect with PKCE; settings `HSL_OIDC_*` in
+  `.env.example`) is off unless configured. Only people holding a Slipway role in the HackSpaceLabs portal get in
+  (`admin`, `maintainer`, `developer`, `viewer`, or a custom Slipway role of the same name); anyone else sees "no
+  access" and no account is made. Their Slipway roles become exactly those roles, on every sign-in and recheck.
+  A first sign-in finds the account already linked to that HackSpaceLabs user, or the account with the email
+  Keycloak marks verified, or makes a new one; an email that already belongs to an account is refused, and the
+  owner signs in the old way and links HackSpaceLabs under Settings, Profile (which needs a sign-in from the last
+  15 minutes). Never by an unverified email or by name.
+  Once linked, an account signs in only with HackSpaceLabs: password and GitHub sign-in are refused (the GitHub
+  connection keeps working for repositories). Slipway refuses to link the last active admin who can sign in
+  without it, and `slipway create-admin` stays the way back in. The session lasts as long as the Keycloak session
+  (96 hours, or 30 days with "Remember me"), and is rechecked with Keycloak at most every
+  `HSL_OIDC_RECHECK_SECONDS` (60): signing out of any HackSpaceLabs app, being disabled or losing the Slipway role
+  ends it; Keycloak being unreachable does not. Signing out of Slipway also signs out of HackSpaceLabs. With
+  `HSL_OIDC_AUTO_REDIRECT=true` the sign-in page sends people straight to HackSpaceLabs; a local account still
+  signs in at `/login?local=1`, which is how an admin gets in while Keycloak is down. API tokens of a linked
+  person stop working once the portal says they are disabled or have no Slipway role (asked at most every 5
+  minutes, and only with `HSL_PORTAL_INTERNAL_URL` set; when the portal can't answer they keep working).
+  For linked people, disabling and role changes are done in the portal, not in Slipway. An admin password reset
+  unlinks HackSpaceLabs (like GitHub): the person signs in with the new password and links again, and until then a
+  HackSpaceLabs sign-in is refused as an existing account. Deactivating keeps the link, so the person's next
+  HackSpaceLabs sign-in finds the deactivated account rather than a new one. For a HackSpaceLabs session the
+  15-minute rule for credential changes counts from the last password typed at HackSpaceLabs; the Profile page
+  offers "Confirm it's you" for that.
 - Rate limits are in-process (single node) and count failures only. Password login: 10 per 5 minutes per
   client + email (IPv6 grouped by /48), 30 per 5 minutes per client IP (IPv6 /64), and 50 per 15 minutes per
   email across all clients. Attempts are counted before the password is checked, so parallel bursts are
@@ -452,8 +477,9 @@ slipway/
   services/    auth, users, github, ssh, hosts (health), repos (sync), deployer (pipeline + runner),
                ports (host port checks), discovery (unmanaged containers), analytics (deploy stats),
                host_metrics (host history and retention), migrate (moving instances between hosts)
+               hsl (HackSpaceLabs Keycloak: discovery, tokens, rechecks; the portal's owner check)
   api/v1/      JSON API routers
-  web/         page routes, GitHub OAuth flow, Jinja templates, static CSS/JS/icons
+  web/         page routes, GitHub OAuth and HackSpaceLabs sign-in flows, Jinja templates, static CSS/JS/icons
 alembic/       migrations
 docker/        container entrypoint (runs migrations)
 scripts/       dev server, demo-data seeder
@@ -469,4 +495,5 @@ tests/         pytest suite
   Today they run as in-process tasks, and anything in flight at restart is marked failed. Rate limits are
   also per process and would move to Redis.
 - Zero-downtime deploys (start new container, health check, then swap), rollbacks to a previous release.
-- Per-project / per-host permission scoping, teams, SSO (OIDC), and email verification for open sign-up.
+- Per-project / per-host permission scoping, teams, and email verification for open sign-up. (Single sign-on is
+  Sign in with HackSpaceLabs, under Security notes.)

@@ -30,10 +30,12 @@ from slipway.db.session import dispose_engine, get_sessionmaker, init_engine
 from slipway.services import backup_store, renewals, snapshots
 from slipway.services import do_lb as _do_lb  # noqa: F401  (importing it registers the do_lb traffic backend)
 from slipway.services import provisioning, updates
+from slipway.services.auth import clear_session_cookie
 from slipway.services.deployer import runner
 from slipway.services.host_metrics import retention_forever
 from slipway.services.hosts import poll_hosts_forever
 from slipway.services.users import bootstrap
+from slipway.web import hsl as hsl_web
 from slipway.web import oauth, pages
 
 log = logging.getLogger("slipway")
@@ -86,6 +88,19 @@ async def check_encryption_key(db: AsyncSession) -> bool:
     return True
 
 
+def _log_hsl_settings() -> None:
+    """One line at start about Sign in with HackSpaceLabs when something about it needs saying."""
+    settings = get_settings()
+    if problem := settings.hsl_problem():
+        log.error("HackSpaceLabs sign-in is off: %s. Set HSL_OIDC_ISSUER, HSL_OIDC_CLIENT_ID and HSL_OIDC_CLIENT_SECRET "
+                  "together (or none of them).", problem)
+    elif settings.hsl_enabled:
+        log.info("HackSpaceLabs sign-in is on (%s, client %s)", settings.hsl_oidc_issuer, settings.hsl_oidc_client_id)
+        if not settings.hsl_portal_internal_url:
+            log.warning("HSL_PORTAL_INTERNAL_URL is not set: API tokens of HackSpaceLabs-linked owners are not checked "
+                        "against the portal.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_engine()
@@ -113,6 +128,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     update_checker = asyncio.create_task(updates.check_forever(), name="update-checker")
     update_runs = asyncio.create_task(updates.reconcile_forever(), name="update-runs")
     host_history = asyncio.create_task(retention_forever(), name="host-history")
+    _log_hsl_settings()
     log.info("Slipway %s started (%s)", __version__, get_settings().env)
     try:
         yield
@@ -165,6 +181,14 @@ def create_app() -> FastAPI:
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
         return response
 
+    # Outermost: a HackSpaceLabs session that its recheck ended (api/deps.py) loses its cookie, whatever the answer.
+    @app.middleware("http")
+    async def end_session_cookie(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response: Response = await call_next(request)
+        if getattr(request.state, "end_session_cookie", False):
+            clear_session_cookie(response)
+        return response
+
     @app.exception_handler(pages.LoginRequired)
     async def login_required(request: Request, exc: pages.LoginRequired) -> Response:
         return RedirectResponse(f"/login?next={quote(exc.next_url)}", status_code=302)
@@ -209,6 +233,7 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(api_router, prefix="/api/v1")
     app.include_router(oauth.router)
+    app.include_router(hsl_web.router)
     app.include_router(pages.router)
     return app
 

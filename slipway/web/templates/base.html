@@ -81,7 +81,7 @@
             {% if auth.can(Perm.USERS_READ) %}<a href="/settings/users">{{ icon("users") }} Users &amp; roles</a>{% endif %}
             <a href="/api/docs">{{ icon("file") }} API docs</a>
             <hr style="margin: 6px 0">
-            <button type="button" data-api="POST /api/v1/auth/logout" data-then="redirect:/login">{{ icon("logout") }} Sign out</button>
+            <button type="button" data-api="POST /api/v1/auth/logout" data-then="follow:/login">{{ icon("logout") }} Sign out</button>
           </div>
         </details>
       </div>

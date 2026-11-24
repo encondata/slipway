@@ -612,6 +612,9 @@ dialog.modal .modal-foot { padding: 16px 20px 20px; display: flex; justify-conte
 .btn-github:hover { background: #27272A; }
 :root[data-theme="dark"] .btn-github { background: #F4F4F5; color: #18181B; border-color: #F4F4F5; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn-github { background: #F4F4F5; color: #18181B; border-color: #F4F4F5; } }
+/* Sign in with HackSpaceLabs: the HackSpaceLabs H mark on a plain button. */
+.hsl-mark { width: 18px; height: 18px; flex: none; }
+.auth-card .text-link { text-align: center; font-size: 13.5px; }
 
 /* ------------------------------------------------------------------ charts */
 /* Drawn by templates/_charts.html; tooltips by slipway.js. Deploy outcomes wear status colours (succeeded,

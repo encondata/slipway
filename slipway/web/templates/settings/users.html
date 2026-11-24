@@ -17,7 +17,8 @@
 {% set can_write = auth.can(Perm.USERS_WRITE) %}
 <section class="card">
   <div class="card-head"><span class="head-icon">{{ icon("users", "i-lg") }}</span>
-    <div><h2>Users</h2><p>People who can sign in to Slipway. Access comes from roles.</p></div>
+    <div><h2>Users</h2><p>People who can sign in to Slipway. Access comes from roles.{% if settings.hsl_enabled or users|selectattr("hackspacelabs")|list %}
+      People linked to HackSpaceLabs sign in only with it and get their roles from it: disable them, reset them or change their roles in the HackSpaceLabs portal, not here.{% endif %}</p></div>
     <span class="spacer"></span>{% if can_write %}<button class="btn btn-primary" data-open="new-user">{{ icon("plus") }} Add user</button>{% endif %}</div>
   <div class="table-wrap"><table class="table">
     <thead><tr><th>User</th><th>Roles</th><th>Sign-in</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead>
@@ -25,7 +26,7 @@
       <tr>
         <td><span class="primary-cell">{{ avatar(u, "sm") }}<span><strong>{{ u.display_name }}{% if u.id == user.id %} <span class="subtle">(you)</span>{% endif %}</strong><small>{{ u.email }}</small></span></span></td>
         <td>{% for r in u.role_names %}<span class="badge plain {{ 'primary' if r == 'admin' }}">{{ r }}</span> {% else %}<span class="subtle">none</span>{% endfor %}</td>
-        <td class="muted">{% if u.github %}{{ icon("github", "i-sm") }} @{{ u.github.login }}{% endif %}{% if u.github and u.password_hash %} · {% endif %}{% if u.password_hash %}Password{% endif %}{% if not u.github and not u.password_hash %}<span class="subtle">none</span>{% endif %}</td>
+        <td class="muted">{% if u.hackspacelabs %}<img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt="" style="width:14px;height:14px;vertical-align:-2px"> HackSpaceLabs {{ u.hackspacelabs.login }}{% if u.github or u.password_hash %} · {% endif %}{% endif %}{% if u.github %}{{ icon("github", "i-sm") }} @{{ u.github.login }}{% endif %}{% if u.github and u.password_hash %} · {% endif %}{% if u.password_hash %}Password{% endif %}{% if not u.github and not u.password_hash and not u.hackspacelabs %}<span class="subtle">none</span>{% endif %}</td>
         <td>{% if u.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge">Deactivated</span>{% endif %}</td>
         <td class="muted">{{ u.last_login_at|timeago }}</td>
         <td class="actions-cell">{% if can_write and (u.id == user.id or u.id in manageable) %}<button class="btn btn-sm" data-open="edit-{{ u.id }}">Edit</button>{% endif %}</td>
@@ -66,15 +67,19 @@
       {{ role_boxes(u.role_names) }}
       {% if u.id != user.id %}
       <label class="check"><input type="checkbox" name="is_active" {{ 'checked' if u.is_active }}><span><strong>Active</strong><br><span class="subtle">Deactivated users are signed out, lose their API tokens and GitHub link, and cannot sign in.
-        {%- if not u.password_hash and u.github %} They have no password, so reactivating them later needs one: type it under Reset password in the same save.
+        {%- if u.hackspacelabs %} Their HackSpaceLabs link stays, so they sign in with it again once reactivated.
+        {%- elif not u.password_hash and u.github %} They have no password, so reactivating them later needs one: type it under Reset password in the same save.
         {%- elif not u.password_hash %} They have no password or GitHub link, so they cannot sign in until you set one with Reset password.{% endif %}</span></span></label>
       {% endif %}
       {% if u.id != user.id %}
-      <div class="field"><label>Reset password <span class="subtle">(optional; also signs them out, deletes their API tokens and unlinks GitHub)</span></label><input class="input" name="password" type="password" autocomplete="new-password" minlength="10"></div>
+      <div class="field"><label>Reset password <span class="subtle">(optional; also signs them out, deletes their API tokens and unlinks GitHub{% if u.hackspacelabs %} and HackSpaceLabs: they sign in with the new password and link again{% endif %})</span></label><input class="input" name="password" type="password" autocomplete="new-password" minlength="10"></div>
+      {% if u.hackspacelabs %}
+      <div class="row wrap"><span class="muted"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt="" style="width:14px;height:14px;vertical-align:-2px"> Signs in with HackSpaceLabs as <strong>{{ u.hackspacelabs.login }}</strong>; password and GitHub sign-in are off for this account.</span></div>
+      {% endif %}
       {% if u.github %}
       <div class="row wrap"><span class="muted">{{ icon("github", "i-sm") }} Signs in with GitHub as <strong>@{{ u.github.login }}</strong></span>
         {# Unlinking would lock out a user with no password, so the API refuses it; a reset sets one and unlinks too. #}
-        {% if u.password_hash %}
+        {% if u.password_hash or u.hackspacelabs %}
         <button class="btn btn-sm btn-danger" type="button" data-api="DELETE /api/v1/users/{{ u.id }}/github"
           data-confirm="Unlink @{{ u.github.login }} from {{ u.email }}? They can no longer sign in with that GitHub account."
           data-success="GitHub unlinked" data-then="reload">Unlink GitHub</button>

@@ -114,7 +114,7 @@ async def update(user_id: uuid.UUID, body: UserUpdate, ctx: Writer, request: Req
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "Change your own password from your profile (POST /api/v1/auth/me/password)"
         )
-    revoke = False
+    revoke = reset = False
     try:
         password_hash = None
         if body.password:
@@ -132,7 +132,7 @@ async def update(user_id: uuid.UUID, body: UserUpdate, ctx: Writer, request: Req
             if not body.is_active:
                 await ensure_not_last_admin(db, user)
                 revoke = True
-            elif user.password_hash is None and user.github is None and password_hash is None:
+            elif user.password_hash is None and user.github is None and user.hackspacelabs is None and password_hash is None:
                 # Deactivation unlinked GitHub, so a GitHub-only account would come back with no way in.
                 raise UserError(
                     f"{user.email} has no password or GitHub link to sign in with (deactivating unlinks GitHub); "
@@ -143,12 +143,17 @@ async def update(user_id: uuid.UUID, body: UserUpdate, ctx: Writer, request: Req
             user.full_name = body.full_name.strip()
         if password_hash is not None:
             user.password_hash = password_hash
-            revoke = True
+            revoke = reset = True
     except UserError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     if revoke:
-        # A reset or deactivation must cut off every credential: sessions, API tokens and GitHub links.
-        await revoke_user_credentials(db, user)
+        # A reset or deactivation must cut off every credential: sessions, API tokens and GitHub links. A reset also
+        # unlinks HackSpaceLabs; deactivation keeps that link, so the person's next sign-in finds this (inactive)
+        # account instead of being given a new one.
+        unlinked = await revoke_user_credentials(db, user, reset=reset)
+        for login in unlinked:
+            audit.record(db, "user.hackspacelabs_unlinked", actor=ctx.user, target=user,
+                         summary=f"Unlinked HackSpaceLabs account {login} from {user.email} (password reset)", request=request)
     details = body.model_dump(exclude_none=True, exclude={"password"})
     if body.password:
         details["password_reset"] = True
@@ -192,7 +197,7 @@ async def unlink_user_github(user_id: uuid.UUID, ctx: Writer, request: Request, 
     account = user.github
     if account is None:
         return
-    if user.password_hash is None:
+    if user.password_hash is None and user.hackspacelabs is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"{user.email} has no password and could no longer sign in; reset their password instead, "

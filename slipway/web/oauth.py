@@ -129,13 +129,16 @@ async def github_link(request: Request, db: DB, ctx: OptionalAuth) -> Response:
     if ctx is None or ctx.session is None:
         return RedirectResponse("/login?next=/settings", status_code=302)
     # Adding (or re-authorizing) a GitHub login is a credential change: it needs a recent sign-in.
-    if (ctx.user.password_hash or ctx.user.github) and not signed_in_recently(ctx.session):
+    if (ctx.user.password_hash or ctx.user.github or ctx.user.hackspacelabs) and not signed_in_recently(ctx.session):
+        if ctx.session.auth_source == "oidc" and get_settings().hsl_enabled:
+            # The clock is Keycloak's: confirm with a fresh HackSpaceLabs sign-in, then come straight back here.
+            return RedirectResponse("/auth/hsl/login?reauth=1&next=%2Fauth%2Fgithub%2Flink", status_code=302)
         from slipway.web.pages import render  # pages imports this module, so not at the top
 
         action = "re-authorize GitHub" if ctx.user.github else "link GitHub"
         return await render(
             request, db, "error.html", ctx, status_code=403, code=403, heading="Sign in again to continue",
-            message=f"{sign_in_again(action)}.",
+            message=f"{sign_in_again(action, ctx.session)}.",
         )
     return _start("link", "/settings", ctx.session)
 
@@ -197,7 +200,7 @@ async def github_callback(
             gh_id, login = str(profile["id"]), str(profile["login"])
             account = await db.scalar(
                 select(OAuthAccount)
-                .options(joinedload(OAuthAccount.user))
+                .options(joinedload(OAuthAccount.user).selectinload(User.oauth_accounts))
                 .where(OAuthAccount.provider == "github", OAuthAccount.provider_user_id == gh_id)
             )
 
@@ -216,6 +219,12 @@ async def github_callback(
                 user = account.user
                 if not user.is_active:
                     return _fail("deactivated")
+                if user.hackspacelabs is not None:
+                    # D16: tied to HackSpaceLabs, so it signs in only there. The GitHub link stays for repositories.
+                    audit.record(db, "auth.login_failed", actor=user, target=user, request=request,
+                                 summary=f"GitHub sign-in as @{login} refused: this account signs in with HackSpaceLabs")
+                    await db.commit()
+                    return _fail("hsl_only")
 
             else:
                 admin_email = get_settings().admin_email
