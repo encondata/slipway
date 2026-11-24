@@ -7,9 +7,14 @@ from datetime import datetime
 from sqlalchemy import Column, ForeignKey, String, Table, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from slipway.core.crypto import EncryptedText
+from slipway.core.crypto import EncryptedJSON, EncryptedText
 from slipway.core.permissions import has_permission
 from slipway.db.base import Base, Timestamps, UUIDPrimaryKey
+
+# OAuthAccount.provider values. A HackSpaceLabs link's provider_user_id is the Keycloak user id (``sub``) and its
+# login the Keycloak username.
+GITHUB = "github"
+HACKSPACELABS = "hackspacelabs"
 
 user_roles = Table(
     "user_roles",
@@ -70,7 +75,12 @@ class User(UUIDPrimaryKey, Timestamps, Base):
 
     @property
     def github(self) -> OAuthAccount | None:
-        return next((a for a in self.oauth_accounts if a.provider == "github"), None)
+        return next((a for a in self.oauth_accounts if a.provider == GITHUB), None)
+
+    @property
+    def hackspacelabs(self) -> OAuthAccount | None:
+        """The HackSpaceLabs link. An account that has one signs in only with HackSpaceLabs (PLAN.md D16)."""
+        return next((a for a in self.oauth_accounts if a.provider == HACKSPACELABS), None)
 
 
 class OAuthAccount(UUIDPrimaryKey, Timestamps, Base):
@@ -97,6 +107,14 @@ class UserSession(UUIDPrimaryKey, Timestamps, Base):
     last_seen_at: Mapped[datetime]
     ip: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(300))
+    # "local" (password or GitHub) or "oidc" (HackSpaceLabs). An oidc session is rechecked with Keycloak.
+    auth_source: Mapped[str] = mapped_column(String(16), default="local", server_default="local")
+    # The ID token's sid, the encrypted {sub, refresh_token, id_token}, the last recheck, and when the person
+    # last typed their password at Keycloak (auth_time), which the recent sign-in rule uses for these sessions.
+    idp_sid: Mapped[str | None] = mapped_column(String(255))
+    idp_tokens: Mapped[dict[str, str] | None] = mapped_column(EncryptedJSON)
+    idp_checked_at: Mapped[datetime | None]
+    auth_time: Mapped[datetime | None]
 
     user: Mapped[User] = relationship(lazy="joined")
 
