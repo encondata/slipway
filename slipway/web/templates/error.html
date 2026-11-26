@@ -1,13 +1,16 @@
 {% extends "base.html" %}
-{% from "_macros.html" import icon, logo %}
+{% from "_macros.html" import icon %}
 {% block title %}{{ code }}{% endblock %}
 {% block body %}
 {% if user %}{{ super() }}{% else %}
-<div class="auth-page"><div class="card auth-card" style="text-align:center">
-  <a class="brand" href="/">{{ logo() }}</a>
-  <h1>{{ heading or code }}</h1><p class="muted">{{ message }}</p>
-  <a class="btn btn-primary" href="/">Go home</a>
-</div></div>
+<main class="hsl-auth" id="main">
+  <div class="hsl-auth-card">
+    {% include "_auth_brand.html" %}
+    <h1 class="hsl-auth-title">{{ heading or code }}</h1>
+    <p class="hsl-auth-text">{{ message }}</p>
+    <a class="hsl-auth-button is-primary" href="/">Go home</a>
+  </div>
+</main>
 {% endif %}
 {% endblock %}
 {% block content %}

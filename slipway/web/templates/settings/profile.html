@@ -18,7 +18,7 @@
 
   {% if user.hackspacelabs or settings.hsl_enabled %}
   <section class="card">
-    <div class="card-head"><span class="head-icon"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt=""></span><div><h2>HackSpaceLabs account</h2><p>One sign-in for Slipway and the other HackSpaceLabs apps.</p></div></div>
+    <div class="card-head"><span class="head-icon"><img class="hsl-mark" src="/static/hsl-ui/mark.svg?v={{ asset_version() }}" width="22" height="20" alt=""></span><div><h2>HackSpaceLabs account</h2><p>One sign-in for Slipway and the other HackSpaceLabs apps.</p></div></div>
     <div class="card-body stack" style="gap: 14px">
       {% if user.hackspacelabs %}
         <div class="row"><span class="badge success">Linked</span> <strong>{{ user.hackspacelabs.login }}</strong></div>
@@ -29,7 +29,7 @@
         {% endif %}
       {% else %}
         <p class="muted">Not linked.</p>
-        <div><a class="btn btn-hsl" href="/auth/hsl/link"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt=""> Link HackSpaceLabs</a></div>
+        <div><a class="hsl-auth-button is-sso" href="/auth/hsl/link"><img class="hsl-mark" src="/static/hsl-ui/mark.svg?v={{ asset_version() }}" width="20" height="19" alt="">Link HackSpaceLabs</a></div>
         <p class="help">After linking, this account signs in only with HackSpaceLabs, and your roles here come from HackSpaceLabs. Linking needs a sign-in from the last 15 minutes.</p>
       {% endif %}
     </div>
