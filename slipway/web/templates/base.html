@@ -1,4 +1,4 @@
-{% from "_macros.html" import icon, logo, mountains, avatar %}
+{% from "_macros.html" import icon %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -6,9 +6,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Slipway{% endblock %} · Slipway</title>
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <link rel="icon" href="/static/img/favicon.svg?v={{ asset_version() }}" type="image/svg+xml">
+  <link rel="icon" href="/static/hsl-ui/favicon.svg?v={{ asset_version() }}" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png?v={{ asset_version() }}">
+  {#- The HSL Suite kit (static/hsl-ui, synced by scripts/sync-hsl-ui.sh): fonts, tokens, frame and sign-in card. #}
+  <link rel="stylesheet" href="/static/hsl-ui/fonts.css?v={{ asset_version() }}">
+  <link rel="stylesheet" href="/static/hsl-ui/tokens.css?v={{ asset_version() }}">
+  <link rel="stylesheet" href="/static/hsl-ui/shell.css?v={{ asset_version() }}">
+  <link rel="stylesheet" href="/static/hsl-ui/auth.css?v={{ asset_version() }}">
   <link rel="stylesheet" href="/static/css/slipway.css?v={{ asset_version() }}">
+  {#- Not deferred: suite.js applies the theme before the page paints, and theme.js moves Slipway's old setting over. #}
+  <script src="/static/hsl-ui/suite.js?v={{ asset_version() }}"></script>
   <script src="/static/js/theme.js?v={{ asset_version() }}"></script>
   <script src="/static/js/slipway.js?v={{ asset_version() }}" defer></script>
 </head>
@@ -26,67 +33,63 @@
   ("/analytics", "analytics", "Analytics", Perm.ANALYTICS_READ),
   ("/logs", "logs", "Logs", Perm.LOGS_READ),
 ] %}
-<div class="app">
-  <aside class="sidebar" id="sidebar">
-    <a class="brand" href="/">{{ logo() }}</a>
-    <nav class="nav" aria-label="Main">
+{#- The user menu: the role line says when the account signs in with HackSpaceLabs, whose Profile is the portal's. #}
+{% set roles_line = user.role_names|join(", ")|title or "No role" %}
+{% set profile_url = settings.hsl_portal_url ~ "/me" if user.hackspacelabs and settings.hsl_portal_url else "/settings" %}
+<a class="hsl-skip" href="#main">Skip to content</a>
+<div class="hsl-shell">
+  <aside class="hsl-sidebar" id="sidebar">
+    <a class="hsl-brand" href="/" aria-label="Slipway home">
+      <img class="hsl-mark" src="/static/hsl-ui/mark.svg?v={{ asset_version() }}" width="34" height="32" alt="">
+      <span class="hsl-wordmark">Slipway</span>
+    </a>
+    <nav class="hsl-nav" aria-label="Main">
       {#- The longest matching item is the active one, so /deployments/history lights History, not Deployments. #}
       {% set here = namespace(href="") %}
       {% for href in nav|map(attribute=0) %}{% if (path == href or (href != '/' and path.startswith(href))) and href|length > here.href|length %}{% set here.href = href %}{% endif %}{% endfor %}
-      {% for href, ic, label, perm in nav if perm is none or auth.can(perm) %}
-      <a href="{{ href }}" class="{{ 'active' if href == here.href }}{{ ' nav-sub' if href.count('/') > 1 }}">{{ icon(ic) }} {{ label }}</a>
-      {% endfor %}
-      <hr>
-      <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">{{ icon("settings") }} Settings</a>
-      {% if auth.can(Perm.UPDATES_RUN) %}
-      <a href="/updates" class="{{ 'active' if path.startswith('/updates') }}">{{ icon("sync") }} Updates{% if updates_ahead %}<span class="nav-badge" title="{{ updates_ahead }} new commit{{ 's' if updates_ahead != 1 }} to upgrade to">{{ updates_ahead if updates_ahead < 100 else "99+" }}</span>{% endif %}</a>
-      {% endif %}
+      <div class="hsl-nav-group">
+        {% for href, ic, label, perm in nav if perm is none or auth.can(perm) %}
+        <a href="{{ href }}" class="hsl-nav-item{{ ' nav-sub' if href.count('/') > 1 }}"{% if href == here.href %} aria-current="page"{% endif %}>{{ icon(ic) }}{{ label }}</a>
+        {% endfor %}
+      </div>
+      <div class="hsl-nav-group">
+        <a href="/settings" class="hsl-nav-item"{% if path.startswith('/settings') %} aria-current="page"{% endif %}>{{ icon("settings") }}Settings</a>
+        {% if auth.can(Perm.UPDATES_RUN) %}
+        <a href="/updates" class="hsl-nav-item"{% if path.startswith('/updates') %} aria-current="page"{% endif %}>{{ icon("sync") }}Updates{% if updates_ahead %}<span class="hsl-nav-badge" title="{{ updates_ahead }} new commit{{ 's' if updates_ahead != 1 }} to upgrade to">{{ updates_ahead if updates_ahead < 100 else "99+" }}</span>{% endif %}</a>
+        {% endif %}
+      </div>
     </nav>
-    <div class="sidebar-art">
-      {{ mountains() }}
-      <div class="tagline"><strong>Slipway</strong><span><em>Deploy.</em> Run. Observe.</span></div>
+    <div class="hsl-sidebar-foot">
+      <a href="/api/docs" class="hsl-nav-item">{{ icon("file") }}API docs</a>
     </div>
   </aside>
 
-  <div class="main">
-    <header class="topbar">
-      <button class="icon-btn menu-toggle" type="button" aria-label="Open navigation">{{ icon("menu") }}</button>
+  <div class="hsl-main">
+    <header class="hsl-topbar">
+      <div class="hsl-topbar-title">
+        <a href="/">Slipway</a><span class="hsl-topbar-sep" aria-hidden="true">/</span><strong>{{ self.title() }}</strong>
+      </div>
       <form class="search" action="/search" role="search">
         {{ icon("search") }}
         <input name="q" value="{{ q if q is defined else '' }}" placeholder="Search repositories, instances, hosts…" aria-label="Search">
         <kbd>⌘K</kbd>
       </form>
-      <div class="topbar-right">
+      <div class="hsl-topbar-end">
         {% if user.github %}
         <a class="pill" href="{{ '/repositories' if auth.can(Perm.REPOS_READ) else '/settings' }}" title="Signed in to GitHub as @{{ user.github.login }}">
-          {{ icon("github") }} GitHub
+          {{ icon("github") }}<span class="pill-label">GitHub</span>
           <span class="meta"><span class="dot success"></span>{% if last_sync %}Synced {{ last_sync|timeago }}{% else %}Not synced yet{% endif %}</span>
         </a>
         {% elif settings.github_enabled %}
-        <a class="pill" href="/auth/github/link">{{ icon("github") }} Connect GitHub</a>
+        <a class="pill" href="/auth/github/link">{{ icon("github") }}<span class="pill-label">Connect GitHub</span></a>
         {% else %}
-        <a class="pill" href="/settings" title="Set SLIPWAY_GITHUB_CLIENT_ID / _SECRET to enable GitHub">{{ icon("github") }} <span class="meta"><span class="dot"></span>GitHub not configured</span></a>
+        <a class="pill" href="/settings" title="Set SLIPWAY_GITHUB_CLIENT_ID / _SECRET to enable GitHub">{{ icon("github") }}<span class="meta"><span class="dot"></span>GitHub not configured</span></a>
         {% endif %}
-        <button class="icon-btn" type="button" data-theme-toggle aria-label="Toggle light/dark theme" title="Toggle theme">{{ icon("moon") }}</button>
-        <details class="usermenu">
-          <summary>
-            {{ avatar(user) }}
-            <span class="who"><strong>{{ user.display_name }}</strong><span>{{ user.role_names|join(", ")|title or "No role" }}</span></span>
-            {{ icon("chevron-down", "i-sm") }}
-          </summary>
-          <div class="menu-panel">
-            <div class="label">{{ user.email }}</div>
-            <a href="/settings">{{ icon("user") }} Profile</a>
-            <a href="/settings/tokens">{{ icon("key") }} API tokens</a>
-            {% if auth.can(Perm.USERS_READ) %}<a href="/settings/users">{{ icon("users") }} Users &amp; roles</a>{% endif %}
-            <a href="/api/docs">{{ icon("file") }} API docs</a>
-            <hr style="margin: 6px 0">
-            <button type="button" data-api="POST /api/v1/auth/logout" data-then="follow:/login">{{ icon("logout") }} Sign out</button>
-          </div>
-        </details>
+        <hsl-app-switcher current="slipway" apps='{{ settings.hsl_apps|tojson }}'></hsl-app-switcher>
+        <hsl-user-menu name="{{ user.display_name }}" detail="{{ roles_line }}{{ ' · HackSpaceLabs' if user.hackspacelabs }}" profile-url="{{ profile_url }}"></hsl-user-menu>
       </div>
     </header>
-    <main class="content{% block content_class %}{% endblock %}">
+    <main class="hsl-content content{% block content_class %}{% endblock %}" id="main" tabindex="-1">
       {% block content %}{% endblock %}
     </main>
   </div>

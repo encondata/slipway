@@ -2,24 +2,6 @@
 <svg class="i {{ cls }}" aria-hidden="true"><use href="/static/img/icons.svg#{{ name }}"></use></svg>
 {%- endmacro %}
 
-{% macro logo() -%}
-<svg class="logo" viewBox="0 0 1826 455" role="img" aria-label="Slipway"><use href="/static/img/logo.svg#logo"></use></svg>
-{%- endmacro %}
-
-{% macro mountains(view="150 170 620 450") -%}
-<svg class="mountains" viewBox="{{ view }}" preserveAspectRatio="xMidYMax slice" aria-hidden="true">
-  <defs>
-    <linearGradient id="mt-peaks" x1="0" y1="0" x2="1" y2="1"><stop class="mt-a" offset="0"/><stop class="mt-b" offset="1"/></linearGradient>
-    <linearGradient id="mt-fade" x1="0" y1="0" x2="0" y2="1"><stop class="mt-fade-a" offset="0"/><stop class="mt-fade-b" offset="1"/></linearGradient>
-  </defs>
-  <path class="mt-back" d="M0 408 122 295 219 343 345 186 472 328 563 291 704 401 812 323 940 396 1059 366 1200 437V620H0Z"/>
-  <path fill="url(#mt-peaks)" d="M0 482 120 337 218 392 346 209 481 372 550 326 706 466 835 367 951 445 1088 400 1200 466V620H0Z"/>
-  <path class="mt-mid" d="M0 509 120 337 155 435 254 428 346 209 391 373 483 428 547 327 624 479 792 457 836 368 909 449 1068 482 1200 461V620H0Z"/>
-  <path class="mt-shade" d="m0 516 122-179 56 131 169-259 80 260 119-143 130 195 148-117 128 129 112-132 136 66v154H0Z"/>
-  <rect y="430" width="1200" height="190" fill="url(#mt-fade)"/>
-</svg>
-{%- endmacro %}
-
 {#- What a running job of each kind is doing (slipway.js STATUS says the same). -#}
 {% set RUNNING_LABELS = {"deploy": "Building", "restore": "Restoring", "reset": "Resetting", "rollback": "Rolling back",
                          "backup": "Backing up", "snapshot": "Taking snapshot", "admin": "Creating admin",

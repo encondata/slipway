@@ -61,7 +61,7 @@ async def _world(admin_client) -> dict:
 
 
 def _nav(page: str) -> str:
-    return re.search(r'<nav class="nav".*?</nav>', page, re.S).group(0)
+    return re.search(r'<nav class="hsl-nav".*?</nav>', page, re.S).group(0)
 
 
 def _tbodies(page: str) -> list[str]:
@@ -202,7 +202,7 @@ async def test_sidebar_history_item_and_the_active_one(admin_client):
     for path, active in (("/deployments", "/deployments"), ("/deployments/history", "/deployments/history"),
                          (f"/deployments/{ids['beta-deps'][0]}", "/deployments"), ("/hosts", "/hosts")):
         nav = _nav((await admin_client.get(path)).text)
-        assert re.findall(r'<a href="([^"]+)" class="active', nav) == [active], path
+        assert re.findall(r'<a href="([^"]+)" class="[^"]*" aria-current="page"', nav) == [active], path
         assert '<a href="/deployments/history" class="' in nav and " nav-sub" in nav
         assert nav.index('href="/deployments"') < nav.index('href="/deployments/history"') < nav.index('href="/hosts"')
     overview = (await admin_client.get("/")).text

@@ -19,8 +19,8 @@ async def test_anonymous_pages_redirect_to_login(client):
 
 async def test_favicon_ico_redirects_to_the_svg_icon(client):
     r = await client.get("/favicon.ico")
-    assert r.status_code == 301 and r.headers["location"] == "/static/img/favicon.svg"
-    icon = await client.get("/static/img/favicon.svg")
+    assert r.status_code == 301 and r.headers["location"] == "/static/hsl-ui/favicon.svg"
+    icon = await client.get("/static/hsl-ui/favicon.svg")
     assert icon.status_code == 200 and icon.headers["content-type"].startswith("image/svg+xml")
 
 
@@ -31,8 +31,8 @@ async def test_hosts_page_fills_wide_screens_and_other_pages_keep_their_cap(clie
 
     await make_user("wide@example.com", roles=["admin"])
     await login(client, "wide@example.com")
-    assert '<main class="content content-fluid">' in (await client.get("/hosts")).text
-    assert '<main class="content">' in (await client.get("/environments")).text
+    assert '<main class="hsl-content content content-fluid" id="main"' in (await client.get("/hosts")).text
+    assert '<main class="hsl-content content" id="main"' in (await client.get("/environments")).text
     css = (Path(__file__).resolve().parents[1] / "slipway/web/static/css/slipway.css").read_text()
     assert ".content.content-fluid { max-width: none; }" in css
     assert "max-width: 1600px" in css

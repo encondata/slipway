@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="35 45 630 585" width="630" height="585" role="img" aria-label="HackSpaceLabs">
+  <!-- The HackSpaceLabs H: warm bands over cool ones, split by a gap that steps up across the crossbar.
+       Drawn on a 700 x 670 grid; the H spans 35-665 x 45-630. -->
+  <mask id="hsl-mark-cut">
+    <path d="M95 45H215L255 85V240H445V85L485 45H605L665 105V570L605 630H485L445 590V465H255V590L215 630H95L35 570V105Z" fill="#fff"/>
+    <path d="M0 434H168C206 434 206 374 244 374H446C496 374 496 277 546 277H700" fill="none" stroke="#000" stroke-width="16"/>
+  </mask>
+  <g mask="url(#hsl-mark-cut)">
+    <rect width="700" height="670" fill="#003e65"/>
+    <path d="M0 562C160 546 320 560 460 546S620 502 700 496V0H0Z" fill="#0a8dba"/>
+    <path d="M0 522C160 506 300 520 450 496S620 432 700 422V0H0Z" fill="#0fb0d6"/>
+    <path d="M0 470C150 456 280 470 420 440S600 352 700 346V0H0Z" fill="#74d4ec"/>
+    <path d="M0 434H168C206 434 206 374 244 374H446C496 374 496 277 546 277H700V0H0Z" fill="#d81f27"/>
+    <path d="M0 338C150 318 300 352 450 332S620 282 700 277V0H0Z" fill="#ec2d1d"/>
+    <path d="M0 272C140 256 260 292 400 276S600 226 700 222V0H0Z" fill="#fb7d24"/>
+    <path d="M0 176C150 160 260 196 420 170S620 142 700 142V0H0Z" fill="#ffc760"/>
+    <path d="M0 112C150 92 260 138 410 118S610 96 700 100V0H0Z" fill="#fbae2c"/>
+  </g>
+</svg>

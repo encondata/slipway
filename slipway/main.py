@@ -228,7 +228,7 @@ def create_app() -> FastAPI:
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
         # Browsers still ask for /favicon.ico for responses without <link rel="icon"> (JSON, raw files).
-        return RedirectResponse("/static/img/favicon.svg", status_code=301)
+        return RedirectResponse("/static/hsl-ui/favicon.svg", status_code=301)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(api_router, prefix="/api/v1")

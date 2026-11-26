@@ -30,7 +30,7 @@ vanilla JS (no Node build) · **asyncssh** · shipped as a **Docker** image.
 | DigitalOcean | An environment's slots on droplets Slipway makes, with managed PostgreSQL, a Spaces bucket, a load balancer with Let's Encrypt certificates and a cloud firewall; a confirmed monthly cost, production safeguards, and backups kept on the Slipway server ([docs/digitalocean.md](docs/digitalocean.md)) |
 | VMs | An environment's slots and data server on VMs Slipway makes on Proxmox (Terraform) or standalone ESXi (pyvmomi), with static addresses, resizes at the next deploy, VM snapshots and revert ([docs/machines.md](docs/machines.md)) |
 | Audit | Sign-ins, failed logins and password checks, user/role/token/host/instance/deploy actions with actor and IP |
-| UI | Light and dark themes from your mockups and asset pack, responsive down to phone width |
+| UI | The HSL Suite look shared with HackSpaceLabs, Switchyard, Harbor Master and Tideline (`slipway/web/static/hsl-ui/`, synced from hackspacelabs-web with `scripts/sync-hsl-ui.sh` and never edited here): light by default, dark from the user menu, responsive down to phone width |
 
 ## Install on a server
 

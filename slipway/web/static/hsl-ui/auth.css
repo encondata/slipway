@@ -1,0 +1,220 @@
+/*
+ * HSL Suite sign-in pages: the centred card used for sign-in, signed-out, no-access and
+ * change-password. Needs tokens.css. Markup: see README.md.
+ */
+
+.hsl-auth,
+.hsl-auth *,
+.hsl-auth *::before,
+.hsl-auth *::after {
+  box-sizing: border-box;
+}
+
+.hsl-auth {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px 16px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.hsl-auth :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.hsl-auth-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  max-width: 400px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.hsl-auth-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  color: var(--logo-ink);
+}
+
+.hsl-auth-brand .hsl-wordmark {
+  color: var(--logo-ink);
+  font-family: var(--font-brand);
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+
+.hsl-auth-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 650;
+  text-align: center;
+}
+
+.hsl-auth-text {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.hsl-auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.hsl-auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  font-weight: 500;
+}
+
+.hsl-auth-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-ctl);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 400;
+}
+
+.hsl-auth-input:focus {
+  border-color: var(--accent);
+}
+
+.hsl-auth-check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.hsl-auth-check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.hsl-auth-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  width: 100%;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-ctl);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.hsl-auth-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.hsl-auth-button.is-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.hsl-auth-button.is-primary:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+  color: var(--accent-text);
+}
+
+/* "Sign in with HackSpaceLabs": the H mark on a plain button, in the wordmark's colour. */
+.hsl-auth-button.is-sso {
+  color: var(--logo-ink);
+}
+
+.hsl-auth-button.is-sso:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--logo-ink);
+}
+
+.hsl-auth-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.hsl-auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.hsl-auth-divider::before,
+.hsl-auth-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.hsl-auth-alert {
+  margin: 0;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--bad-border);
+  border-radius: var(--radius-ctl);
+  background: var(--bad-bg);
+  color: var(--bad);
+  font-size: 0.92rem;
+}
+
+.hsl-auth-alert.is-warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.hsl-auth-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.hsl-auth-link {
+  align-self: center;
+  text-align: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.hsl-auth-link:hover {
+  text-decoration: underline;
+}

@@ -1,0 +1,132 @@
+/*
+ * HSL Suite design tokens (hackspacelabs-web/ui). Shared by HackSpaceLabs, Slipway, Switchyard,
+ * Harbor Master and Tideline. Values are Switchyard's (PLAN.md appendix A in encondata/hsl-suite).
+ *
+ * Light is the default. Dark applies only when the page sets data-theme="dark" on <html>, which
+ * suite.js does when the user turns it on. Never follow prefers-color-scheme.
+ *
+ * Do not edit a synced copy inside an app: change it here and sync (scripts/sync-hsl-ui.sh).
+ */
+
+:root {
+  /* Surfaces and text */
+  --bg: #f4f6f9;
+  --surface: #fff;
+  --surface-2: #f8fafc;
+  --text: #131f2b;
+  --muted: #5c6a79;
+  /* Below 4.5:1 on white: for icons, borders and placeholders, not for text people must read. */
+  --faint: #8794a2;
+  --border: #dce3eb;
+  --border-strong: #c7d1dc;
+  --logo-ink: #003459;
+
+  /* Accent. --accent-base lets an app offer a per-user accent (Switchyard does). */
+  --accent: var(--accent-base, #0072b1);
+  --accent-hover: color-mix(in srgb, var(--accent) 86%, #000);
+  /* 8%, not Switchyard's 11%, so accent text on it passes 4.5:1 (4.66). */
+  --accent-soft: color-mix(in srgb, var(--accent) 8%, #fff);
+  --accent-text: #fff;
+
+  /* Status */
+  /* #0f7a5b, not Switchyard's #12805f, so it passes 4.5:1 on --ok-bg (4.63). */
+  --ok: #0f7a5b;
+  --ok-bg: #e3f3ee;
+  --success-bg: #e3f3ee;
+  --bad: #c8312b;
+  --bad-bg: #fdecea;
+  --bad-border: #f3c1bd;
+  --warn: #a15c07;
+  --warn-bg: #fdf3e1;
+  --warn-border: #f1d29a;
+  --notice-bg: #fdf3e1;
+  --off: #5c6a79;
+  --off-bg: #eef1f5;
+
+  /* Diffs, code */
+  --add-bg: #e6f6ee;
+  --del-bg: #fdecea;
+  --code-bg: #f1f4f8;
+
+  /* Charts: series, grid, and HTTP status classes (2xx to 5xx, 0 = no answer) */
+  --series-1: var(--accent);
+  --series-2: #0891b2;
+  --grid: #e5eaf0;
+  --c0: #98a4b1;
+  --c2: #12966f;
+  --c3: #22a6c7;
+  --c4: #e3a008;
+  --c5: #d6453d;
+
+  /* Shape */
+  --radius: 10px;
+  --radius-ctl: 8px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgb(19 31 43 / 0.05);
+  --shadow-2: 0 10px 30px rgb(19 31 43 / 0.12), 0 2px 6px rgb(19 31 43 / 0.06);
+
+  /* Type */
+  --font: 'Inter Variable', Inter, system-ui, 'Segoe UI', Roboto, sans-serif;
+  --font-brand: 'Outfit', 'Inter Variable', Inter, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  /* Frame */
+  --hsl-sidebar-width: 248px;
+  --hsl-topbar-height: 64px;
+
+  font-family: var(--font);
+  font-feature-settings: 'cv11', 'ss01';
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0c1219;
+  --surface: #131b24;
+  --surface-2: #18212b;
+  --text: #e2e8ef;
+  --muted: #95a3b2;
+  --faint: #6d7c8b;
+  --border: #24303c;
+  --border-strong: #31404f;
+  --logo-ink: #e2e8ef;
+
+  /* Same hue, lifted so it reads on the dark surface. */
+  --accent: oklch(from var(--accent-base, #0072b1) max(l, 0.72) c h);
+  --accent-hover: color-mix(in srgb, var(--accent) 85%, #fff);
+  --accent-soft: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  --accent-text: #0a1018;
+
+  --ok: #3cc59f;
+  --ok-bg: #163a30;
+  --success-bg: #163a30;
+  --bad: #f0716a;
+  --bad-bg: #351a19;
+  --bad-border: #5c2a27;
+  --warn: #f0b75a;
+  --warn-bg: #2e2412;
+  --warn-border: #5a4419;
+  --notice-bg: #2e2412;
+  --off: #95a3b2;
+  --off-bg: #1d2731;
+
+  --add-bg: #163a30;
+  --del-bg: #351a19;
+  --code-bg: #0a1018;
+
+  --series-1: var(--accent);
+  --series-2: #38bdf8;
+  --grid: #222d39;
+  --c0: #6d7c8b;
+  --c2: #2bb38e;
+  --c3: #38bdf8;
+  --c4: #f0b75a;
+  --c5: #f0716a;
+
+  --shadow: none;
+  --shadow-2: 0 10px 30px rgb(0 0 0 / 0.55);
+}
