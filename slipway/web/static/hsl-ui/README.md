@@ -117,7 +117,9 @@ The second command is for CI: it fails if the copy no longer matches what was sy
 - Mark the current page with `aria-current="page"` (or the class `is-active`) on its `.hsl-nav-item`.
 - Under 900 px the sidebar becomes a strip above the page, with the nav scrolling sideways, and the user
   menu shows only the avatar.
-- The sizes are tokens: `--hsl-sidebar-width` (248 px) and `--hsl-topbar-height` (64 px).
+- The sizes are tokens: `--hsl-sidebar-width` (248 px) and `--hsl-topbar-height` (64 px). To narrow the
+  sidebar (a collapsed rail, say), set `--hsl-sidebar-width` on `.hsl-shell` rather than overriding
+  `grid-template-columns`: the full-height sidebar colour is drawn from the same token.
 
 ## The sign-in card
 
@@ -218,7 +220,8 @@ people must read; the kit's own labels use `--muted`.
   - `<hsl-user-menu>` takes `avatar-url` (a photo) and `compact-below` (when the name hides).
   - Kit classes on a `<button>` (`hsl-auth-link`, `hsl-auth-button`, the menu items, the nav items, the
     user button) set their own background, border colour and text colour on hover, so an app's global
-    `button:hover` rules no longer show through.
+    `button:hover` rules no longer show through. Kit links (brand, nav items, switcher and menu rows,
+    `hsl-auth-button`) don't underline on hover, whatever the app's `a:hover` says.
   - The sidebar's colour and edge run the full height of pages taller than the window.
   - Added `apple-touch-icon.png`.
   - The `detail` line's wording is set down above.

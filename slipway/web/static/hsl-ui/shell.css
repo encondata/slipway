@@ -36,6 +36,16 @@
   outline-offset: 2px;
 }
 
+/* Kit links never underline on hover, whatever an app's own a:hover rule says. */
+.hsl-skip:hover,
+.hsl-brand:hover,
+.hsl-nav-item:hover,
+.hsl-topbar-title a:hover,
+.hsl-switcher-app:hover,
+.hsl-menu-item:hover {
+  text-decoration: none;
+}
+
 /* Skip link: first thing in the page, visible only when focused. */
 .hsl-skip {
   position: absolute;

@@ -135,6 +135,7 @@
   border-color: var(--accent);
   background: var(--surface);
   color: var(--accent);
+  text-decoration: none;
 }
 
 .hsl-auth-button.is-primary {
