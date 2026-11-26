@@ -446,6 +446,8 @@ hsl-user-menu[hidden] {
 @media (max-width: 900px) {
   .hsl-shell {
     grid-template-columns: minmax(0, 1fr);
+    /* The strip keeps its own height; the page takes the rest. */
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .hsl-sidebar {

@@ -180,6 +180,12 @@
         self.open(-1);
       }
     });
+    // Choosing an item closes the menu, which matters in single-page apps where a link doesn't reload
+    // the page. The dark mode switch stays open so its new state can be seen.
+    menu.addEventListener('click', function (e) {
+      var item = e.target.closest('[role="menuitem"]');
+      if (item && menu.contains(item)) self.close(false);
+    });
     menu.addEventListener('keydown', function (e) {
       var items = self.items();
       var i = items.indexOf(document.activeElement);
@@ -285,7 +291,8 @@
     if (this.isConnected) this.render();
   };
 
-  HslAppSwitcher.prototype.apps = function () {
+  // Not called apps(): React 19 sets props as properties when the element has one of that name.
+  HslAppSwitcher.prototype.readApps = function () {
     var list;
     try {
       list = JSON.parse(this.getAttribute('apps') || '[]');
@@ -301,7 +308,7 @@
   HslAppSwitcher.prototype.render = function () {
     if (this.menuButton) this.menuButton.disconnect();
     while (this.firstChild) this.removeChild(this.firstChild);
-    var apps = this.apps();
+    var apps = this.readApps();
     this.hidden = apps.length === 0;
     if (this.hidden) return;
 
@@ -455,7 +462,7 @@
   }
 
   window.HSLSuite = {
-    version: '0.1.0',
+    version: '0.1.1',
     theme: {
       key: THEME_KEY,
       get: readTheme,

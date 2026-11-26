@@ -19,6 +19,7 @@ runs a WCAG contrast check on whatever is showing.
 | `shell.css` | The frame and the two widgets; every class starts with `hsl-` |
 | `auth.css` | The centred card for sign-in, signed-out, no-access and change-password pages |
 | `suite.js` | `<hsl-app-switcher>`, `<hsl-user-menu>`, the theme, and the mark |
+| `hsl-suite.d.ts` | TypeScript declarations for `window.HSLSuite` and the two elements (JSX attributes for React) |
 | `mark.svg`, `favicon.svg` | The H mark |
 | `VERSION` | The kit's version; releases are tagged `ui-v<VERSION>` |
 | `demo.html`, `demo.css`, `demo.js` | The demo page (not copied into apps) |
@@ -159,8 +160,9 @@ bubbles), and the app does the signing out:
 document.querySelector('hsl-user-menu').addEventListener('hsl-signout', () => signOut())
 ```
 
-In React, use a ref and `addEventListener`. Set attributes, not children: the element draws its own
-content.
+In React, pass the attributes as props (strings; `apps={JSON.stringify(list)}`) and listen with a ref and
+`addEventListener`. Give the element no children: it draws its own content. Choosing a link or Sign out
+closes the menu; the Dark mode switch leaves it open.
 
 **Keyboard.** Both widgets are WAI-ARIA menu buttons:
 - On the button, Enter, Space or Down opens the menu on its first item, and Up opens it on its last.
@@ -192,3 +194,13 @@ Two light values differ from Switchyard's so that text passes WCAG AA (4.5:1):
 
 `--faint` is below 4.5:1 on light surfaces. Use it for icons, borders and placeholders, not for text
 people must read; the kit's own labels use `--muted`.
+
+## Changes
+
+- **0.1.1**
+  - The switcher no longer has an `apps()` method, which React 19 overwrote when `apps` was passed as a prop.
+  - Choosing a menu item closes the menu, which matters in single-page apps.
+  - Under 900 px the sidebar strip keeps its own height instead of stretching on short pages.
+  - A wrapped `.hsl-auth-link` is centred.
+  - Added `hsl-suite.d.ts`.
+- **0.1.0** First release.
