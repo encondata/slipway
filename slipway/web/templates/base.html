@@ -7,7 +7,7 @@
   <title>{% block title %}Slipway{% endblock %} · Slipway</title>
   <meta name="csrf-token" content="{{ csrf_token }}">
   <link rel="icon" href="/static/hsl-ui/favicon.svg?v={{ asset_version() }}" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png?v={{ asset_version() }}">
+  <link rel="apple-touch-icon" href="/static/hsl-ui/apple-touch-icon.png?v={{ asset_version() }}">
   {#- The HSL Suite kit (static/hsl-ui, synced by scripts/sync-hsl-ui.sh): fonts, tokens, frame and sign-in card. #}
   <link rel="stylesheet" href="/static/hsl-ui/fonts.css?v={{ asset_version() }}">
   <link rel="stylesheet" href="/static/hsl-ui/tokens.css?v={{ asset_version() }}">
@@ -33,8 +33,11 @@
   ("/analytics", "analytics", "Analytics", Perm.ANALYTICS_READ),
   ("/logs", "logs", "Logs", Perm.LOGS_READ),
 ] %}
-{#- The user menu: the role line says when the account signs in with HackSpaceLabs, whose Profile is the portal's. #}
+{#- The user menu's detail line, worded as in every HSL Suite app: the role, then how this session signed in
+    (HackSpaceLabs, or Slipway's own password or GitHub, which count as a local account). An account linked to
+    HackSpaceLabs has the portal's Profile. #}
 {% set roles_line = user.role_names|join(", ")|title or "No role" %}
+{% set signed_in_with = "HackSpaceLabs" if auth.session and auth.session.auth_source == "oidc" else "Local account" %}
 {% set profile_url = settings.hsl_portal_url ~ "/me" if user.hackspacelabs and settings.hsl_portal_url else "/settings" %}
 <a class="hsl-skip" href="#main">Skip to content</a>
 <div class="hsl-shell">
@@ -86,7 +89,7 @@
         <a class="pill" href="/settings" title="Set SLIPWAY_GITHUB_CLIENT_ID / _SECRET to enable GitHub">{{ icon("github") }}<span class="meta"><span class="dot"></span>GitHub not configured</span></a>
         {% endif %}
         <hsl-app-switcher current="slipway" apps='{{ settings.hsl_apps|tojson }}'></hsl-app-switcher>
-        <hsl-user-menu name="{{ user.display_name }}" detail="{{ roles_line }}{{ ' · HackSpaceLabs' if user.hackspacelabs }}" profile-url="{{ profile_url }}"></hsl-user-menu>
+        <hsl-user-menu name="{{ user.display_name }}" detail="{{ roles_line }} · {{ signed_in_with }}"{% if user.avatar_url %} avatar-url="{{ user.avatar_url }}"{% endif %} profile-url="{{ profile_url }}"></hsl-user-menu>
       </div>
     </header>
     <main class="hsl-content content{% block content_class %}{% endblock %}" id="main" tabindex="-1">

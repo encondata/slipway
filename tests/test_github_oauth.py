@@ -66,6 +66,14 @@ async def test_first_github_user_becomes_admin(client):
     assert me["email"] == "mona@example.com" and me["roles"] == ["admin"] and me["github_login"] == "octocat"
 
 
+async def test_a_github_sign_in_is_a_local_account_with_its_photo(client):
+    state = await _start(client)
+    await client.get(f"/auth/github/callback?code=good-code&state={state}")
+    page = (await client.get("/")).text
+    assert 'detail="Admin · Local account"' in page
+    assert f'avatar-url="{PROFILE["avatar_url"]}"' in page
+
+
 async def test_state_mismatch_rejected(client):
     await _start(client)
     r = await client.get("/auth/github/callback?code=good-code&state=forged")
