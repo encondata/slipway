@@ -21,6 +21,7 @@ runs a WCAG contrast check on whatever is showing.
 | `suite.js` | `<hsl-app-switcher>`, `<hsl-user-menu>`, the theme, and the mark |
 | `hsl-suite.d.ts` | TypeScript declarations for `window.HSLSuite` and the two elements (JSX attributes for React) |
 | `mark.svg`, `favicon.svg` | The H mark |
+| `apple-touch-icon.png` | The H mark on white, 180 × 180, for phone home screens |
 | `VERSION` | The kit's version; releases are tagged `ui-v<VERSION>` |
 | `demo.html`, `demo.css`, `demo.js` | The demo page (not copied into apps) |
 
@@ -68,6 +69,13 @@ The second command is for CI: it fails if the copy no longer matches what was sy
   <script src="/static/hsl-ui/suite.js"></script>
   ```
 
+- **Icons:** `favicon.svg` for the tab and `apple-touch-icon.png` for phone home screens:
+
+  ```html
+  <link rel="icon" href="/hsl-ui/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/hsl-ui/apple-touch-icon.png">
+  ```
+
 ## The frame
 
 ```html
@@ -98,7 +106,7 @@ The second command is for CI: it fails if the copy no longer matches what was sy
       <!-- the app's own tools (search box, status) go here -->
       <div class="hsl-topbar-end">
         <hsl-app-switcher current="tideline" apps='[…]'></hsl-app-switcher>
-        <hsl-user-menu name="Jimmy Henderson" detail="Admin" profile-url="https://hackspacelabs.com/me"></hsl-user-menu>
+        <hsl-user-menu name="Jimmy Henderson" detail="Admin · HackSpaceLabs" profile-url="https://hackspacelabs.com/me"></hsl-user-menu>
       </div>
     </header>
     <main class="hsl-content" id="main" tabindex="-1">…</main>
@@ -109,7 +117,9 @@ The second command is for CI: it fails if the copy no longer matches what was sy
 - Mark the current page with `aria-current="page"` (or the class `is-active`) on its `.hsl-nav-item`.
 - Under 900 px the sidebar becomes a strip above the page, with the nav scrolling sideways, and the user
   menu shows only the avatar.
-- The sizes are tokens: `--hsl-sidebar-width` (248 px) and `--hsl-topbar-height` (64 px).
+- The sizes are tokens: `--hsl-sidebar-width` (248 px) and `--hsl-topbar-height` (64 px). To narrow the
+  sidebar (a collapsed rail, say), set `--hsl-sidebar-width` on `.hsl-shell` rather than overriding
+  `grid-template-columns`: the full-height sidebar colour is drawn from the same token.
 
 ## The sign-in card
 
@@ -149,9 +159,18 @@ It hides itself when `apps` is empty. Only `http(s)` addresses and same-site pat
 | Attribute | |
 |---|---|
 | `name` | the person's name; the avatar shows its initials |
-| `detail` | the line under the name, e.g. "Admin · signed in with HackSpaceLabs" |
+| `detail` | the line under the name: the role, then how they signed in (below) |
+| `avatar-url` | optional: a photo for the avatar (same-site path or http(s)); initials if it's empty or fails to load |
 | `profile-url` | the Profile link (the portal's `/me`); left out when empty |
 | `profile-label`, `signout-label` | default "Profile" and "Sign out" |
+| `compact-below` | optional: a window width in px at or below which the button shows only the avatar. Every app gets this below 900 px; set it when your top bar needs the room sooner (Harbor Master uses 1200). |
+
+**The `detail` line is the same in every app:** the person's role in this app as the app names it, then
+` · HackSpaceLabs` for an account signed in through HackSpaceLabs, or ` · Local account` for one that
+signed in with the app's own password. For example "Admin · HackSpaceLabs", "Editor · Local account",
+"Administrator · HackSpaceLabs" (the portal).
+
+The photo must be allowed by the page's `img-src`. Serve it from your own origin where you can.
 
 The menu has Profile, a "Dark mode" switch and Sign out. **Sign out fires a `hsl-signout` event** (it
 bubbles), and the app does the signing out:
@@ -196,6 +215,16 @@ Two light values differ from Switchyard's so that text passes WCAG AA (4.5:1):
 people must read; the kit's own labels use `--muted`.
 
 ## Changes
+
+- **0.1.2**
+  - `<hsl-user-menu>` takes `avatar-url` (a photo) and `compact-below` (when the name hides).
+  - Kit classes on a `<button>` (`hsl-auth-link`, `hsl-auth-button`, the menu items, the nav items, the
+    user button) set their own background, border colour and text colour on hover, so an app's global
+    `button:hover` rules no longer show through. Kit links (brand, nav items, switcher and menu rows,
+    `hsl-auth-button`) don't underline on hover, whatever the app's `a:hover` says.
+  - The sidebar's colour and edge run the full height of pages taller than the window.
+  - Added `apple-touch-icon.png`.
+  - The `detail` line's wording is set down above.
 
 - **0.1.1**
   - The switcher no longer has an `apps()` method, which React 19 overwrote when `apps` was passed as a prop.

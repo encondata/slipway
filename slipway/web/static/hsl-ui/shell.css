@@ -3,6 +3,9 @@
  * suite.js draws. Every class starts with hsl- so it never meets an app's own CSS; app pages keep
  * their own component styles, which pick up the shared tokens. Needs tokens.css.
  * Measurements are Switchyard's. Markup: see README.md.
+ *
+ * Kit classes that may sit on a <button> set background, border colour and text colour in every
+ * state, so an app's own button:hover rules never show through.
  */
 
 .hsl-shell,
@@ -16,13 +19,31 @@
   display: grid;
   grid-template-columns: var(--hsl-sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
-  background: var(--bg);
+  /* The sidebar's colour and edge run the full height of the page, also below the sticky sidebar
+     itself on pages taller than the window. */
+  background: linear-gradient(
+    to right,
+    var(--surface) calc(var(--hsl-sidebar-width) - 1px),
+    var(--border) calc(var(--hsl-sidebar-width) - 1px),
+    var(--border) var(--hsl-sidebar-width),
+    var(--bg) var(--hsl-sidebar-width)
+  );
   color: var(--text);
 }
 
 .hsl-shell :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* Kit links never underline on hover, whatever an app's own a:hover rule says. */
+.hsl-skip:hover,
+.hsl-brand:hover,
+.hsl-nav-item:hover,
+.hsl-topbar-title a:hover,
+.hsl-switcher-app:hover,
+.hsl-menu-item:hover {
+  text-decoration: none;
 }
 
 /* Skip link: first thing in the page, visible only when focused. */
@@ -128,10 +149,13 @@
 
 .hsl-nav-item:hover {
   background: var(--surface-2);
+  color: var(--text);
 }
 
 .hsl-nav-item.is-active,
-.hsl-nav-item[aria-current='page'] {
+.hsl-nav-item[aria-current='page'],
+.hsl-nav-item.is-active:hover,
+.hsl-nav-item[aria-current='page']:hover {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
@@ -287,6 +311,7 @@ hsl-user-menu[hidden] {
 .hsl-userbtn[aria-expanded='true'] {
   border-color: var(--border-strong);
   background: var(--surface-2);
+  color: var(--text);
 }
 
 .hsl-userbtn-name {
@@ -306,6 +331,11 @@ hsl-user-menu[hidden] {
   color: var(--accent-text);
   font-size: 0.8rem;
   font-weight: 700;
+}
+
+.hsl-avatar.is-photo {
+  object-fit: cover;
+  background: var(--surface-2);
 }
 
 .hsl-pop {
@@ -423,10 +453,14 @@ hsl-user-menu[hidden] {
 
 .hsl-menu-item:hover,
 .hsl-menu-item:focus-visible {
+  border-color: transparent;
   background: var(--surface-2);
+  color: var(--text);
 }
 
-.hsl-menu-item.is-danger {
+.hsl-menu-item.is-danger,
+.hsl-menu-item.is-danger:hover,
+.hsl-menu-item.is-danger:focus-visible {
   color: var(--bad);
 }
 
@@ -441,6 +475,15 @@ hsl-user-menu[hidden] {
   background: var(--border);
 }
 
+/* compact-below on <hsl-user-menu>: only the avatar at or below the width the app chose. */
+hsl-user-menu[data-hsl-compact] .hsl-userbtn {
+  padding: 0 4px;
+}
+
+hsl-user-menu[data-hsl-compact] .hsl-userbtn-name {
+  display: none;
+}
+
 /* ---------- Narrow screens ---------- */
 
 @media (max-width: 900px) {
@@ -448,6 +491,7 @@ hsl-user-menu[hidden] {
     grid-template-columns: minmax(0, 1fr);
     /* The strip keeps its own height; the page takes the rest. */
     grid-template-rows: auto minmax(0, 1fr);
+    background: var(--bg);
   }
 
   .hsl-sidebar {

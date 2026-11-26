@@ -148,6 +148,25 @@
     }
   }
 
+  /** The round avatar: the photo at `url` if there is one and it loads, else the name's initials. */
+  function avatarFor(name, url) {
+    var letters = el('span', 'hsl-avatar', initials(name));
+    letters.setAttribute('aria-hidden', 'true');
+    if (!url) return letters;
+    var photo = el('img', 'hsl-avatar is-photo');
+    photo.alt = '';
+    photo.setAttribute('aria-hidden', 'true');
+    photo.width = 30;
+    photo.height = 30;
+    photo.decoding = 'async';
+    photo.referrerPolicy = 'no-referrer';
+    photo.addEventListener('error', function () {
+      if (photo.parentNode) photo.parentNode.replaceChild(letters, photo);
+    });
+    photo.src = url;
+    return photo;
+  }
+
   function initials(name) {
     var parts = String(name || '').trim().split(/\s+/).filter(Boolean);
     if (parts.length === 0) return '?';
@@ -356,11 +375,12 @@
   };
 
   // ---------------------------------------------------------------- <hsl-user-menu>
-  // name, detail (role line), profile-url, profile-label, signout-label. Fires "hsl-signout".
+  // name, detail (role line), avatar-url, profile-url, profile-label, signout-label, compact-below.
+  // Fires "hsl-signout".
 
   class HslUserMenu extends HTMLElement {
     static get observedAttributes() {
-      return ['name', 'detail', 'profile-url', 'profile-label', 'signout-label'];
+      return ['name', 'detail', 'avatar-url', 'profile-url', 'profile-label', 'signout-label', 'compact-below'];
     }
   }
 
@@ -369,15 +389,30 @@
     this.onTheme = function () {
       self.syncTheme();
     };
+    this.onResize = function () {
+      self.syncCompact();
+    };
     document.addEventListener('hsl-themechange', this.onTheme);
+    window.addEventListener('resize', this.onResize);
     this.render();
   };
   HslUserMenu.prototype.disconnectedCallback = function () {
     document.removeEventListener('hsl-themechange', this.onTheme);
+    window.removeEventListener('resize', this.onResize);
     if (this.menuButton) this.menuButton.disconnect();
   };
-  HslUserMenu.prototype.attributeChangedCallback = function () {
-    if (this.isConnected) this.render();
+
+  // compact-below="1200": at that window width or less the button shows only the avatar (the kit does
+  // this below 900 px for every app). Marked with data-hsl-compact for the CSS.
+  HslUserMenu.prototype.syncCompact = function () {
+    var below = parseInt(this.getAttribute('compact-below') || '', 10);
+    var compact = below > 0 && window.innerWidth <= below;
+    if (compact !== this.hasAttribute('data-hsl-compact')) this.toggleAttribute('data-hsl-compact', compact);
+  };
+  HslUserMenu.prototype.attributeChangedCallback = function (name) {
+    if (!this.isConnected) return;
+    if (name === 'compact-below') this.syncCompact();
+    else this.render();
   };
 
   HslUserMenu.prototype.syncTheme = function () {
@@ -402,9 +437,7 @@
     button.setAttribute('aria-expanded', 'false');
     button.setAttribute('aria-controls', popId);
     button.setAttribute('aria-label', 'Account: ' + name);
-    var avatar = el('span', 'hsl-avatar', initials(name));
-    avatar.setAttribute('aria-hidden', 'true');
-    button.appendChild(avatar);
+    button.appendChild(avatarFor(name, safeUrl(this.getAttribute('avatar-url'))));
     button.appendChild(el('span', 'hsl-userbtn-name', name));
 
     var pop = el('div', 'hsl-pop hsl-menu');
@@ -451,6 +484,7 @@
     this.appendChild(button);
     this.appendChild(pop);
     this.syncTheme();
+    this.syncCompact();
 
     this.menuButton = new MenuButton(this, button, pop, menu);
     this.menuButton.connect();
@@ -462,7 +496,7 @@
   }
 
   window.HSLSuite = {
-    version: '0.1.1',
+    version: '0.1.2',
     theme: {
       key: THEME_KEY,
       get: readTheme,

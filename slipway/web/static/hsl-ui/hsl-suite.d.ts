@@ -37,10 +37,15 @@ export interface HslAppSwitcherAttributes extends Base {
 
 export interface HslUserMenuAttributes extends Base {
   name?: string
+  /** The role, then " · HackSpaceLabs" or " · Local account". */
   detail?: string
+  /** A photo for the avatar; initials if empty or it fails to load. */
+  'avatar-url'?: string
   'profile-url'?: string
   'profile-label'?: string
   'signout-label'?: string
+  /** Window width in px at or below which only the avatar shows (the kit does this below 900 px). */
+  'compact-below'?: string | number
 }
 
 declare module 'react' {

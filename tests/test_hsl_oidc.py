@@ -514,6 +514,20 @@ async def test_a_signed_in_page_clears_the_auto_redirect_marker(client, kc, admi
     assert page.status_code == 200 and f'{hsl_web.TRY_COOKIE}=""' in _cookie(page, hsl_web.TRY_COOKIE)
 
 
+async def test_the_user_menu_says_how_the_session_signed_in(client, make_client, kc, admin, monkeypatch):
+    # The HSL Suite wording: the role, then " · HackSpaceLabs" or " · Local account".
+    monkeypatch.setattr(get_settings(), "hsl_portal_url", PORTAL)
+    _alice(kc)
+    await _sign_in(client, kc)
+    page = (await client.get("/")).text
+    assert 'detail="Developer · HackSpaceLabs"' in page and f'profile-url="{PORTAL}/me"' in page
+    assert "avatar-url=" not in page
+    local = make_client()
+    await login(local, "admin@example.com")
+    page = (await local.get("/")).text
+    assert 'detail="Admin · Local account"' in page and 'profile-url="/settings"' in page
+
+
 async def test_without_hackspacelabs_nothing_changes(client):
     page = (await client.get("/login")).text
     assert "HackSpaceLabs" not in page and 'id="login-form"' in page
