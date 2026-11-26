@@ -693,3 +693,23 @@ done({ hrefs: hrefs });
 """)
     assert result["hrefs"][0] == "http://kc.test/realms/test/protocol/openid-connect/logout?client_id=slipway"
     assert result["hrefs"][1].endswith("/login")
+
+
+def test_the_user_menus_sign_out_follows_the_returned_redirect(tmp_path):
+    # The HSL Suite user menu (<hsl-user-menu>) fires hsl-signout; slipway.js signs out as the old menu button did.
+    from tests.test_review_web import run_js
+
+    result = run_js(tmp_path, """
+location.pathname = "/instances";
+var menu = h("hsl-user-menu", {});
+document.body.appendChild(menu);
+routes["POST /api/v1/auth/logout"] = { status: 200, body: { redirect: "http://kc.test/realms/test/protocol/openid-connect/logout?client_id=slipway" } };
+menu.dispatchEvent(new CustomEvent("hsl-signout", { bubbles: true }));
+await settle();
+routes["POST /api/v1/auth/logout"] = { status: 204 };
+menu.dispatchEvent(new CustomEvent("hsl-signout", { bubbles: true }));
+await settle();
+done({ hrefs: hrefs });
+""")
+    assert result["hrefs"][0] == "http://kc.test/realms/test/protocol/openid-connect/logout?client_id=slipway"
+    assert result["hrefs"][1].endswith("/login")

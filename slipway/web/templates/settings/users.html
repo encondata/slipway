@@ -26,7 +26,7 @@
       <tr>
         <td><span class="primary-cell">{{ avatar(u, "sm") }}<span><strong>{{ u.display_name }}{% if u.id == user.id %} <span class="subtle">(you)</span>{% endif %}</strong><small>{{ u.email }}</small></span></span></td>
         <td>{% for r in u.role_names %}<span class="badge plain {{ 'primary' if r == 'admin' }}">{{ r }}</span> {% else %}<span class="subtle">none</span>{% endfor %}</td>
-        <td class="muted">{% if u.hackspacelabs %}<img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt="" style="width:14px;height:14px;vertical-align:-2px"> HackSpaceLabs {{ u.hackspacelabs.login }}{% if u.github or u.password_hash %} · {% endif %}{% endif %}{% if u.github %}{{ icon("github", "i-sm") }} @{{ u.github.login }}{% endif %}{% if u.github and u.password_hash %} · {% endif %}{% if u.password_hash %}Password{% endif %}{% if not u.github and not u.password_hash and not u.hackspacelabs %}<span class="subtle">none</span>{% endif %}</td>
+        <td class="muted">{% if u.hackspacelabs %}<img class="hsl-mark hsl-mark-inline" src="/static/hsl-ui/mark.svg?v={{ asset_version() }}" width="15" height="14" alt=""> HackSpaceLabs {{ u.hackspacelabs.login }}{% if u.github or u.password_hash %} · {% endif %}{% endif %}{% if u.github %}{{ icon("github", "i-sm") }} @{{ u.github.login }}{% endif %}{% if u.github and u.password_hash %} · {% endif %}{% if u.password_hash %}Password{% endif %}{% if not u.github and not u.password_hash and not u.hackspacelabs %}<span class="subtle">none</span>{% endif %}</td>
         <td>{% if u.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge">Deactivated</span>{% endif %}</td>
         <td class="muted">{{ u.last_login_at|timeago }}</td>
         <td class="actions-cell">{% if can_write and (u.id == user.id or u.id in manageable) %}<button class="btn btn-sm" data-open="edit-{{ u.id }}">Edit</button>{% endif %}</td>
@@ -74,7 +74,7 @@
       {% if u.id != user.id %}
       <div class="field"><label>Reset password <span class="subtle">(optional; also signs them out, deletes their API tokens and unlinks GitHub{% if u.hackspacelabs %} and HackSpaceLabs: they sign in with the new password and link again{% endif %})</span></label><input class="input" name="password" type="password" autocomplete="new-password" minlength="10"></div>
       {% if u.hackspacelabs %}
-      <div class="row wrap"><span class="muted"><img class="hsl-mark" src="/static/img/hsl-mark.svg?v={{ asset_version() }}" alt="" style="width:14px;height:14px;vertical-align:-2px"> Signs in with HackSpaceLabs as <strong>{{ u.hackspacelabs.login }}</strong>; password and GitHub sign-in are off for this account.</span></div>
+      <div class="row wrap"><span class="muted"><img class="hsl-mark hsl-mark-inline" src="/static/hsl-ui/mark.svg?v={{ asset_version() }}" width="15" height="14" alt=""> Signs in with HackSpaceLabs as <strong>{{ u.hackspacelabs.login }}</strong>; password and GitHub sign-in are off for this account.</span></div>
       {% endif %}
       {% if u.github %}
       <div class="row wrap"><span class="muted">{{ icon("github", "i-sm") }} Signs in with GitHub as <strong>@{{ u.github.login }}</strong></span>

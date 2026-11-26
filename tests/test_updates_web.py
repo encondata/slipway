@@ -31,7 +31,7 @@ RUN_ID = "20261117-100000-abcdef"
 
 
 def _nav(page: str) -> str:
-    return re.search(r'<nav class="nav".*?</nav>', page, re.S).group(0)
+    return re.search(r'<nav class="hsl-nav".*?</nav>', page, re.S).group(0)
 
 
 # ------------------------------------------------------------------------- sidebar
@@ -54,7 +54,7 @@ async def test_updates_nav_item_only_with_the_permission(admin_client, make_clie
 async def test_nav_badge_counts_new_commits_until_slipway_changes(admin_client, server, monkeypatch):
     await _checked(admin_client, server)
     nav = _nav((await admin_client.get("/hosts")).text)
-    assert re.search(r'Updates<span class="nav-badge"[^>]*>2</span>', nav)
+    assert re.search(r'Updates<span class="hsl-nav-badge"[^>]*>2</span>', nav)
 
     monkeypatch.setenv("SLIPWAY_COMMIT", NEW)  # upgraded since that check: those commits run now
     assert "nav-badge" not in _nav((await admin_client.get("/hosts")).text)
@@ -132,7 +132,7 @@ async def test_page_after_a_check_shows_commits_warnings_and_upgrade(admin_clien
     assert f"Upgrade to {NEW[:7]}" in page
 
     # Text from git is escaped everywhere: no tag from it reaches the page.
-    for raw in (EVIL_BRANCH, EVIL_SUBJECT, EVIL_AUTHOR, "<img", "<script>alert"):
+    for raw in (EVIL_BRANCH, EVIL_SUBJECT, EVIL_AUTHOR, "<img src=x", "<script>alert"):
         assert raw not in page
     assert "x/&lt;img src=x onerror=alert(1)&gt;" in page
     assert "&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;" in page

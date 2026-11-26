@@ -499,21 +499,16 @@
       : "Couldn't copy to the clipboard. Select the text and copy it by hand.", "error");
   });
 
-  // ------------------------------------------------------- theme
-  document.addEventListener("click", (ev) => {
-    if (!ev.target.closest("[data-theme-toggle]")) return;
-    const root = document.documentElement;
-    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-    const next = dark ? "light" : "dark";
-    root.dataset.theme = next;
-    try { localStorage.setItem("slipway-theme", next); } catch (e) { /* ignore */ }
-  });
-
-  // ---------------------------------------------------- menus / nav
-  document.addEventListener("click", (ev) => {
-    $$("details.usermenu[open]").forEach((d) => { if (!d.contains(ev.target)) d.open = false; });
-    if (ev.target.closest(".menu-toggle")) $("#sidebar").classList.toggle("open");
-    else if (!ev.target.closest("#sidebar")) { const s = $("#sidebar"); if (s) s.classList.remove("open"); }
+  // ------------------------------------------------- theme, sign-out
+  // The theme belongs to the HSL Suite kit (hsl-ui/suite.js, js/theme.js): light unless the user turns dark mode on
+  // in the user menu, never the operating system's. The user menu (<hsl-user-menu>) fires hsl-signout. A HackSpaceLabs
+  // session answers {redirect}: Keycloak's own sign-out page; a local one answers 204, which goes to /login.
+  document.addEventListener("hsl-signout", async () => {
+    try {
+      then("follow:/login", await api("POST", "/api/v1/auth/logout"));
+    } catch (err) {
+      toast(err.message, "error");
+    }
   });
 
   document.addEventListener("keydown", (ev) => {
