@@ -40,6 +40,7 @@ from slipway.services.terraform import (
 )
 
 from tests.fake_proxmox import FakeProxmox
+from tests.python_shim import python_header
 from tests.hypervisor_guard import no_real_hypervisors  # noqa: F401  (the fixture)
 
 pytestmark = pytest.mark.usefixtures("no_real_hypervisors")
@@ -117,7 +118,7 @@ class FakeTF:
         self.bin.parent.mkdir()
         config = {"pve_state": str(self.pve_state), "script": str(self.script), "log": str(self.log)}
         self.bin.write_text(
-            f"#!{sys.executable}\n"
+            python_header() +
             "import runpy\n"
             f"runpy.run_path({str(FAKE)!r}, init_globals={{'FAKE_CONFIG': {config!r}}}, run_name='__main__')\n"
         )

@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -23,6 +22,7 @@ from slipway.db.session import get_sessionmaker
 from slipway.models import AppSetting, Deployment, Environment, Host, Instance, Repository, Resource
 from slipway.services import cloudflare, resources, switchyard, traffic
 from tests import fake_switchyard
+from tests.python_shim import python_header
 from tests.fake_cloudflare import TOKEN, ZONE, FakeCloudflare
 from tests.test_final_remote import ShellRemote
 
@@ -797,8 +797,7 @@ async def test_a_blocked_sync_warns_and_writes_nothing(configured):
 # --------------------------------------------------------------------- test 29
 
 
-SHIM = r'''#!{python}
-import json, os, sys
+SHIM = r'''{header}import json, os, sys
 tool = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
 with open(os.environ["HTTP_LOG"], "a") as fh:
@@ -822,7 +821,7 @@ def _shims(tmp_path: Path, tools=("curl",), codes=None) -> tuple[dict, Path]:
     bin_dir.mkdir()
     for tool in tools:
         script = bin_dir / tool
-        script.write_text(SHIM.format(python=sys.executable))
+        script.write_text(SHIM.format(header=python_header()))
         script.chmod(0o755)
     awk = "/usr/bin/awk" if os.path.exists("/usr/bin/awk") else "/bin/awk"
     (bin_dir / "awk").symlink_to(awk)
@@ -955,8 +954,7 @@ async def test_a_switch_without_a_traffic_address_warns(fake, sites, waits):
 # ------------------------------------------------------------- database probe
 
 
-DOCKER = r'''#!{python}
-import json, os, sys
+DOCKER = r'''{header}import json, os, sys
 with open(os.environ["DOCKER_LOG"], "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv[1:], "has_password": bool(os.environ.get("PGPASSWORD")),
                          "password_ok": os.environ.get("PGPASSWORD") == os.environ.get("EXPECT")}}) + "\n")
@@ -970,7 +968,7 @@ def _docker(tmp_path, answer="1"):
     bin_dir = tmp_path / "dbin"
     bin_dir.mkdir()
     script = bin_dir / "docker"
-    script.write_text(DOCKER.format(python=sys.executable))
+    script.write_text(DOCKER.format(header=python_header()))
     script.chmod(0o755)
     log = tmp_path / "docker.log"
     log.write_text("")

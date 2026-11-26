@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,6 +40,7 @@ from slipway.services.providers import proxmox as pxp
 from slipway.services.providers import provider_for
 from slipway.services.vmtypes import MachineError
 from tests import fake_proxmox as fp
+from tests.python_shim import python_header
 from tests import vm_fixtures as vf
 from tests.fake_vm_hosts import VmRemote, probe_through
 from tests.test_terraform import lock_file
@@ -70,7 +70,7 @@ class World:
         self.bin.parent.mkdir()
         config = {"pve_state": str(self.fake.path), "script": str(self.script), "log": str(self.log)}
         self.bin.write_text(
-            f"#!{sys.executable}\n"
+            python_header() +
             "import runpy\n"
             f"runpy.run_path({str(FAKE_TF)!r}, init_globals={{'FAKE_CONFIG': {config!r}}}, run_name='__main__')\n"
         )
