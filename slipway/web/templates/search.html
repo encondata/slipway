@@ -15,7 +15,7 @@
     {% if key == "repos" %}
       <tr><td><a href="/repositories?repo={{ item.id }}"><strong>{{ item.full_name }}</strong></a></td><td class="muted">{{ item.description }}</td></tr>
     {% elif key == "instances" %}
-      <tr><td><a href="/instances/{{ item.id }}"><strong>{{ item.name }}</strong></a></td><td class="muted">{{ item.repository.full_name }} on {{ item.host.name }}</td><td>{{ badge("instance", item.status) }}</td></tr>
+      <tr><td><a href="/instances/{{ item.id }}"><strong>{{ item.name }}</strong></a></td><td class="muted">{{ item.source_name }} on {{ item.host.name }}</td><td>{{ badge("instance", item.status) }}</td></tr>
     {% else %}
       <tr><td><a href="/hosts/{{ item.id }}"><strong>{{ item.name }}</strong></a></td><td class="muted mono">{{ item.address }}</td><td>{{ badge("host", item.status) }}</td></tr>
     {% endif %}

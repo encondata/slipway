@@ -2,6 +2,8 @@
 {% from "_macros.html" import icon, badge, meter, empty %}
 {% from "_instance_rows.html" import port_row, volume_row, route_row %}
 {% set editing = instance is not none %}
+{# Where the code comes from: a repository (Dockerfile, compose, app) or a public container image. #}
+{% set image_mode = (instance.build_source == "image") if editing else (image_first|default(false) or not repos) %}
 {% set paths_locked = paths_locked if paths_locked is defined else locked %}
 {% block title %}{{ "Edit " ~ instance.name if editing else "Create Instance" }}{% endblock %}
 
@@ -36,21 +38,17 @@
   <div>
     {% if editing and can_view %}<div class="breadcrumb"><a href="/instances">Instances</a>{{ icon("chevron-right", "i-sm") }}<a href="/instances/{{ instance.id }}">{{ instance.name }}</a>{{ icon("chevron-right", "i-sm") }}<span>Edit</span></div>{% endif %}
     <h1>{{ "Edit " ~ instance.name if editing else "Create Instance" }}</h1>
-    <p class="lede">{{ "Changes apply on the next deployment." if editing else "Deploy a GitHub repository as a containerized application on a Docker host." }}</p>
+    <p class="lede">{{ "Changes apply on the next deployment." if editing else "Deploy a GitHub repository, or a container image from Docker Hub or another registry, on a Docker host." }}</p>
   </div>
 </div>
 
-{% if not repos or not hosts %}
+{% if not hosts %}
 <section class="card">
-  {% if not repos %}
-    {{ empty("repositories", "No repositories yet", "Sync your repositories from GitHub first.", None) }}
-  {% else %}
     {{ empty("hosts", "No hosts yet", "Add a Docker host before creating an instance.", "/hosts?add=1" if auth.can(Perm.HOSTS_READ) and auth.can(Perm.HOSTS_WRITE) else None, "Add host") }}
-  {% endif %}
 </section>
 {% else %}
 <div class="stepper" aria-hidden="true">
-  <span class="step active"><b>1</b> Repository</span><span class="line"></span>
+  <span class="step active"><b>1</b> Source</span><span class="line"></span>
   <span class="step active"><b>2</b> Build</span><span class="line"></span>
   <span class="step active"><b>3</b> Host</span><span class="line"></span>
   <span class="step active"><b>4</b> Review &amp; Deploy</span>
@@ -59,9 +57,38 @@
 <form class="grid grid-form" data-preview-form method="post" action="/js-required"
       data-form="{{ ('PATCH /api/v1/instances/' ~ instance.id) if editing else 'POST /api/v1/instances' }}"
       data-then="{{ 'redirect:/instances/{id}' if can_view else 'redirect:/' }}" data-success="{{ 'Instance updated' if editing else 'Instance created' }}">
-  <div class="stack">
+  <div class="stack" data-source-form data-repo-select="#repo-select">
     <section class="card">
-      <div class="card-head"><span class="head-icon">{{ icon("repositories", "i-lg") }}</span><div><h2>Repository</h2><p>Choose the GitHub repository and branch to deploy.</p></div></div>
+      <div class="card-head"><span class="head-icon accent">{{ icon("package", "i-lg") }}</span><div><h2>Source</h2><p>Where the application comes from.</p></div></div>
+      <div class="card-body">
+        <div class="choice-grid">
+          <label class="choice"><input type="radio" name="source_kind" value="github" data-no-send {{ 'checked' if not image_mode }} {{ 'disabled' if editing or not repos }}>{{ icon("repositories") }}<span><strong>GitHub repository</strong><small>{% if repos or editing %}Build from a repository's Dockerfile, compose file or slipway.yml{% else %}No repositories yet: sync yours{% if auth.can(Perm.REPOS_SYNC) %} or add a public one under <a href="/repositories">Repositories</a>{% endif %}{% endif %}</small></span></label>
+          <label class="choice"><input type="radio" name="source_kind" value="image" data-no-send {{ 'checked' if image_mode }} {{ 'disabled' if editing }}>{{ icon("box") }}<span><strong>Container image</strong><small>Run a published image from Docker Hub, GHCR, lscr.io or Quay</small></span></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" data-show-when="source_kind=image">
+      <div class="card-head"><span class="head-icon">{{ icon("box", "i-lg") }}</span><div><h2>Container image</h2><p>A public image, such as a community app's. The host pulls it on every deploy.</p></div></div>
+      <div class="card-body stack" style="gap: 14px" data-image-form>
+        {# Checked while the image source is chosen (slipway.js wireSource), so show-when sees build_source=image. #}
+        <input type="radio" name="build_source" value="image" style="display: none" tabindex="-1" aria-hidden="true" {{ 'checked' if image_mode }} {{ 'disabled' if locked }}>
+        <div class="field">
+          <label for="image-ref">Image</label>
+          <div class="row" style="gap: 8px">
+            <input class="input mono" id="image-ref" name="image" required maxlength="500" style="flex: 1" autocapitalize="off" spellcheck="false"
+                   value="{{ (instance.image or '') if editing else (start_image|default("") or "") }}" placeholder="linuxserver/jellyfin:latest">
+            <button class="btn" type="button" data-image-lookup>{{ icon("search", "i-sm") }} Look up</button>
+          </div>
+          <span class="help">A name with an optional tag (<code>nginx:1.27</code>, <code>ghcr.io/owner/app:v2</code>), a digest (<code>name@sha256:…</code>), or a <code>hub.docker.com</code> page. Without a tag, <code>latest</code>. Each deploy resolves the tag to its digest and runs exactly that image{% if editing %}; change the tag here and deploy to update{% endif %}.</span>
+        </div>
+        <div data-image-info hidden></div>
+        <div class="callout warning">{{ icon("alert") }}<span>An image runs whatever its publisher put in it, with the ports and folders you give it. Use images from publishers you trust, and give them only the folders they need.</span></div>
+      </div>
+    </section>
+
+    <section class="card" data-show-when="source_kind=github">
+      <div class="card-head"><span class="head-icon">{{ icon("repositories", "i-lg") }}</span><div><h2>Repository</h2><p>Choose the GitHub repository and branch to deploy.{% if not editing and auth.can(Perm.REPOS_SYNC) %} A public project that isn't listed can be added under <a href="/repositories?add=1">Repositories</a>.{% endif %}</p></div></div>
       <div class="card-body form-grid" style="grid-template-columns: minmax(0, 2fr) minmax(0, 1fr)">
         <div class="field">
           <label for="repo-select">Repository</label>
@@ -85,10 +112,10 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card" data-show-when="source_kind=github">
       <div class="card-head"><span class="head-icon accent">{{ icon("instances", "i-lg") }}</span><div><h2>Build Configuration</h2><p>How Slipway builds and packages your application.</p></div></div>
       <div class="card-body stack" style="gap: 16px">
-        {% set src = instance.build_source if editing else (selected_repo.default_source if selected_repo else "dockerfile") %}
+        {% set src = instance.build_source if editing else ("image" if image_mode else (selected_repo.default_source if selected_repo else "dockerfile")) %}
         <div class="choice-grid">
           <label class="choice"><input type="radio" name="build_source" value="dockerfile" {{ 'checked' if src == 'dockerfile' }} {{ 'disabled' if locked }}>{{ icon("file") }}<span><strong>Dockerfile</strong><small>Build a single container from a Dockerfile</small></span></label>
           <label class="choice"><input type="radio" name="build_source" value="compose" {{ 'checked' if src == 'compose' }} {{ 'disabled' if locked }}>{{ icon("package") }}<span><strong>docker compose</strong><small>Use a compose file to build multiple services</small></span></label>
@@ -189,7 +216,7 @@
       <div class="card-body stack" style="gap: 18px">
         <div class="field">
           <label for="inst-name">Instance name</label>
-          <input class="input" id="inst-name" name="name" required maxlength="100" value="{{ instance.name if editing else ((selected_repo.name ~ '-prod') if selected_repo else '') }}">
+          <input class="input" id="inst-name" name="name" required maxlength="100" value="{{ instance.name if editing else ((selected_repo.name ~ '-prod') if selected_repo and not image_mode else '') }}">
           {% if editing %}<span class="help">{{ "Compose project" if instance.build_source == "compose" else "Container" }} name stays <code>{{ instance.compose_project if instance.build_source == "compose" else instance.container_name }}</code>.</span>{% endif %}
         </div>
         <div class="field">
@@ -208,7 +235,7 @@
           </div>
           <div><button class="btn btn-sm" type="button" data-add-row="#env-rep">{{ icon("plus", "i-sm") }} Add variable</button></div>
         </div>
-        <div class="grid grid-2" style="gap: 18px" data-show-when="build_source=dockerfile">
+        <div class="grid grid-2" style="gap: 18px" data-show-when="build_source=dockerfile|image">
           <div class="field">
             <span class="label-text">Port mapping</span>
             <div class="repeater" id="port-rep" data-repeater="ports" data-min-keys="2">
@@ -268,8 +295,8 @@
     <div class="card-head"><span class="head-icon accent">{{ icon("rocket", "i-lg") }}</span><div><h2>Deployment Preview</h2><p>Review your configuration before deploying.</p></div></div>
     <div class="card-body stack" style="gap: 18px">
       <dl class="kv">
-        <dt>{{ icon("repositories", "i-sm") }} Repository</dt><dd data-preview="repository">—</dd>
-        <dt>{{ icon("branch", "i-sm") }} Branch</dt><dd data-preview="branch">—</dd>
+        <dt>{{ icon("repositories", "i-sm") }} <span data-preview-label="repository">Repository</span></dt><dd data-preview="repository">—</dd>
+        <dt>{{ icon("branch", "i-sm") }} <span data-preview-label="branch">Branch</span></dt><dd data-preview="branch">—</dd>
         <dt>{{ icon("instances", "i-sm") }} Build source</dt><dd data-preview="source">—</dd>
         <dt>{{ icon("hosts", "i-sm") }} Target host</dt><dd data-preview="host">—</dd>
         <dt>{{ icon("database", "i-sm") }} Folder</dt><dd class="mono" data-preview="folder">—</dd>
@@ -287,7 +314,8 @@
       <button class="btn btn-primary btn-lg btn-block" type="submit" name="deploy" value="true">{{ icon("rocket") }} Deploy Instance</button>
       {% endif %}
       <button class="btn btn-block" type="submit" name="deploy" value="false">Save without deploying</button>
-      <p class="subtle" style="text-align:center">Slipway downloads the source, builds the image on the host, and starts the container(s).</p>
+      <p class="subtle" style="text-align:center" data-show-when="source_kind=github">Slipway downloads the source, builds the image on the host, and starts the container(s).</p>
+      <p class="subtle" style="text-align:center" data-show-when="source_kind=image">Slipway resolves the image's digest, the host pulls it, and Slipway starts the container.</p>
       {% endif %}
     </div>
   </aside>

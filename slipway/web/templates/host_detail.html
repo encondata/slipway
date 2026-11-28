@@ -172,7 +172,7 @@ sudo mkdir -p {{ host.deploy_root|shquote }} && sudo chown {{ host.username|shqu
   <div class="table-wrap"><table class="table">
     <thead><tr><th>Instance</th>{% if can_repos %}<th>Repository</th>{% endif %}<th>Branch</th><th>Status</th><th>Last deploy</th></tr></thead>
     <tbody>{% for i in instances %}
-      <tr><td><a href="/instances/{{ i.id }}"><strong>{{ i.name }}</strong></a></td>{% if can_repos %}<td class="muted">{{ i.repository.full_name }}</td>{% endif %}<td><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span></td><td>{{ badge("instance", i.status) }}</td><td class="muted">{{ i.last_deployed_at|timeago }}</td></tr>
+      <tr><td><a href="/instances/{{ i.id }}"><strong>{{ i.name }}</strong></a></td>{% if can_repos %}<td class="muted">{{ i.source_name }}</td>{% endif %}<td><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span></td><td>{{ badge("instance", i.status) }}</td><td class="muted">{{ i.last_deployed_at|timeago }}</td></tr>
     {% endfor %}</tbody>
   </table></div>
   {% else %}<div class="card-body"><p class="muted">Nothing runs here yet.</p></div>{% endif %}

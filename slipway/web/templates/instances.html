@@ -5,7 +5,7 @@
 <div class="page-head">
   <div>
     <h1>Instances</h1>
-    <p class="lede">Each instance is one repository branch running as containers on one of your hosts.</p>
+    <p class="lede">Each instance is one repository branch, or one container image, running on one of your hosts.</p>
   </div>
   <div class="actions">
     {% if instances %}<input class="input" style="width: 240px" placeholder="Filter instances…" data-filter="#instances-table" aria-label="Filter instances">{% endif %}
@@ -25,7 +25,7 @@
       <tr>
         <td><a class="primary-cell" href="/instances/{{ i.id }}" style="color:inherit"><span class="row-icon">{{ icon("box") }}</span><span><strong>{{ i.name }}</strong><small class="mono">{{ i.slug }}</small></span></a>
           {%- if i.environment_id and i.environment %} <span class="chip env-chip" title="{{ 'The data server' if i.slot == 'data' else 'A slot' }} of environment {{ i.environment.name }}">{{ i.environment.name }} · {{ i.slot }}</span>{% endif %}</td>
-        <td class="muted">{{ i.repository.full_name }}</td>
+        <td class="muted">{{ i.source_name }}</td>
         <td><span class="chip">{{ icon("branch", "i-sm") }} {{ i.branch }}</span></td>
         <td>{% if can_hosts %}<a href="/hosts/{{ i.host.id }}">{{ i.host.name }}</a>{% else %}{{ i.host.name }}{% endif %}</td>
         <td class="muted">{{ {"compose": "Compose", "app": "App"}.get(i.build_source, "Dockerfile") }}</td>
@@ -44,7 +44,7 @@
     </tbody>
   </table></div>
   {% else %}
-    {{ empty("instances", "No instances yet", "Pick a repository, a branch and a host, and Slipway builds and runs it for you.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) else None, "Create instance") }}
+    {{ empty("instances", "No instances yet", "Pick a repository and branch, or a container image from Docker Hub or another registry, and a host: Slipway builds and runs it for you.", "/instances/new" if auth.can(Perm.INSTANCES_WRITE) else None, "Create instance") }}
   {% endif %}
 </section>
 {% endblock %}

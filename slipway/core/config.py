@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     github_service_token: str | None = None
     github_api_url: str = "https://api.github.com"
     github_web_url: str = "https://github.com"
+    # Container registries Slipway reads public images from (instances of a container image), on top of
+    # Docker Hub, GHCR, LinuxServer (lscr.io), Quay, GCR, GitLab, ECR Public and MCR.
+    image_registries: CommaList = Field(default_factory=list)
 
     host_poll_interval: int = 300  # seconds; 0 disables background host health checks
     # seconds between host history rollups and cleanups; 0 disables them
@@ -111,7 +114,7 @@ class Settings(BaseSettings):
     # The TCP probe of a new VM's address before it is made; tests patch the probe itself.
     vm_address_probe: bool = True
 
-    @field_validator("github_allowed_users", "github_allowed_orgs", mode="before")
+    @field_validator("github_allowed_users", "github_allowed_orgs", "image_registries", mode="before")
     @classmethod
     def _split_commas(cls, value: object) -> object:
         if isinstance(value, str):

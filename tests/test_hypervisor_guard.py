@@ -17,7 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from slipway.services import acme, cloudflare, digitalocean, github, spaces, switchyard, tls_pin, traffic
+from slipway.services import acme, cloudflare, digitalocean, github, registry, spaces, switchyard, tls_pin, traffic
 
 from tests import hypervisor_guard
 from tests.hypervisor_guard import Guard, RealHypervisorCall, no_real_hypervisors  # noqa: F401  (the fixture)
@@ -238,6 +238,7 @@ CLOUD_MODULES = {
     "slipway.services.switchyard": (switchyard, "a real Switchyard request"),
     "slipway.services.traffic": (traffic, "a real public check request"),
     "slipway.services.github": (github, "a real GitHub request"),
+    "slipway.services.registry": (registry, "a real container registry request"),
 }
 
 

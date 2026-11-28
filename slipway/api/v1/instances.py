@@ -71,6 +71,7 @@ from slipway.services import (
     hosts,
     jobs,
     manifest,
+    registry,
     snapshots,
     ssh,
     switchyard,
@@ -95,6 +96,7 @@ open_session = ssh.open_session  # replaced in tests
 
 # Settings that decide where and how an instance runs; fixed once anything was deployed.
 _PLACEMENT_FIELDS = ("host_id", "build_source", "compose_file", "dockerfile_path", "build_context", "manifest_file")
+IMAGE_TEXT = "An instance runs either a repository's code or a container image: switch by creating a new instance"
 # A claimed instance runs on its host from the start, but its paths in the repository can still be
 # corrected until Slipway first deploys it.
 CLAIM_EDITABLE_FIELDS = frozenset({"compose_file", "dockerfile_path", "build_context"})
@@ -370,9 +372,16 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
     if (body.seed_snapshot_id is not None or body.first_admin is not None) and body.build_source != BuildSource.APP:
         raise HTTPException(UNPROCESSABLE,
                             "Only app instances (slipway.yml) can start from a snapshot or have a first admin")
-    repo = await db.get(Repository, body.repository_id)
+    image = body.build_source == BuildSource.IMAGE
+    if image and not body.image:
+        raise HTTPException(UNPROCESSABLE, "Name the container image to run, such as nginx:latest")
+    if image and body.repository_id is not None:
+        raise HTTPException(UNPROCESSABLE, "An instance of a container image has no repository")
+    if not image and body.repository_id is None:
+        raise HTTPException(UNPROCESSABLE, "Choose the repository to deploy, or a container image")
+    repo = await db.get(Repository, body.repository_id) if body.repository_id is not None else None
     host = await db.get(Host, body.host_id)
-    if repo is None or host is None:
+    if (repo is None and not image) or host is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown repository or host")
     await _refuse_owned(db, host, "instance")
     try:
@@ -384,13 +393,17 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
     await _check_slug_free(db, slug)
     await _check_hostnames(db, body.routes, None)
     await _check_folder(db, host, _folder_of(host, slug, body.deploy_dir or None), None)
-    if not body.branch and not repo.default_branch_usable:
+    if image:
+        ref = registry.parse(body.image or "")  # already checked by the schema
+        branch = ref.branch
+    elif not body.branch and not repo.default_branch_usable:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Slipway could not store the default branch of {repo.full_name} (its name is longer than "
             f"{BRANCH_MAX} characters); specify a branch",
         )
-    branch = body.branch or repo.default_branch
+    else:
+        branch = body.branch or repo.default_branch
     seed: Snapshot | None = None
     if body.seed_snapshot_id is not None or body.first_admin is not None:
         # Checked against the branch's slipway.yml, as the form showed it (§10.7, §11.1); again when it runs.
@@ -410,12 +423,14 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         name=body.name.strip(),
         slug=slug,
         repository=repo,
+        image=body.image if image else None,
         host=host,
-        branch=body.branch or repo.default_branch,
+        branch=branch,
         build_source=body.build_source,
-        dockerfile_path=body.dockerfile_path or "Dockerfile",
-        build_context=body.build_context or ".",
-        compose_file=body.compose_file or repo.compose_file or "docker-compose.yml",
+        # An image instance builds the Dockerfile Slipway writes for it (deployer._image_pipeline).
+        dockerfile_path="Dockerfile" if image else body.dockerfile_path or "Dockerfile",
+        build_context="." if image else body.build_context or ".",
+        compose_file=body.compose_file or (repo.compose_file if repo is not None else None) or "docker-compose.yml",
         deploy_dir=body.deploy_dir or None,
         manifest_file=body.manifest_file or manifest.DEFAULT_FILE,
         app_settings=body.app_settings or {},
@@ -442,7 +457,8 @@ async def create_instance(body: InstanceCreate, ctx: Writer, request: Request, d
         db.add(_new_first_admin(instance, body.first_admin, body.first_admin.password, ctx.user))
     audit.record(
         db, "instance.create", actor=ctx.user, target=instance, details=details or None,
-        summary=f"Created instance {instance.name} ({repo.full_name}@{instance.branch} on {host.name})", request=request,
+        summary=f"Created instance {instance.name} ({instance.image if image else f'{repo.full_name}@{instance.branch}'} "
+                f"on {host.name})", request=request,
     )
     dep = await queue_deployment(db, instance, ctx.user) if body.deploy else None
     await db.commit()
@@ -478,6 +494,16 @@ async def update_instance(instance_id: uuid.UUID, body: InstanceUpdate, ctx: Wri
         # whether Slipway may pick free ports stay editable here.
         if any(k not in ("name", "auto_ports") for k in data):
             raise HTTPException(status.HTTP_409_CONFLICT, member_text(instance))
+    if data.get("build_source") is not None and (data["build_source"] == BuildSource.IMAGE) != instance.is_image:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, IMAGE_TEXT)
+    if data.get("image") is not None and not instance.is_image:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, IMAGE_TEXT)
+    if instance.is_image:
+        # The image's tag is its branch; paths in a repository don't apply.
+        for key in ("branch", "dockerfile_path", "build_context", "compose_file", "manifest_file"):
+            data.pop(key, None)
+        if data.get("image") == instance.image:
+            data.pop("image")
     await _check_seed_update(db, ctx, instance, data)
     changing = {f for f in _PLACEMENT_FIELDS if data.get(f) is not None and data[f] != getattr(instance, f)}
     if "host_id" in changing:
@@ -563,6 +589,10 @@ async def _apply_update(
     for field in ("name", "branch", "build_source", "dockerfile_path", "build_context", "compose_file", "manifest_file"):
         if data.get(field) is not None:
             setattr(instance, field, data[field])
+    if data.get("image") is not None and instance.is_image:
+        # Another tag or image: the next deploy pulls it (a deployed instance keeps its container until then).
+        instance.image = data["image"]
+        instance.branch = registry.parse(data["image"]).branch
     if body.app_settings is not None:
         instance.app_settings = body.app_settings
     if "app_services" in data:

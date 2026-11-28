@@ -1433,10 +1433,23 @@
       const set = (key, value) => $$(`[data-preview="${key}"]`).forEach((n) => { n.textContent = value || "—"; });
       const compose = (source && source.value) === "compose";
       const app = (source && source.value) === "app";
-      set("repository", repo && repo.selectedOptions[0] ? repo.selectedOptions[0].textContent.trim() : "");
-      set("branch", data.branch);
+      const image = (source && source.value) === "image";
+      const imageRef = field("image");
+      const label = (key, value) => $$(`[data-preview-label="${key}"]`).forEach((n) => { n.textContent = value; });
+      label("repository", image ? "Image" : "Repository");
+      label("branch", image ? "Tag" : "Branch");
+      if (image) {
+        const ref = imageRef ? imageRef.value.trim() : "";
+        const tag = ref.includes("@") ? "digest" : (/:([^/:]+)$/.exec(ref) || [null, ref ? "latest" : ""])[1];
+        set("repository", ref);
+        set("branch", tag);
+      } else {
+        set("repository", repo && repo.selectedOptions[0] ? repo.selectedOptions[0].textContent.trim() : "");
+        set("branch", data.branch);
+      }
       const manifestFile = field("manifest_file");
-      set("source", app ? `App (${(manifestFile && manifestFile.value) || "slipway.yml"})`
+      set("source", image ? "Container image"
+        : app ? `App (${(manifestFile && manifestFile.value) || "slipway.yml"})`
         : compose ? `docker compose (${(composeFile && composeFile.value) || "docker-compose.yml"})`
         : `Dockerfile (${(dockerfile && dockerfile.value) || "Dockerfile"})`);
       set("host", host ? host.dataset.label : "");
@@ -1711,6 +1724,114 @@
     if (branch) branch.addEventListener("change", load);
     $$('[name="build_source"]', form).forEach((r) => r.addEventListener("change", load));
     load();
+  }
+
+  // ------------------------------------- instance source: a repository or a container image (instance_form.html)
+  // Choosing "Container image" checks the hidden build_source=image radio, so the form's show-when rules and its
+  // body follow; going back to the repository checks the build mode the selected repository suggests.
+  function wireSource(root) {
+    const form = root.closest("form");
+    if (!form) return;
+    const imageRadio = $('[name="build_source"][value="image"]', form);
+    const repoSelect = $(root.dataset.repoSelect || "#repo-select", form);
+    $$('[name="source_kind"]', form).forEach((radio) => radio.addEventListener("change", () => {
+      if (!radio.checked) return;
+      if (radio.value === "image") {
+        if (imageRadio) imageRadio.checked = true;
+        return;
+      }
+      const opt = repoSelect && repoSelect.selectedOptions[0];
+      const want = (opt && opt.dataset.fillBuild_source) || "dockerfile";
+      const pick = $(`[name="build_source"][value="${want}"]`, form) || $('[name="build_source"][value="dockerfile"]', form);
+      if (pick) pick.checked = true;
+    }));
+    const box = $("[data-image-form]", form);
+    if (box) wireImageLookup(form, box);
+  }
+
+  function imageName(ref) {
+    // "lscr.io/linuxserver/jellyfin:latest" -> "jellyfin"; a hub.docker.com URL -> its last part.
+    const bare = ref.trim().replace(/[?#].*$/, "").replace(/\/+$/, "").split("@")[0];
+    const last = bare.split("/").filter(Boolean).pop() || "";
+    return last.replace(/:[^:]*$/, "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  }
+
+  function wireImageLookup(form, box) {
+    const input = $('[name="image"]', box);
+    const button = $("[data-image-lookup]", box);
+    const out = $("[data-image-info]", box);
+    const nameField = $('[name="name"]', form);
+    if (!input) return;
+    const editing = (form.dataset.form || "").startsWith("PATCH");
+    let nameTyped = Boolean(nameField && nameField.value.trim());
+    if (nameField) nameField.addEventListener("input", (ev) => { if (ev.isTrusted) nameTyped = true; });
+    input.addEventListener("change", () => {
+      if (!editing && nameField && !nameTyped && imageName(input.value)) {
+        nameField.value = imageName(input.value);
+        nameField.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    });
+    const addRows = (repSel, rows) => {
+      const rep = $(repSel, form);
+      if (!rep || !rows.length) return 0;
+      const tpl = $("template", rep);
+      // Leave out the empty rows first, so the suggestions don't land below a blank one.
+      $$(".repeater-row", rep).filter((r) => $$("input", r).every((i) => !i.value.trim()))
+        .forEach((r) => r.parentNode.removeChild(r));
+      rows.forEach((values) => {
+        rep.insertBefore(tpl.content.cloneNode(true), tpl);
+        const row = $$(".repeater-row", rep).pop();
+        Object.entries(values).forEach(([k, v]) => {
+          const el = $(`[data-f="${k}"]`, row);
+          if (el) el.value = v;
+        });
+      });
+      rep.dispatchEvent(new Event("input", { bubbles: true }));
+      return rows.length;
+    };
+    const lookup = async () => {
+      const ref = input.value.trim();
+      if (!ref) { input.focus(); return; }
+      out.hidden = false;
+      out.innerHTML = '<p class="muted" style="margin: 0">Reading the image...</p>';
+      button.disabled = true;
+      try {
+        const info = await api("GET", `/api/v1/images/inspect?ref=${encodeURIComponent(ref)}`);
+        input.value = info.ref;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        const chips = (list) => list.map((x) => `<span class="chip mono">${esc(x)}</span>`).join(" ");
+        const ports = (info.ports || []).map((p) => `${p.container}/${p.protocol}`);
+        const volumes = info.volumes || [];
+        const env = Object.entries(info.env || {});
+        const slug = imageName(info.ref) || "app";
+        out.innerHTML = `<div class="image-info stack" style="gap: 8px">
+          <div><strong>${esc(info.title || info.ref)}</strong>${info.page_url ? ` <a href="${esc(info.page_url)}" target="_blank" rel="noopener">${esc(info.page_url.replace(/^https:\/\//, ""))}</a>` : ""}
+            ${info.description ? `<div class="subtle">${esc(info.description)}</div>` : ""}</div>
+          <div class="subtle mono" style="overflow-wrap: anywhere">${esc(info.digest)}${info.platform ? ` (${esc(info.platform)})` : ""}</div>
+          <div><span class="label-text">Exposed ports</span> ${ports.length ? chips(ports) : '<span class="muted">None declared</span>'}</div>
+          <div><span class="label-text">Volumes</span> ${volumes.length ? chips(volumes) : '<span class="muted">None declared</span>'}</div>
+          ${env.length ? `<div><span class="label-text">Variables it sets</span> ${chips(env.map(([k, v]) => `${k}=${v}`).slice(0, 20))}</div>` : ""}
+          ${ports.length || volumes.length ? '<div><button class="btn btn-sm" type="button" data-image-apply>Use these ports and volumes</button></div>' : ""}
+          ${info.source ? `<div class="subtle" style="overflow-wrap: anywhere">Source: ${esc(info.source)}</div>` : ""}
+        </div>`;
+        const apply = $("[data-image-apply]", out);
+        if (apply) apply.addEventListener("click", () => {
+          const n = addRows("#port-rep", (info.ports || []).map((p) => ({ host: p.container, container: p.container, protocol: p.protocol })))
+            + addRows("#vol-rep", volumes.map((v) => {
+              const part = v.replace(/\/+$/, "").split("/").filter(Boolean).pop() || "data";
+              return { source: `${slug}-${part}`.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").slice(0, 120), target: v };
+            }));
+          toast(`Added ${n} mapping(s): check the host ports and volume names before deploying`);
+          apply.disabled = true;
+        });
+      } catch (err) {
+        out.innerHTML = `<div class="callout warning"><span>${esc(err.message)}</span></div>`;
+      } finally {
+        button.disabled = false;
+      }
+    };
+    button.addEventListener("click", lookup);
+    input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); lookup(); } });
   }
 
   // ------- conditional fields: data-show-when="field=value" (or value|value; several, space-separated, all hold)
@@ -3216,6 +3337,7 @@
     // Before wireShowWhen: the flow keeps its computed fields (data_mode) current on every change first.
     $$("form[data-env-flow]").forEach(wireEnvFlow);
     $$("form").forEach(wireVmForms);
+    $$("[data-source-form]").forEach(wireSource); // before wireShowWhen: it sets build_source first
     $$("form").forEach(wireShowWhen);
     $$("[data-app-form]").forEach(wireAppForm);
     $$("form[data-account-form]").forEach(wireAccountForm);

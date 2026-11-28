@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from slipway.core.permissions import validate_permissions
 from slipway.models import Backup, Deployment, FirstAdmin, Host, Instance, Repository, Snapshot, User
-from slipway.services import data, deployer, manifest, ports, switchyard
+from slipway.services import data, deployer, manifest, ports, registry, switchyard
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -354,6 +354,25 @@ class SyncOut(BaseModel):
     total: int
 
 
+class RepoImportIn(BaseModel):
+    """A GitHub repository anyone may read (or one your token can), by URL or ``owner/name``."""
+
+    url: Annotated[str, Field(min_length=3, max_length=300), NoNul]
+
+
+class ImageInfoOut(BaseModel):
+    ref: str
+    digest: str
+    platform: str | None = None
+    ports: list[dict[str, Any]] = []
+    volumes: list[str] = []
+    env: dict[str, str] = {}
+    title: str | None = None
+    description: str | None = None
+    source: str | None = None
+    page_url: str | None = None
+
+
 # ----------------------------------------------------------------------- instances
 
 
@@ -427,7 +446,9 @@ class FirstAdminIn(BaseModel):
 
 class _InstanceFields(BaseModel):
     branch: Annotated[str, Field(min_length=1, max_length=BRANCH_MAX, pattern=r"^[A-Za-z0-9._/-]+$"), NoNul] | None = None
-    build_source: Literal["dockerfile", "compose", "app"] | None = None
+    build_source: Literal["dockerfile", "compose", "app", "image"] | None = None
+    # Image mode: a public container image (``nginx:1.27``, ``ghcr.io/owner/app:v1``, a hub.docker.com URL).
+    image: Annotated[str, Field(max_length=500), NoNul] | None = None
     dockerfile_path: Annotated[str, Field(max_length=255), NoNul] | None = None
     build_context: Annotated[str, Field(max_length=255), NoNul] | None = None
     compose_file: Annotated[str, Field(max_length=255), NoNul] | None = None
@@ -506,12 +527,22 @@ class _InstanceFields(BaseModel):
     def _env(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return None if v is None else deployer.clean_env(v)
 
+    @field_validator("image")
+    @classmethod
+    def _image(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        ref = registry.parse(v)
+        registry.check_allowed(ref)
+        return ref.label
+
 
 class InstanceCreate(_InstanceFields):
     name: Str = Field(min_length=1, max_length=100)
-    repository_id: uuid.UUID
+    # A repository's code, or (build_source "image") a container image and no repository.
+    repository_id: uuid.UUID | None = None
     host_id: uuid.UUID
-    build_source: Literal["dockerfile", "compose", "app"] = "dockerfile"
+    build_source: Literal["dockerfile", "compose", "app", "image"] = "dockerfile"
     deploy: bool = True
     first_admin: FirstAdminIn | None = None
 
@@ -552,8 +583,9 @@ class InstanceOut(Out):
     id: uuid.UUID
     name: str
     slug: str
-    repository_id: uuid.UUID
-    repository: str
+    repository_id: uuid.UUID | None  # None for an instance of a container image
+    repository: str  # the repository's owner/name, or the image
+    image: str | None = None
     # None for a managed environment's data owner, which has no host (phase 4 §3.4).
     host_id: uuid.UUID | None
     host: str | None
@@ -614,7 +646,8 @@ class InstanceOut(Out):
             name=i.name,
             slug=i.slug,
             repository_id=i.repository_id,
-            repository=i.repository.full_name,
+            repository=i.source_name,
+            image=i.image,
             host_id=i.host_id,
             host=i.host.name if i.host is not None else None,
             branch=i.branch,

@@ -24,6 +24,7 @@ class BuildSource(StrEnum):
     DOCKERFILE = "dockerfile"
     COMPOSE = "compose"
     APP = "app"  # the repository's slipway.yml says how (see services.manifest)
+    IMAGE = "image"  # a public container image, no repository (see services.registry)
 
 
 class InstanceStatus(StrEnum):
@@ -88,14 +89,21 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
         # Phase 4: only a managed environment's data owner has no host (services.environments enforces the
         # rest: it writes a host-less owner only for data_mode managed).
         CheckConstraint("host_id IS NOT NULL OR (slot = 'data' AND environment_id IS NOT NULL)", name="host"),
+        # An instance runs a repository's code, or a container image (and then has no repository).
+        CheckConstraint("(repository_id IS NULL) = (build_source = 'image')", name="source"),
+        CheckConstraint("build_source <> 'image' OR image IS NOT NULL", name="image"),
     )
 
     name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(63), unique=True)
-    repository_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("repositories.id", ondelete="RESTRICT"))
+    # None for an instance of a container image (BuildSource.IMAGE, ck_instances_source).
+    repository_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("repositories.id", ondelete="RESTRICT"))
     # None only for a managed environment's data owner (ck_instances_host).
     host_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("hosts.id", ondelete="RESTRICT"))
+    # The branch deployed; for an image instance, the image's tag (or "digest" for a pinned one).
     branch: Mapped[str] = mapped_column(String(255))
+    # Image mode: the image as entered, normalised (``nginx:1.27``, ``ghcr.io/owner/app:v1``; services.registry).
+    image: Mapped[str | None] = mapped_column(String(255))
 
     build_source: Mapped[str] = mapped_column(String(16), default=BuildSource.DOCKERFILE)
     dockerfile_path: Mapped[str] = mapped_column(String(255), default="Dockerfile")
@@ -176,9 +184,20 @@ class Instance(UUIDPrimaryKey, Timestamps, Base):
     slot: Mapped[str | None] = mapped_column(String(8))  # SlotName
     slot_state: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'"))
 
-    repository: Mapped[Repository] = relationship(lazy="selectin")
+    repository: Mapped[Repository | None] = relationship(lazy="selectin")
     host: Mapped[Host | None] = relationship(lazy="selectin")
     environment: Mapped[Environment | None] = relationship(lazy="selectin", foreign_keys=[environment_id])
+
+    @property
+    def source_name(self) -> str:
+        """What the instance runs, for people: the repository's owner/name, or the image."""
+        if self.repository is not None:
+            return self.repository.full_name
+        return self.image or ""
+
+    @property
+    def is_image(self) -> bool:
+        return self.build_source == BuildSource.IMAGE
 
     @property
     def container_name(self) -> str:
@@ -255,7 +274,8 @@ class Deployment(UUIDPrimaryKey, Timestamps, Base):
         ForeignKey("environments.id", ondelete="SET NULL"), index=True
     )
     status: Mapped[str] = mapped_column(String(16), default=DeploymentStatus.QUEUED, index=True)
-    branch: Mapped[str] = mapped_column(String(255))
+    branch: Mapped[str] = mapped_column(String(255))  # an image instance's tag
+    # An image instance's deploy: the commit_sha columns hold the first 40 hex digits of the image's digest.
     commit_sha: Mapped[str | None] = mapped_column(String(40))
     commit_message: Mapped[str | None] = mapped_column(String(500))
     commit_author: Mapped[str | None] = mapped_column(String(100))

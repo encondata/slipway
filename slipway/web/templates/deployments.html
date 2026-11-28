@@ -34,7 +34,7 @@
         {% if d.instance is none %}
         <td><strong>{{ d|dep_label }}</strong>{% if can_repos and d.environment %}<div class="subtle">{{ d.environment.repository.full_name }}</div>{% endif %}</td>
         {% else %}
-        <td>{% if can_instances %}<a href="/instances/{{ d.instance.id }}"><strong>{{ d.instance.name }}</strong></a>{% else %}<strong>{{ d.instance.name }}</strong>{% endif %}{% if can_repos %}<div class="subtle">{{ d.instance.repository.full_name }}</div>{% endif %}</td>
+        <td>{% if can_instances %}<a href="/instances/{{ d.instance.id }}"><strong>{{ d.instance.name }}</strong></a>{% else %}<strong>{{ d.instance.name }}</strong>{% endif %}{% if can_repos %}<div class="subtle">{{ d.instance.source_name }}</div>{% endif %}</td>
         {% endif %}
         {% if env_col %}<td>{% if d.environment %}{% if can_envs %}<a href="/environments/{{ d.environment.id }}">{{ d.environment.name }}</a>{% else %}{{ d.environment.name }}{% endif %}{% if d.instance and d.instance.slot %} <span class="subtle">· {{ d.instance.slot }}</span>{% endif %}{% else %}<span class="subtle">—</span>{% endif %}</td>{% endif %}
         <td>{{ badge("deployment", d.status, d.kind) }}{% if d.environment_id %}<div class="subtle">{{ d|dep_label }}</div>{% elif d.kind and d.kind != "deploy" %}<div class="subtle">{{ d.kind|kind_label }}</div>{% endif %}</td>

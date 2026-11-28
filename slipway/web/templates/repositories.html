@@ -51,10 +51,12 @@
 <div class="page-head">
   <div>
     <h1>Repositories</h1>
-    <p class="lede">Your GitHub repositories in Slipway. Install and deploy apps, or create instances from ready projects.</p>
+    <p class="lede">Your GitHub repositories in Slipway, and public projects added by URL. Install and deploy apps, or create instances from ready projects.</p>
   </div>
   <div class="actions">
+    {% if auth.can(Perm.INSTANCES_WRITE) %}<a class="btn" href="/instances/new?source=image">{{ icon("box") }} Run an image</a>{% endif %}
     {% if auth.can(Perm.REPOS_SYNC) %}
+      <button class="btn" type="button" data-open="add-repo">{{ icon("plus") }} Add by URL</button>
       {% if user.github %}
       <button class="btn btn-primary" data-api="POST /api/v1/repositories/sync" data-success="Repositories synced from GitHub" data-then="reload">{{ icon("sync") }} Sync GitHub</button>
       {% elif settings.github_enabled %}
@@ -112,11 +114,28 @@
   {% elif stats.total %}
     {{ empty("search", "No matches", "No repositories match this filter.") }}
   {% else %}
-    {% call empty("repositories", "No repositories yet", "Sync your GitHub account to bring your repositories into Slipway.") %}
+    {% call empty("repositories", "No repositories yet", "Sync your GitHub account to bring your repositories into Slipway, or add a public project by its URL.") %}
+      {% if auth.can(Perm.REPOS_SYNC) %}<p><button class="btn" type="button" data-open="add-repo">{{ icon("plus") }} Add by URL</button></p>{% endif %}
       {% if not settings.github_enabled %}<p class="subtle">GitHub isn't configured: set <code>SLIPWAY_GITHUB_CLIENT_ID</code> and <code>SLIPWAY_GITHUB_CLIENT_SECRET</code>.</p>
       {% elif not user.github %}<a class="btn btn-primary" href="/auth/github/link">{{ icon("github") }} Connect GitHub</a>{% endif %}
     {% endcall %}
   {% endif %}
 </section>
 
+{% if auth.can(Perm.REPOS_SYNC) %}
+<dialog class="modal" id="add-repo" data-open-on="add" style="width: min(560px, calc(100vw - 32px))">
+  <form method="post" action="/js-required" data-form="POST /api/v1/repositories/import" data-then="redirect:/repositories?repo={id}" data-success="Repository added">
+    <div class="modal-head"><h2>Add a repository by URL</h2><button class="icon-btn" type="button" data-close aria-label="Close">{{ icon("x") }}</button></div>
+    <div class="modal-body stack" style="gap: 14px">
+      <div class="field">
+        <label for="repo-url">GitHub repository</label>
+        <input class="input mono" id="repo-url" name="url" required maxlength="300" placeholder="https://github.com/owner/project" autocapitalize="off" spellcheck="false">
+        <span class="help">A URL such as <code>https://github.com/owner/project</code>, or <code>owner/project</code>. Public repositories need no GitHub account{% if not user.github %}; a private one needs yours linked{% endif %}. Slipway looks for a Dockerfile, a compose file or a slipway.yml, and the project deploys like your own repositories.</span>
+      </div>
+      <div class="callout warning">{{ icon("alert") }}<span>A community project's Dockerfile and compose file run as trusted code on the host you deploy it to. Read them first, and deploy from a tag or a branch you trust.</span></div>
+    </div>
+    <div class="modal-foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit">Add repository</button></div>
+  </form>
+</dialog>
+{% endif %}
 {% endblock %}

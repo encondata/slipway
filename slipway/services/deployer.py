@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
 import logging
 import posixpath
 import queue
@@ -99,8 +100,8 @@ from slipway.models import (
 from slipway.models.data import REVISION_MAX_BYTES
 from slipway.models.environment import SECRETS_LOST
 from slipway.services import (audit, backup_store, cloudflare, data, do_provision, environments, machines, manifest,
-                              ports, provider_accounts, resources, snapfile, snapshots, ssh, switchyard, traffic,
-                              vm_jobs, vmnet)
+                              ports, provider_accounts, registry, resources, snapfile, snapshots, ssh, switchyard,
+                              traffic, vm_jobs, vmnet)
 from slipway.services.github import CommitInfo, GitHubClient, GitHubError
 from slipway.services.repos import github_token_for
 from slipway.services.snapfile import SnapshotError
@@ -1566,6 +1567,10 @@ async def provider_steps(db: Any, instance: Instance, environment: Any, members:
     return ProviderSteps(provider, prepare, resize_name if due else None)
 
 
+# An image instance's first two steps resolve the tag to a digest and write the Dockerfile that starts from it.
+IMAGE_STEP_NAMES = {"resolve": "Resolve the image", "source": "Prepare the release", "build": "Pull the image"}
+
+
 def step_keys(instance: Instance) -> list[str]:
     """A deploy's steps. Dockerfile and compose instances keep exactly these (I7); see ``steps_for``."""
     if instance.build_source == BuildSource.APP:
@@ -1598,6 +1603,9 @@ def steps_for(
     if kind in vm_jobs.KINDS:
         # The VM kinds (P5 §10.1), named after the VM; the job names the snapshot when it starts (``job_steps``).
         return vm_jobs.step_rows(str(kind), vm=data.host_label(instance), names=STEP_NAMES)
+    if instance.build_source == BuildSource.IMAGE:
+        return [{"key": k, "name": IMAGE_STEP_NAMES.get(k) or STEP_NAMES[k], "status": "pending"}
+                for k in step_keys(instance)]
     if instance.build_source != BuildSource.APP:
         return [{"key": k, "name": STEP_NAMES[k], "status": "pending"} for k in step_keys(instance)]
     if environment is not None and instance.environment_id is not None:
@@ -2306,7 +2314,7 @@ async def _reserved_ports(instance: Instance) -> list[tuple[int, str, str]]:
         )).all()
     out = []
     for name, source, configured, published in rows:
-        for p in (configured if source == BuildSource.DOCKERFILE else published) or []:
+        for p in (configured if source in (BuildSource.DOCKERFILE, BuildSource.IMAGE) else published) or []:
             try:
                 out.append((int(p["host"]), "udp" if p.get("protocol") == "udp" else "tcp", name))
             except (KeyError, TypeError, ValueError):
@@ -6758,6 +6766,8 @@ async def _pipeline(
         raise DeployError(f"Slipway can't run {data.kind_label(job.kind)} jobs this way")
     if job.env is None:
         raise DeployError(_env_unreadable(job))
+    if instance.build_source == BuildSource.IMAGE:
+        return await _image_pipeline(deployment_id, job, sink, steps, connect)
     token, source = github_token_for(job.user)
     reuse = job.retry is not None and job.retry.reusable
     with tempfile.TemporaryDirectory(prefix="slipway-") as tmp:
@@ -6821,6 +6831,75 @@ async def _pipeline(
             async with connect(ssh.SSHTarget.from_host(host)) as remote:
                 await _install(remote, instance, deployment_id, commit.sha, tarball, job, sink, steps)
     return commit
+
+
+def write_image_source(dest: Path, dockerfile: str) -> int:
+    """The release of an image instance: a tarball laid out like GitHub's (one top folder) with a Dockerfile."""
+    body = dockerfile.encode()
+    with tarfile.open(dest, "w:gz") as archive:
+        top = tarfile.TarInfo("slipway-image")
+        top.type, top.mode = tarfile.DIRTYPE, 0o755
+        archive.addfile(top)
+        member = tarfile.TarInfo("slipway-image/Dockerfile")
+        member.size, member.mode = len(body), 0o644
+        archive.addfile(member, io.BytesIO(body))
+    return dest.stat().st_size
+
+
+async def _image_pipeline(
+    deployment_id: uuid.UUID, job: _Job, sink: LogSink, steps: Steps, connect: ConnectFactory
+) -> CommitInfo:
+    """Deploy a container image: resolve its tag to a digest, then build and run ``FROM <image>@<digest>`` as a
+    Dockerfile instance does. A retry deploys the digest its first attempt resolved."""
+    instance, host = job.instance, job.instance.host
+    try:
+        ref = registry.parse(instance.image or "")
+    except ValueError as exc:
+        raise DeployError(f"The instance's image can't be used: {exc}") from exc
+    reuse = job.retry is not None and job.retry.reusable
+    with tempfile.TemporaryDirectory(prefix="slipway-") as tmp:
+        tarball: Path | None = None
+        async with steps.step("resolve"):
+            kept = str(job.options.get("image_digest") or "")
+            if job.retry is not None and registry.DIGEST_RE.match(kept):
+                digest = kept
+                await sink.line(f"Deploying {ref.label} again at {digest} (the image of deployment {job.retry.id.hex[:8]})")
+            else:
+                await sink.line(f"Resolving {ref.label} on {ref.registry}")
+                try:
+                    digest = await registry.resolve(ref)
+                except (registry.RegistryError, ValueError) as exc:
+                    raise DeployError(str(exc)) from exc
+            sha = digest.removeprefix("sha256:")[:40]
+            if job.retry is not None and sha != job.retry.sha:
+                raise DeployError("The image resolved to another digest than the one being retried")
+            message = _fit(Deployment, "commit_message", f"{ref.label} ({digest[:19]})")
+            author = _fit(Deployment, "commit_author", ref.registry)
+            async with session_scope() as db:
+                await db.execute(update(Deployment).where(Deployment.id == deployment_id)
+                                 .values(commit_sha=sha, commit_message=message, commit_author=author))
+            await _save_options(job, image_digest=digest)
+            await sink.line(f"Image {ref.label} is {digest}")
+        if reuse:
+            assert job.retry is not None and job.retry.release
+            kept_release = posixpath.join(paths_for(instance).releases, posixpath.basename(job.retry.release))
+            async with connect(ssh.SSHTarget.from_host(host)) as probe:
+                gone, _ = await probe.run(f"[ -d {q(kept_release)} ]", check=False, timeout=60)
+            if gone:
+                await sink.line(f"The release {kept_release} is no longer on {host.name}: preparing it again")
+                job.retry.reusable = reuse = False
+        if reuse:
+            await steps.skip("source", f"Reusing the release of deployment {job.retry.id.hex[:8]}")
+        else:
+            async with steps.step("source"):
+                tarball = Path(tmp) / "source.tar.gz"
+                dockerfile = registry.image_dockerfile(ref, digest)
+                await asyncio.to_thread(write_image_source, tarball, dockerfile)
+                await sink.line(f"Dockerfile: FROM {ref.pinned(digest)}")
+        await sink.line(f"Connecting to {host.username}@{host.address}")
+        async with connect(ssh.SSHTarget.from_host(host)) as remote:
+            await _install(remote, instance, deployment_id, sha, tarball, job, sink, steps)
+    return CommitInfo(sha=sha, message=message, author=author, date=None)
 
 
 # ------------------------------------------------------------ provider steps (phases 4 and 5)

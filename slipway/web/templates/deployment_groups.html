@@ -46,7 +46,7 @@
           {%- if fold %}<button type="button" class="icon-btn dep-toggle" data-expand="{{ fold_id }}" aria-controls="{{ fold_id }}" aria-expanded="false" aria-label="Show earlier deployments of {{ label }}">{{ icon("chevron-right", "i-sm expand-chevron") }}</button>
           {%- else %}<span class="dep-toggle" aria-hidden="true"></span>{% endif %}
           {% if inst %}
-          <span class="dep-name">{% if can_instances %}<a href="/instances/{{ inst.id }}"><strong>{{ inst.name }}</strong></a>{% else %}<strong>{{ inst.name }}</strong>{% endif %}{% if can_repos %}<small class="subtle">{{ inst.repository.full_name }}</small>{% endif %}</span>
+          <span class="dep-name">{% if can_instances %}<a href="/instances/{{ inst.id }}"><strong>{{ inst.name }}</strong></a>{% else %}<strong>{{ inst.name }}</strong>{% endif %}{% if can_repos %}<small class="subtle">{{ inst.source_name }}</small>{% endif %}</span>
           {% else %}
           <span class="dep-name">{% if env and can_envs %}<a href="/environments/{{ env.id }}"><strong>{{ label }}</strong></a>{% else %}<strong>{{ label }}</strong>{% endif %}<small class="subtle">Environment jobs{% if can_repos and env %} · {{ env.repository.full_name }}{% endif %}</small></span>
           {% endif %}

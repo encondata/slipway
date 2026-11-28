@@ -17,7 +17,7 @@
     <div class="breadcrumb"><a href="/instances">Instances</a>{{ icon("chevron-right", "i-sm") }}<span>{{ instance.name }}</span></div>
     <h1 class="row">{{ instance.name }} {{ badge("instance", instance.status, active_job.kind if active_job else None) }}
       {%- if data_only_job %} {% if auth.can(Perm.DEPLOYMENTS_READ) %}<a href="/deployments/{{ active_job.id }}" class="badge warning spin">{{ active_job.kind|kind_label }}…</a>{% else %}<span class="badge warning spin">{{ active_job.kind|kind_label }}…</span>{% endif %}{% endif %}</h1>
-    <p class="lede">{{ instance.repository.full_name }} · <span class="mono">{{ instance.branch }}</span>{% if hostless %} · its data is in a managed database{% else %} on {% if can_hosts %}<a href="/hosts/{{ instance.host.id }}">{{ instance.host.name }}</a>{% else %}{{ instance.host.name }}{% endif %}{% if hv and hv.made %} {{ provider_chip(hv, auth) }}{% endif %}{% endif %}</p>
+    <p class="lede">{{ instance.source_name }}{% if not instance.is_image %} · <span class="mono">{{ instance.branch }}</span>{% endif %}{% if hostless %} · its data is in a managed database{% else %} on {% if can_hosts %}<a href="/hosts/{{ instance.host.id }}">{{ instance.host.name }}</a>{% else %}{{ instance.host.name }}{% endif %}{% if hv and hv.made %} {{ provider_chip(hv, auth) }}{% endif %}{% endif %}</p>
   </div>
   <div class="actions">
     {% if auth.can(Perm.INSTANCES_OPERATE) and live and instance.status != "deploying" %}
@@ -80,13 +80,18 @@
     <div class="card-head"><span class="head-icon">{{ icon("info", "i-lg") }}</span><h2>Overview</h2></div>
     <div class="card-body">
       <dl class="kv">
+        {% if instance.is_image %}
+        <dt>{{ icon("package", "i-sm") }} Image</dt><dd class="mono">{% if image_page %}<a href="{{ image_page }}" target="_blank" rel="noopener">{{ instance.image }}</a>{% else %}{{ instance.image }}{% endif %}</dd>
+        <dt>{{ icon("commit", "i-sm") }} Running digest</dt><dd class="mono">{{ ("sha256:" ~ instance.current_commit_sha[:12]) if instance.current_commit_sha else "—" }}</dd>
+        {% else %}
         <dt>{{ icon("repositories", "i-sm") }} Repository</dt><dd><a href="{{ instance.repository.html_url }}" target="_blank" rel="noopener">{{ instance.repository.full_name }}</a></dd>
         <dt>{{ icon("branch", "i-sm") }} Branch</dt><dd class="mono">{{ instance.branch }}</dd>
         <dt>{{ icon("commit", "i-sm") }} Running commit</dt><dd class="mono">{{ instance.current_commit_sha[:12] if instance.current_commit_sha else "—" }}</dd>
+        {% endif %}
         <dt>{{ icon("clock", "i-sm") }} Last deployed</dt><dd>{{ instance.last_deployed_at|timeago }}</dd>
         {% set app = instance.build_source == "app" %}
         {% set app_state = instance.app_state or {} %}
-        <dt>{{ icon("instances", "i-sm") }} Build</dt><dd>{% if app %}App · <span class="mono">{{ instance.manifest_file }}</span>{% if app_state.manifest %} ({{ app_state.manifest.name }}){% endif %}{% elif instance.build_source == "compose" %}docker compose · <span class="mono">{{ instance.compose_file }}</span>{% else %}Dockerfile · <span class="mono">{{ instance.dockerfile_path }}</span> (context <span class="mono">{{ instance.build_context }}</span>){% endif %}</dd>
+        <dt>{{ icon("instances", "i-sm") }} Build</dt><dd>{% if app %}App · <span class="mono">{{ instance.manifest_file }}</span>{% if app_state.manifest %} ({{ app_state.manifest.name }}){% endif %}{% elif instance.build_source == "compose" %}docker compose · <span class="mono">{{ instance.compose_file }}</span>{% elif instance.is_image %}Container image, pulled on the host{% else %}Dockerfile · <span class="mono">{{ instance.dockerfile_path }}</span> (context <span class="mono">{{ instance.build_context }}</span>){% endif %}</dd>
         {% if app %}
         <dt>{{ icon("box", "i-sm") }} Compose projects</dt><dd>{% for p in app_state.projects or [] %}<span class="chip mono">{{ p }}</span> {% else %}<span class="muted">From slipway.yml, on the first deploy</span>{% endfor %}</dd>
         {% if not member %}
@@ -109,7 +114,7 @@
         {% if instance.claim %}
         <dt>{{ icon("package", "i-sm") }} Claimed from</dt><dd>{{ "compose project" if instance.claim.kind == "compose" else "container" }} <span class="mono">{{ instance.claim.name }}</span>{% if instance.claim.working_dir %} in <span class="mono">{{ instance.claim.working_dir }}</span>{% endif %} <span class="subtle">· {{ "replaced by Slipway's deploy" if instance.claim.replaced else "not deployed by Slipway yet" }}</span></dd>
         {% endif %}
-        {% if instance.build_source == "dockerfile" %}
+        {% if instance.build_source in ("dockerfile", "image") %}
         <dt>{{ icon("globe", "i-sm") }} Ports</dt><dd>{% for p in instance.ports %}<span class="chip mono">{{ p.host }} → {{ p.container }}/{{ p.protocol }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         <dt>{{ icon("database", "i-sm") }} Volumes</dt><dd>{% for v in instance.volumes %}<span class="chip mono">{{ v.source }} → {{ v.target }}</span> {% else %}<span class="muted">None</span>{% endfor %}</dd>
         {% else %}

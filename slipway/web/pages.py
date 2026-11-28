@@ -56,7 +56,7 @@ from slipway.models import (
 )
 from slipway.services import analytics as deploy_analytics
 from slipway.schemas import BackupOut, SnapshotOut, provider_account_out, seeding_needs_download
-from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, provisioning, snapshots, ssh, switchyard, updates
+from slipway.services import cloudflare, data, deployer, do_rules, environments, host_metrics, machines, provisioning, registry, snapshots, ssh, switchyard, updates
 from slipway.services import hosts as host_rules
 from slipway.services import provider_accounts as accounts_service
 from slipway.services.auth import AuthContext
@@ -681,12 +681,16 @@ async def _form_context(db: DB, *, keep: uuid.UUID | None = None) -> dict[str, A
 
 
 @router.get("/instances/new")
-async def new_instance(request: Request, db: DB, ctx: PageAuth, repo: str = "") -> HTMLResponse:
+async def new_instance(request: Request, db: DB, ctx: PageAuth, repo: str = "", image: str = "",
+                       source: str = "") -> HTMLResponse:
+    """The instance form. ``?repo=<id>`` picks a repository; ``?source=image`` (or ``?image=<ref>``) starts from a
+    container image."""
     repo_id = _uuid(repo)
     need(ctx, Perm.INSTANCES_WRITE)
     context = await _form_context(db)
     selected = next((r for r in context["repos"] if r.id == repo_id), None) or (context["repos"][0] if context["repos"] else None)
     return await render(request, db, "instance_form.html", ctx, instance=None, env={}, selected_repo=selected,
+                        start_image=image[:500], image_first=bool(image) or source == "image",
                         seed_snapshots=await _seed_snapshots(db, ctx), **context)
 
 
@@ -742,9 +746,15 @@ async def instance_detail(request: Request, db: DB, ctx: PageAuth, instance_id: 
     # The host Slipway made for this slot (a droplet or a VM), or None for a managed environment's data owner,
     # which has no host (P4 §3.4).
     hv = (await host_views(db, [instance.host]))[instance.host.id] if instance.host is not None else None
+    image_page = None
+    if instance.is_image and instance.image:
+        try:
+            image_page = registry.parse(instance.image).page_url
+        except ValueError:
+            image_page = None
     return await render(
         request, db, "instance_detail.html", ctx, instance=instance, deployments=deployments,
-        env_unreadable=await env_unreadable(db, instance), hv=hv,
+        env_unreadable=await env_unreadable(db, instance), hv=hv, image_page=image_page,
         folder=folder,
         folder_in_ram=bool(folder) and instance.host is not None and deployer.ram_backed(instance.host, folder),
         active_job=await data.active_job(db, instance.id),
@@ -1027,8 +1037,8 @@ async def edit_instance(request: Request, db: DB, ctx: PageAuth, instance_id: uu
     if instance is None:
         return await not_found_page(request, db, ctx)
     context = await _form_context(db, keep=instance.host_id)
-    # The repository is fixed once an instance exists, and may since have been archived.
-    context["repos"] = [instance.repository]
+    # The repository is fixed once an instance exists, and may since have been archived. An image has none.
+    context["repos"] = [instance.repository] if instance.repository is not None else []
     # Same rule as PATCH /api/v1/instances/{id}: placement and build settings freeze once anything ran on the host.
     started = await db.scalar(
         select(Deployment.id).where(Deployment.instance_id == instance.id, Deployment.started_at.is_not(None)).limit(1)

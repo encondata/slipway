@@ -65,7 +65,7 @@ async def list_snapshots(
         instance = await db.get(Instance, instance_id)
         if instance is None:
             raise not_found("Instance")
-        repository = instance.repository.full_name
+        repository = instance.repository.full_name if instance.repository is not None else None
     return [SnapshotOut.of(s, seeding_needs_download=seeding_needs_download(s, repository)
                            if instance_id is not None else None) for s in rows]
 

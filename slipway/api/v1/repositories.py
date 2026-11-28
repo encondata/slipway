@@ -13,11 +13,11 @@ from slipway.core.permissions import Perm
 from slipway.db.base import utcnow
 from slipway.models import Repository
 from slipway.models.repository import DEFAULT_BRANCH_TOO_LONG
-from slipway.schemas import BRANCH_MAX, RepoOut, SyncOut
+from slipway.schemas import BRANCH_MAX, RepoImportIn, RepoOut, SyncOut
 from slipway.services import audit, deployer, manifest
 from slipway.services.auth import AuthContext
 from slipway.services.github import GitHubClient, GitHubError
-from slipway.services.repos import GitHubNotLinked, github_token_for, sync_repositories
+from slipway.services.repos import GitHubNotLinked, github_token_for, import_repository, sync_repositories
 
 router = APIRouter(prefix="/repositories", tags=["repositories"])
 
@@ -66,6 +66,24 @@ async def sync(ctx: Syncer, request: Request, db: DB) -> SyncOut:
     )
     await db.commit()
     return SyncOut(created=result.created, updated=result.updated, total=result.total)
+
+
+@router.post("/import")
+async def import_repo(body: RepoImportIn, ctx: Syncer, request: Request, db: DB) -> RepoOut:
+    """Add a GitHub repository by URL (a community project, say): public ones need no GitHub account."""
+    try:
+        result = await import_repository(db, ctx.user, body.url)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except GitHubError as exc:
+        raise _gh_error(exc) from exc
+    repo = result.repo
+    audit.record(
+        db, "repos.import", actor=ctx.user, target=repo, details={"github_id": repo.github_id, "created": result.created},
+        summary=f"{'Added' if result.created else 'Refreshed'} repository {repo.full_name} by URL", request=request,
+    )
+    await db.commit()
+    return RepoOut.of(repo)
 
 
 @router.get("/{repo_id}")

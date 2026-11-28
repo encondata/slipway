@@ -12,7 +12,7 @@ seam, and the guard closes each:
 * ``slipway.services.proxmox.transport_factory`` raises unless the test replaced it (with an httpx
   ``MockTransport``, as switchyard's tests do);
 * the ``transport_factory`` of ``digitalocean``, ``spaces``, ``acme``, ``cloudflare``, ``switchyard``,
-  ``traffic`` (the public check) and ``github`` (used when a caller passes no ``transport``) returns an
+  ``traffic`` (the public check), ``github`` and ``registry`` (used when a caller passes no ``transport``) returns an
   ``httpx.MockTransport`` that raises on the first request. Building a client stays harmless; only
   sending something fails;
 * ``asyncssh.connect`` and ``asyncssh.get_server_host_key``, which ``slipway.services.ssh`` dials
@@ -59,6 +59,7 @@ CLOUDS = (
     ("slipway.services.switchyard", "a real Switchyard request"),
     ("slipway.services.traffic", "a real public check request"),
     ("slipway.services.github", "a real GitHub request"),
+    ("slipway.services.registry", "a real container registry request"),
 )
 # What ``slipway.services.ssh`` dials through; each reaches only loopback in tests.
 SSH_DIALS = (("connect", "a real SSH connection"), ("get_server_host_key", "a real SSH host key read"))

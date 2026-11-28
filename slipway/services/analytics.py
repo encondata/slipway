@@ -223,17 +223,19 @@ async def _by_instance(
     succeeded_count = _count_where(Deployment.status == DeploymentStatus.SUCCEEDED)
     # Finished deploys only, like the totals; an instance whose only deploy is still running is listed with 0.
     finished_count = _count_where(Deployment.status.in_(_FINISHED))
+    source = func.coalesce(Repository.full_name, Instance.image)
     rows = (
         await db.execute(
             select(
-                Instance.id, Instance.name, Instance.slug, Repository.full_name, Host.name,
+                Instance.id, Instance.name, Instance.slug, source, Host.name,
                 finished_count, succeeded_count, failed_count,
             )
             .join(Deployment, Deployment.instance_id == Instance.id)
-            .join(Repository, Repository.id == Instance.repository_id)
+            # An instance of a container image has no repository: its image stands in for the name.
+            .outerjoin(Repository, Repository.id == Instance.repository_id)
             .join(Host, Host.id == Instance.host_id)
             .where(_in(start, end))
-            .group_by(Instance.id, Instance.name, Instance.slug, Repository.full_name, Host.name)
+            .group_by(Instance.id, Instance.name, Instance.slug, Repository.full_name, Instance.image, Host.name)
         )
     ).all()
     ids = [row[0] for row in rows]
